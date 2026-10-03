@@ -1,0 +1,80 @@
+# skot configuration.
+#
+# skot manages a sandbox and a patch series. It does not know your language, your
+# build system, or where your artifact goes. Everything of that sort is a hook below,
+# and skot never looks inside one.
+#
+# Every hook is a shell command string. It runs with the sandbox as its working
+# directory, and it receives:
+#
+#   SKOT_DIR       project root
+#   SKOT_SANDBOX   the sandbox working tree
+#   SKOT_REF       the resolved upstream ref, as you named it
+#   SKOT_SHA       the resolved commit id
+#   SKOT_VERSION   version parsed out of the ref, or empty
+#
+# A non-zero exit aborts the run.
+
+[upstream]
+# Repository to mirror and patch against.
+url = "https://github.com/example/project"
+# Ref used when a command is not given one.
+default-ref = "v1.0.0"
+
+[sandbox]
+# persistent  keep the sandbox between runs and reset it to a ref, so expensive
+#             dependency state survives a ref change. This is what you want locally.
+# ephemeral   create it, use it, destroy it. This is what you want in CI.
+policy = "persistent"
+
+# Paths the reset must not touch. This is where dependency caches are protected.
+#
+# A reset force-checks out without removing untracked files, so an untracked cache such as
+# node_modules/ or target/ already survives. Naming it here is still worth doing: it makes
+# the dependency explicit, and it is what will be consulted for tracked paths too.
+#
+# For a path upstream *tracks*, listing it means this: when a reset would delete it because
+# the new base does not have it, skot puts the tracked version back. That restores the file,
+# not unsaved edits to it — a reset discards work in the sandbox by design, and `keep` is not
+# a way around that. It also restores from whatever the sandbox held before, so it covers the
+# one transition onto a base that dropped the path, not every reset after that.
+keep = ["node_modules", "target"]
+
+# Environment added to every hook, on top of the SKOT_* variables above.
+[env]
+# RUSTFLAGS = "-D warnings"
+
+[hooks]
+# --- sync: fetching the mirror ---
+pre-sync = ""
+post-sync = ""
+
+# --- apply: applying the patch series to the sandbox ---
+# post-apply is the natural home for a quick check: "does the result still parse",
+# "does the CLI still start".
+pre-apply = ""
+post-apply = ""
+
+# --- deps: installing dependencies ---
+# Just a hook. skot has no opinion about what a dependency is.
+deps = ""
+
+# --- build: producing whatever you are after ---
+# post-build is where you publish it. Copy to ~/.local/bin, keep a .bak, run a
+# smoke test, upload it. skot neither does this nor needs to know about it.
+pre-build = ""
+post-build = ""
+
+# --- verify: proving the result is good ---
+pre-verify = ""
+post-verify = ""
+
+# --- hooks outside the lifecycle ---
+# Invoked by name: `skot run <name>`.
+#
+# [[hook]]
+# name = "test"
+# cmd = "make check"
+# cwd = "."             # relative to the sandbox; defaults to the sandbox root
+# env = { CI = "1" }
+# required = false     # false warns instead of aborting

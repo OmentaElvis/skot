@@ -1,0 +1,60 @@
+[package]
+name = "skot"
+version = "0.1.0"
+edition = "2024"
+description = "Manage a patch series against an upstream git repository and build the result, without a fork."
+license = "MIT"
+repository = "https://github.com/you/skot"
+readme = "README.md"
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "skot"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4.6", features = ["derive", "wrap_help"] }
+# config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1"
+# errors
+anyhow = "1"
+thiserror = "2"
+# terminal
+indicatif = "0.18"
+inquire = "0.9"
+console = "0.16"
+# Diagnostics. Every record goes to stderr and is filtered by RUST_LOG; the default is quiet
+# enough that a normal run prints only what the user asked to be told.
+#
+# stdout is reserved for parsable output -- currently the `--json` document and nothing else --
+# so a script can pipe skot anywhere without its diagnostics corrupting the result. This is
+# the same split every well-behaved Unix tool makes, and it means `RUST_LOG=debug` is the way
+# to find out what skot was doing rather than re-reading the source.
+log = "0.4"
+env_logger = "0.11"
+# Suspends the progress display around every log write. Without it a record emitted while a
+# bar is ticking gets erased by that bar's next redraw, which is the one thing a progress bar
+# must never do to a line it did not draw.
+indicatif-log-bridge = "0.2"
+# The git engine. `git2` wraps libgit2, so skot needs no `git` binary installed --
+# but it does build libgit2 from C source. That is the accepted trade: libgit2 has the
+# patch-application, worktree, checkout and diff APIs skot needs, so skot implements
+# none of them itself.
+#
+# `https` and `ssh` are not optional extras. Without them libgit2 builds with no transport
+# capable of TLS or SSH at all, and every remote fails with "there is no TLS stream
+# available" -- including the https://github.com/... remotes that are the entire point of
+# mirroring an upstream. Both features link against the system OpenSSL, so building skot
+# needs OpenSSL's headers (`libssl-dev` on Debian and Ubuntu, `openssl-devel` on Fedora) and
+# libssh2. `vendored-openssl` is available in git2 if that is not acceptable.
+git2 = { version = "0.21", features = ["https", "ssh"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
+lto = "thin"
