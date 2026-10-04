@@ -51,6 +51,9 @@ indicatif-log-bridge = "0.2"
 # needs OpenSSL's headers (`libssl-dev` on Debian and Ubuntu, `openssl-devel` on Fedora) and
 # libssh2. `vendored-openssl` is available in git2 if that is not acceptable.
 git2 = { version = "0.21", features = ["https", "ssh"] }
+# The sandbox lock: flock(2) on unix, LockFileEx on Windows, issued directly rather than
+# through std's File::try_lock, which is not implemented on every target.
+fs4 = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 tempfile = "3"

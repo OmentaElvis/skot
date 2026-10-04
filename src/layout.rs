@@ -169,7 +169,8 @@ impl Layout {
     /// Take the advisory lock guarding the sandbox.
     ///
     /// This is an OS file lock (`flock` on Unix, `LockFileEx` on Windows) rather than a lock
-    /// file whose existence *is* the lock.
+    /// file whose existence *is* the lock, acquired through `fs4` because std's
+    /// `File::try_lock` is not implemented on every target.
     ///
     /// The retry window exists so a concurrent run surfaces as a message naming the lock rather
     /// than as a hang or a spurious failure.
@@ -188,12 +189,13 @@ impl Layout {
 
         let deadline = std::time::Instant::now() + LOCK_WAIT;
         loop {
-            match file.try_lock() {
+            // UFCS so the trait method wins over the inherent `File::try_lock`.
+            match fs4::FileExt::try_lock(&file) {
                 Ok(()) => return Ok(SandboxLock { _file: file }),
-                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(fs4::TryLockError::WouldBlock) => {}
                 // A real I/O failure, as opposed to contention. Surfaced immediately: retrying
                 // a permission error for three quarters of a second would only delay it.
-                Err(std::fs::TryLockError::Error(e)) => {
+                Err(fs4::TryLockError::Error(e)) => {
                     return Err(e)
                         .context(format!("locking the sandbox at {}", resource.display()));
                 }
