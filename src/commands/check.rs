@@ -4,6 +4,7 @@ use log::error;
 use crate::cli::CheckArgs;
 use crate::commands::{Ctx, Exit, emit_json};
 use crate::git;
+use crate::hints::Hints;
 use crate::report;
 
 /// Check the series against a ref, or against the sandbox when there is no ref.
@@ -78,6 +79,9 @@ pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
             "all {} apply",
             count(report.patch_count, "patch", "patches")
         )));
+        Hints::new("next")
+            .entry("skot build", "the whole run: fetch, apply, build, verify")
+            .print();
         return Ok(Exit::Success);
     }
 

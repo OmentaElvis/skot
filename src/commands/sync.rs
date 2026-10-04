@@ -1,7 +1,9 @@
 //! `sync`: mirror the upstream repository, and keep its refs current.
 //!
-//! This is the only command that touches the network. Everything else reads the mirror,
-//! which is what makes `check` and `apply` work offline.
+//! This is where upstream itself is fetched. `import` fetches too — a fork or a pull
+//! request — but only ever into this same mirror, through `git::mirror`, because that is
+//! where every command already reads from. Everything else just reads the mirror, which is
+//! what makes `check` and `apply` work offline.
 //!
 //! Two functions, with a deliberate boundary between them:
 //!
@@ -119,8 +121,11 @@ pub fn run(ctx: &Ctx, args: &RefArg) -> Result<Exit> {
     }
 
     Hints::new("next")
-        .entry("skot check <ref>", "verify the series applies to <ref>")
-        .entry("skot apply <ref>", "patch the sandbox against <ref>")
+        .entry("skot build", "the whole run: fetch, apply, build, verify")
+        .entry(
+            "skot check <ref>",
+            "verify the series applies, without building",
+        )
         .print();
     Ok(Exit::Success)
 }

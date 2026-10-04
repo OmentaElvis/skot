@@ -10,6 +10,7 @@ mod build;
 mod check;
 mod clean;
 mod hooks;
+mod import;
 mod init;
 mod list;
 mod new;
@@ -118,6 +119,7 @@ pub fn run(ctx: Ctx) -> Result<Exit> {
         Command::Sync(args) => sync::run(&ctx, args),
         Command::Apply(args) => apply::run(&ctx, args),
         Command::Unapply => apply::unapply(&ctx),
+        Command::Import(args) => import::run(&ctx, args),
         Command::New(args) => new::run(&ctx, args),
         Command::Refresh(args) => refresh::run(&ctx, args),
         Command::Push(args) => push::run(&ctx, args),

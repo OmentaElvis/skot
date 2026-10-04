@@ -96,7 +96,10 @@ pub fn run(ctx: &Ctx, arg: &RefArg) -> Result<Exit> {
             .first_failure()
             .map(|p| p.name.clone())
             .unwrap_or_default();
-        error!("`{failed}` does not apply to {} ({})", rebased.ref_name, rebased.sha);
+        error!(
+            "`{failed}` does not apply to {} ({})",
+            rebased.ref_name, rebased.sha
+        );
         for line in rebased.report.summary().lines() {
             debug!("{line}");
         }
@@ -128,7 +131,8 @@ pub fn run(ctx: &Ctx, arg: &RefArg) -> Result<Exit> {
     }
     debug!("  ~ rewritten,  = unchanged");
     Hints::new("next")
-        .entry("skot check", "re-verify the rewritten series")
+        .entry("skot build", "the whole run onto the new base")
+        .entry("skot check", "or just verify the rewritten series")
         .print();
     Ok(Exit::Success)
 }

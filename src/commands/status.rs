@@ -159,9 +159,7 @@ fn print_sandbox(layout: &Layout) {
         )),
     }
 
-    let applied = State::load(layout)
-        .map(|s| s.applied.len())
-        .unwrap_or(0);
+    let applied = State::load(layout).map(|s| s.applied.len()).unwrap_or(0);
     report::field(
         "applied",
         &match applied {

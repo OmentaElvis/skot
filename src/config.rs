@@ -32,8 +32,7 @@ pub struct Config {
 impl Config {
     /// Parse a config file. Errors name the file and, where toml can tell us, the key.
     pub fn load(path: &Path) -> Result<Self> {
-        let text =
-            std::fs::read_to_string(path).context(format!("reading {}", path.display()))?;
+        let text = std::fs::read_to_string(path).context(format!("reading {}", path.display()))?;
         Self::parse(&text).context(format!("parsing {}", path.display()))
     }
 

@@ -65,6 +65,10 @@ pub fn run(ctx: &Ctx, args: &BuildArgs) -> Result<Exit> {
         // case where neither argument applies.
         sandbox::remove(&ctx.layout)?;
     }
+    // Reload rather than reusing the copy `begin` took: the phases wrote their own state
+    // (`apply` records the ref and the applied stack), and finishing from a snapshot taken
+    // before they ran would write those records back the way they were — empty.
+    let mut state = State::load(&ctx.layout)?;
     state.finish(&ctx.layout)?;
     drop(lock);
 
@@ -297,9 +301,7 @@ mod tests {
         let (_tmp, layout) = testsupport::project();
         let (config, _) = layout.project().unwrap();
 
-        let err = the_ref(&layout, &config, None)
-            .unwrap_err()
-            .to_string();
+        let err = the_ref(&layout, &config, None).unwrap_err().to_string();
         assert!(err.contains("no ref to build"), "got {err}");
         assert!(
             err.contains("skot build v1.2.0"),
@@ -311,9 +313,7 @@ mod tests {
     fn a_build_says_where_to_put_the_ref_when_the_default_is_unset() {
         let (_tmp, layout) = testsupport::project();
         let (config, _) = layout.project().unwrap();
-        let err = the_ref(&layout, &config, None)
-            .unwrap_err()
-            .to_string();
+        let err = the_ref(&layout, &config, None).unwrap_err().to_string();
         assert!(err.contains("upstream.default-ref"), "got {err}");
     }
 
@@ -402,6 +402,36 @@ mod tests {
         let (config, _) = layout.project().unwrap();
         drive(&layout, &config, "main", &[Phase::Apply], false, 0).unwrap();
         drive(&layout, &config, "main", &[Phase::Apply], false, 0).unwrap();
+    }
+
+    #[test]
+    fn a_finished_run_keeps_what_the_phases_recorded() {
+        // `run` marks the run in flight, runs the phases, and then marks it finished. If
+        // it finishes from the snapshot taken before the phases, `apply`'s records are
+        // written back as they were — empty — and the sandbox holds the series while the
+        // state says nothing is applied, which every later command believes.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = buildable(tmp.path());
+        let cli = crate::cli::Cli::try_parse_from(["skot", "build", "--only", "apply"]).unwrap();
+        let crate::cli::Command::Build(args) = cli.command.clone() else {
+            panic!("expected build")
+        };
+        let ctx = Ctx {
+            layout,
+            cli,
+            yes: false,
+        };
+
+        run(&ctx, &args).unwrap();
+
+        let state = State::load(&ctx.layout).unwrap();
+        assert_eq!(state.ref_name.as_deref(), Some("main"));
+        assert_eq!(state.applied, ["0001-a.patch"]);
+        assert!(state.sha.as_deref().is_some_and(|s| s.len() == 40));
+        assert!(
+            state.in_flight.is_none() && state.in_flight_command.is_none(),
+            "the run finished, so nothing is in flight"
+        );
     }
 
     #[test]

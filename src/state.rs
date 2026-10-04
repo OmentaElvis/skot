@@ -29,9 +29,7 @@ impl State {
     pub fn load(layout: &Layout) -> Result<Self> {
         let path = layout.state_file();
         match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                serde_json::from_str(&text).context(format!("parsing {}", path.display()))
-            }
+            Ok(text) => serde_json::from_str(&text).context(format!("parsing {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).context(format!("reading {}", path.display())),
         }

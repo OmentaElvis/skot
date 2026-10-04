@@ -281,12 +281,16 @@ impl Drop for Spinner {
 ///
 /// The remote's line is worth showing while it is speaking, it names the phase
 /// ("Counting", "Compressing") that a bare counter cannot, and it is what git shows. A
-/// chunk can carry a whole phase at once, so only its last non-empty line is taken: that
-/// is the current one, and a multi-line message would not fit the one-line spinner. A
-/// line declaring its phase done is logged instead, so it stays in the console
-/// Our own counter takes the line only in the remote's silences, the pack
-/// streaming and the delta resolution that follow, where otherwise the display would sit
-/// still.
+/// chunk boundary falls wherever the transport's packet ended, so text is reassembled
+/// across chunks and only a newline-terminated line is acted on — anything else is a
+/// fragment: the tail of a word, or a `done.` whose phase is still in the previous
+/// chunk. Within a line, the remote's carriage returns reduce it to the frame it meant
+/// to show, because a redraw sequence will not fit the one-line spinner and a carriage
+/// return reaching the log would execute there and erase the tag printed in front of it.
+/// A line declaring its phase done is logged instead of shown, so the finished phases
+/// stay in the console after the spinner is gone. Our own counter takes the line only in
+/// the remote's silences, the pack streaming and the delta resolution that follow, where
+/// otherwise the display would sit still.
 ///
 /// The callbacks are called from the transport's thread, so the counters are atomics and
 /// the spinner is shared.
@@ -308,6 +312,10 @@ pub struct Progress {
     total_deltas: AtomicUsize,
     /// When the remote last spoke, so our counter can yield while its line is current.
     sideband_at: Mutex<Option<Instant>>,
+    /// The sideband text of a line the remote has not terminated yet. A chunk boundary
+    /// can fall anywhere in it, so the line is only knowable once the newline arrives;
+    /// until then the next chunk is appended here.
+    partial: Mutex<String>,
 }
 
 impl Progress {
@@ -320,6 +328,7 @@ impl Progress {
             indexed_deltas: AtomicUsize::new(0),
             total_deltas: AtomicUsize::new(0),
             sideband_at: Mutex::new(None),
+            partial: Mutex::new(String::new()),
         }
     }
 
@@ -360,22 +369,26 @@ impl Progress {
         callbacks.sideband_progress(on_sideband);
     }
 
-    /// Take a chunk of the remote's sideband chatter and put the current line on screen.
+    /// Take a chunk of the remote's sideband chatter and act on its lines.
     ///
-    /// A chunk may carry a whole phase's worth of lines; only the last non-empty one is
-    /// current, and a multi-line message would not fit the spinner. A line that declares
-    /// its phase done is history rather than state: it is logged, so it stays in the
-    /// console the way git leaves it, and the spinner moves on with the next phase.
+    /// [`sideband`] reassembles the chunk against the line the remote left unfinished
+    /// and reports what became actionable: every line that declares itself done becomes
+    /// a log record — history rather than state, so it stays in the console after the
+    /// spinner is gone — and the unfinished line's current frame is what the spinner
+    /// shows. A chunk of pure whitespace is not speech and must not silence our own
+    /// counter, which is why the timestamp only moves when the remote said something.
     fn observe(&self, text: &str) {
-        let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
-        let Some(latest) = lines.next_back() else {
-            return;
-        };
-        *self.sideband_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
-        if latest.contains("done") {
-            info!(target: "git", "{latest}");
-        } else {
-            self.spinner.set_message(latest);
+        let spoke = !text.trim().is_empty();
+        let mut partial = self.partial.lock().unwrap_or_else(|e| e.into_inner());
+        let lines = sideband(&mut partial, text);
+        if spoke {
+            *self.sideband_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        }
+        for line in lines.done {
+            info!(target: "git", "{line}");
+        }
+        if let Some(line) = lines.current {
+            self.spinner.set_message(&line);
         }
     }
 
@@ -426,6 +439,69 @@ impl Progress {
     pub fn finish(&self) {
         self.spinner.finish();
     }
+}
+
+/// What the remote's sideband text asks of the display.
+struct Sideband {
+    /// Lines that declare themselves done: logged, not shown.
+    done: Vec<String>,
+    /// The unfinished line's current frame, for the spinner; `None` when there is none.
+    current: Option<String>,
+}
+
+/// Fold one chunk of sideband text into the pending line and report what is actionable.
+///
+/// A chunk boundary falls wherever the transport's packet ended — mid-word, or between
+/// a phase's last frame and the `done` that finishes it — so a line is only knowable
+/// once its newline has arrived; everything after the last newline stays in `pending`
+/// for the next chunk to continue. Acting on a fragment is how a fetch ends up logging
+/// a bare `done.` with no phase attached to it, or the middle of a word.
+///
+/// Within a completed line, the remote's own carriage returns reduce it to the frame it
+/// meant to show: `Counting objects:  42% (3/7)\rCounting objects: 100% (7/7), done.` is
+/// one line whose last frame is the current one, the earlier frames having been replaced
+/// on the remote's own screen. Letting them through would redraw them here — on the
+/// spinner, a garbled line; in a log record, a carriage return racing back over the tag
+/// printed in front of it.
+///
+/// The unfinished line is reported on every chunk, because progress redraws use `\r`
+/// rather than `\n`: waiting for a newline would freeze the spinner for the whole phase.
+/// A line that ends without declaring itself done is neither shown nor logged; it has
+/// finished, and the next live line or phase takes over.
+fn sideband(pending: &mut String, chunk: &str) -> Sideband {
+    pending.push_str(chunk);
+
+    let mut out = Sideband {
+        done: Vec::new(),
+        current: None,
+    };
+    if let Some(cut) = pending.rfind('\n') {
+        // `split_off` hands back everything after the newline and leaves the completed
+        // lines — through the newline — in `pending`.
+        let tail = pending.split_off(cut + 1);
+        for line in pending.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let frame = frame(line);
+            if frame.contains("done") {
+                out.done.push(frame.to_owned());
+            }
+        }
+        *pending = tail;
+    }
+
+    let live = pending.trim();
+    if !live.is_empty() {
+        out.current = Some(frame(live).to_owned());
+    }
+    out
+}
+
+/// The frame a sideband line has settled on: everything after its last carriage return.
+fn frame(line: &str) -> &str {
+    line.rsplit('\r').next().unwrap_or(line).trim()
 }
 
 #[cfg(test)]
@@ -506,5 +582,115 @@ mod progress_tests {
         assert_eq!(p.status_line(1024), "resolving deltas 0/10");
         p.indexed_deltas.store(10, Ordering::Relaxed);
         assert_eq!(p.status_line(1024), "received 100 objects, 1.0K");
+    }
+}
+
+#[cfg(test)]
+mod sideband_tests {
+    use super::sideband;
+
+    #[test]
+    fn a_split_done_line_is_logged_whole_not_as_a_bare_done() {
+        // The chunk boundary that produced `git done.` in a real fetch: one chunk ends
+        // with the phase's last frame and the next begins with the `done.` that finishes
+        // it. Nothing may be logged until the newline proves the line over.
+        let mut pending = String::new();
+        let first = sideband(&mut pending, "Counting objects: 100% (255/255), ");
+        assert!(first.done.is_empty());
+        assert_eq!(
+            first.current.as_deref(),
+            Some("Counting objects: 100% (255/255),")
+        );
+
+        let second = sideband(&mut pending, "done.\n");
+        assert_eq!(second.done, ["Counting objects: 100% (255/255), done."]);
+        assert_eq!(second.current, None);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_line_split_mid_word_is_joined_before_it_is_acted_on() {
+        // Also from a real fetch: a logged record began `objects: 98% ...` because the
+        // chunk boundary fell inside the word "Counting".
+        let mut pending = String::new();
+        let first = sideband(&mut pending, "Counting ");
+        assert!(first.done.is_empty());
+
+        let second = sideband(&mut pending, "objects: 100% (255/255), done.\n");
+        assert_eq!(second.done, ["Counting objects: 100% (255/255), done."]);
+    }
+
+    #[test]
+    fn redraws_collapse_to_the_frame_the_remote_meant_to_show() {
+        let mut pending = String::new();
+        let out = sideband(
+            &mut pending,
+            "Counting objects:   0% (1/7)\rCounting objects:  50% (4/7)\rCounting objects: 100% (7/7), done.\n",
+        );
+        assert_eq!(out.done, ["Counting objects: 100% (7/7), done."]);
+        assert_eq!(out.current, None);
+    }
+
+    #[test]
+    fn no_carriage_return_survives_into_a_logged_line() {
+        // From a captured real fetch: the logger printed the record with its `git` tag
+        // and the message's own carriage return raced back over the tag, which is the
+        // first bug this split exists to stop.
+        let mut pending = String::new();
+        let out = sideband(
+            &mut pending,
+            "objects:  98% (250/255)\rCounting objects: 100% (255/255), done\n",
+        );
+        assert_eq!(out.done, ["Counting objects: 100% (255/255), done"]);
+        assert!(out.done.iter().all(|line| !line.contains('\r')));
+    }
+
+    #[test]
+    fn every_finished_phase_is_kept_not_only_the_last_line() {
+        let mut pending = String::new();
+        let out = sideband(
+            &mut pending,
+            "Enumerating objects: 525, done.\n\
+             Counting objects:  42% (3/7)\n\
+             Compressing objects: 100% (72/72), done.\n",
+        );
+        assert_eq!(
+            out.done,
+            [
+                "Enumerating objects: 525, done.",
+                "Compressing objects: 100% (72/72), done.",
+            ]
+        );
+        // The middle line ended without declaring itself done: it is finished, not live.
+        assert_eq!(out.current, None);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn the_spinner_follows_the_live_line_across_chunks() {
+        // Progress redraws use `\r`, not `\n`: the live line stays unfinished for the
+        // whole phase, and the spinner must still advance chunk by chunk.
+        let mut pending = String::new();
+        let first = sideband(
+            &mut pending,
+            "Resolving deltas:  10% (1/8)\rResolving deltas:  20%",
+        );
+        assert_eq!(first.current.as_deref(), Some("Resolving deltas:  20%"));
+        assert!(first.done.is_empty());
+
+        let second = sideband(&mut pending, " (2/8)");
+        assert_eq!(
+            second.current.as_deref(),
+            Some("Resolving deltas:  20% (2/8)")
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_flush_is_not_speech() {
+        let mut pending = String::new();
+        let out = sideband(&mut pending, "\n   \n\t\n");
+        assert!(out.done.is_empty());
+        assert_eq!(out.current, None);
+        assert!(pending.is_empty());
     }
 }

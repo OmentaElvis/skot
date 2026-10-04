@@ -83,6 +83,9 @@ pub enum Command {
     /// Remove the whole series from the sandbox.
     Unapply,
 
+    /// Import a commit range, a fork's branch, or a pull request as a new patch.
+    Import(ImportArgs),
+
     /// Apply the next patch in the series, or a named one.
     Push(PatchArg),
 
@@ -175,7 +178,7 @@ pub struct InitArgs {
     #[arg(long, value_name = "PATH")]
     pub keep: Vec<String>,
 
-    /// Set a hook: NAME=COMMAND, where NAME is a key of [hooks]. Repeatable.
+    /// Set a hook: NAME=COMMAND, where NAME is a key of the `hooks` table. Repeatable.
     /// A hook you name here is not asked about.
     #[arg(long, value_name = "NAME=COMMAND")]
     pub hook: Vec<String>,
@@ -226,6 +229,34 @@ pub struct PatchArg {
     /// Patch in the series. Defaults to the one on top of the stack.
     #[arg(value_name = "PATCH")]
     pub patch: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ImportArgs {
+    /// What to import: `FROM..TO`, `FROM...TO` (from their merge base), or just `TO`.
+    #[arg(value_name = "RANGE", required_unless_present = "pr")]
+    pub range: Option<String>,
+
+    /// Base of the patch. Defaults to the merge base with `upstream.default-ref`.
+    #[arg(long, value_name = "REF")]
+    pub from: Option<String>,
+
+    /// Import pull request N, by fetching `refs/pull/N/head` from `upstream.url`.
+    #[arg(long, value_name = "N", conflicts_with = "range")]
+    pub pr: Option<u64>,
+
+    /// Fetch the range from this repository (a URL or a local clone). Refs are looked up
+    /// there first, so a range named against that repository resolves as written.
+    #[arg(long, value_name = "URL")]
+    pub repo: Option<String>,
+
+    /// Name for the new patch. Defaults to the subject of what is being imported.
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Write the patch file without adding it to the series.
+    #[arg(long)]
+    pub no_register: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -386,5 +417,51 @@ mod tests {
     fn new_requires_a_name() {
         assert!(Cli::try_parse_from(["skot", "new"]).is_err());
         assert!(Cli::try_parse_from(["skot", "new", "trim-widgets"]).is_ok());
+    }
+
+    #[test]
+    fn import_takes_a_range_a_pull_request_and_a_source_repository() {
+        let cli = Cli::try_parse_from(["skot", "import", "main..feat"]).unwrap();
+        let Command::Import(args) = cli.command else {
+            panic!("expected import")
+        };
+        assert_eq!(args.range.as_deref(), Some("main..feat"));
+        assert!(args.pr.is_none());
+        assert!(args.repo.is_none());
+
+        let cli = Cli::try_parse_from(["skot", "import", "--pr", "42", "--name", "fix"]).unwrap();
+        let Command::Import(args) = cli.command else {
+            panic!("expected import")
+        };
+        assert_eq!(args.pr, Some(42));
+        assert_eq!(args.name.as_deref(), Some("fix"));
+
+        let cli =
+            Cli::try_parse_from(["skot", "import", "--repo", "../fork", "main..feat"]).unwrap();
+        let Command::Import(args) = cli.command else {
+            panic!("expected import")
+        };
+        assert_eq!(args.repo.as_deref(), Some("../fork"));
+        assert_eq!(args.range.as_deref(), Some("main..feat"));
+    }
+
+    #[test]
+    fn import_cannot_take_both_a_pull_request_and_a_range() {
+        let err = Cli::try_parse_from(["skot", "import", "--pr", "7", "main..feat"]).unwrap_err();
+        let err = err.to_string();
+        assert!(
+            err.contains("--pr"),
+            "the conflicting flag should be named: {err}"
+        );
+        assert!(
+            err.contains("RANGE"),
+            "the other side should be named: {err}"
+        );
+    }
+
+    #[test]
+    fn import_with_nothing_to_import_is_rejected() {
+        assert!(Cli::try_parse_from(["skot", "import"]).is_err());
+        assert!(Cli::try_parse_from(["skot", "import", "--no-register"]).is_err());
     }
 }

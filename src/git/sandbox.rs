@@ -74,8 +74,7 @@ pub fn create(layout: &Layout, mirror: &Mirror) -> Result<()> {
             .context(format!("clearing the empty directory {}", dir.display()))?;
     }
     if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent)
-            .context(format!("creating {}", parent.display()))?;
+        std::fs::create_dir_all(parent).context(format!("creating {}", parent.display()))?;
     }
 
     // `checkout_existing` populates the new worktree from its HEAD. Without it libgit2 adds
@@ -108,10 +107,9 @@ pub fn create(layout: &Layout, mirror: &Mirror) -> Result<()> {
 /// `reset_to` wants anyway; doing it here means the branch is removed the moment it exists
 /// rather than lingering.
 fn detach_and_drop_stub_branch(mirror: &Mirror, dir: &Path) -> Result<()> {
-    let worktree = mirror
-        .repo()
-        .find_worktree(WORKTREE_NAME)
-        .context(format!("looking up the {WORKTREE_NAME} worktree just added"))?;
+    let worktree = mirror.repo().find_worktree(WORKTREE_NAME).context(format!(
+        "looking up the {WORKTREE_NAME} worktree just added"
+    ))?;
     let repo = git2::Repository::open_from_worktree(&worktree)
         .context(format!("opening the sandbox at {}", dir.display()))?;
 
@@ -146,14 +144,11 @@ fn detach_and_drop_stub_branch(mirror: &Mirror, dir: &Path) -> Result<()> {
 pub fn open(layout: &Layout) -> Result<git2::Repository> {
     let dir = layout.sandbox_dir();
     let mirror = Mirror::open(layout)?;
-    let worktree = mirror
-        .repo()
-        .find_worktree(WORKTREE_NAME)
-        .context(format!(
-            "the mirror at {} has no `{WORKTREE_NAME}` worktree, so there is no sandbox.\n\
+    let worktree = mirror.repo().find_worktree(WORKTREE_NAME).context(format!(
+        "the mirror at {} has no `{WORKTREE_NAME}` worktree, so there is no sandbox.\n\
              Run `skot apply` to create one.",
-            mirror.path().display()
-        ))?;
+        mirror.path().display()
+    ))?;
     git2::Repository::open_from_worktree(&worktree)
         .context(format!("opening the sandbox at {}", dir.display()))
 }
@@ -243,8 +238,10 @@ pub fn restore_kept(
     if survivors.is_empty() {
         return Ok(Vec::new());
     }
-    super::diff::restore_paths(&repo, &old, &survivors)
-        .context(format!("restoring keep paths in {}", layout.sandbox_dir().display()))
+    super::diff::restore_paths(&repo, &old, &survivors).context(format!(
+        "restoring keep paths in {}",
+        layout.sandbox_dir().display()
+    ))
 }
 
 /// Check out `sha` into the sandbox, leaving the working tree clean.
@@ -297,9 +294,9 @@ pub fn reset_to(layout: &Layout, sha: &Sha, keep: &[String]) -> Result<()> {
     // detaching HEAD above would leave it behind, pointing at a commit the sandbox no longer
     // has. Remove it so the mirror lists only what upstream actually published.
     if let Ok(mut branch) = repo.find_reference(&format!("refs/heads/{WORKTREE_NAME}")) {
-        branch
-            .delete()
-            .context(format!("removing the stale `{WORKTREE_NAME}` branch from the mirror"))?;
+        branch.delete().context(format!(
+            "removing the stale `{WORKTREE_NAME}` branch from the mirror"
+        ))?;
     }
 
     // `force` is what makes this a reset rather than a checkout: without it libgit2 refuses to
@@ -420,9 +417,10 @@ pub fn remove(layout: &Layout) -> Result<()> {
         // sandbox is the normal case rather than a reason to refuse.
         let mut options = git2::WorktreePruneOptions::new();
         options.valid(true).working_tree(true);
-        worktree
-            .prune(Some(&mut options))
-            .context(format!("unregistering the sandbox worktree for {}", dir.display()))?;
+        worktree.prune(Some(&mut options)).context(format!(
+            "unregistering the sandbox worktree for {}",
+            dir.display()
+        ))?;
     }
     if dir.exists() {
         std::fs::remove_dir_all(&dir)

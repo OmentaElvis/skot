@@ -160,8 +160,7 @@ impl Layout {
             std::fs::remove_dir_all(&target)
                 .context(format!("removing directory {}", target.display()))?;
         } else {
-            std::fs::remove_file(&target)
-                .context(format!("removing file {}", target.display()))?;
+            std::fs::remove_file(&target).context(format!("removing file {}", target.display()))?;
         }
         Ok(true)
     }
@@ -185,7 +184,10 @@ impl Layout {
             .create(true)
             .truncate(false)
             .open(&resource)
-            .context(format!("opening the sandbox lock at {}", resource.display()))?;
+            .context(format!(
+                "opening the sandbox lock at {}",
+                resource.display()
+            ))?;
 
         let deadline = std::time::Instant::now() + LOCK_WAIT;
         loop {

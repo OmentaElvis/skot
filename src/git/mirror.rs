@@ -49,22 +49,31 @@ impl Mirror {
         Self::fetch(&url, &self.path, ref_name, "fetching upstream").map(|_| ())
     }
 
-    /// The one network call, shared by the initial fetch and every later one.
+    /// Fetch `refspecs` from `url` through the mirror's remote called `remote_name`,
+    /// showing `message` while it runs.
     ///
-    /// There is deliberately no `RepoBuilder::clone` shortcut for a mirror that does not exist
-    /// yet. `clone` takes its refspecs from the remote's config, which means the first
-    /// `skot sync <ref>` would fetch whatever the remote's default branch is and ignore the
-    /// ref that was actually asked for — and would then leave the mirror missing every other
-    /// branch. Initialising and fetching by hand costs three lines and makes the first sync
-    /// behave exactly like the second, which is the property that makes this understandable.
-    ///
-    /// The progress is wired to the spinner rather than discarded. A mirror of a real project
-    /// is minutes of network, and silence that long is indistinguishable from a hang.
-    /// Fetch into `path`, showing `message` on a spinner.
-    ///
-    /// Whether the spinner is drawn is decided where a spinner is made, from the process's
-    /// own situation (`--json`, not a terminal) — not handed in as an instruction from a
-    /// caller. See `ui::Spinner`.
+    /// This is `import`'s network access: a fork or a pull request is fetched *into* the
+    /// mirror under whatever destinations `refspecs` name, so everything after the fetch
+    /// reads the same object store every other command already reads. A remote other than
+    /// `origin` is retargeted to `url` on every call, because one project can be imported
+    /// from several repositories; `origin` keeps the URL it was cloned with.
+    pub fn fetch_refspecs(
+        &self,
+        url: &str,
+        remote_name: &str,
+        refspecs: &[String],
+        message: &str,
+    ) -> Result<()> {
+        Self::transfer(url, &self.path, remote_name, refspecs, message).map(|_| ())
+    }
+
+    /// Resolve `name` to a commit id if it resolves at all, for callers that are probing
+    /// several candidate names and want a miss rather than an error naming a remedy.
+    pub fn try_resolve(&self, name: &str) -> Option<Sha> {
+        super::try_commit(&self.repo, name)
+    }
+
+    /// `sync`'s refspecs: every branch and tag, plus force-updates for `ref_name`.
     fn fetch(
         url: &str,
         path: &Path,
@@ -94,6 +103,30 @@ impl Mirror {
             refspecs.push(format!("+refs/tags/{name}:refs/tags/{name}"));
         }
 
+        Self::transfer(url, path, "origin", &refspecs, message)
+    }
+
+    /// The one network call, shared by the initial fetch, every later `sync`, and `import`.
+    ///
+    /// There is deliberately no `RepoBuilder::clone` shortcut for a mirror that does not exist
+    /// yet. `clone` takes its refspecs from the remote's config, which means the first
+    /// `skot sync <ref>` would fetch whatever the remote's default branch is and ignore the
+    /// ref that was actually asked for — and would then leave the mirror missing every other
+    /// branch. Initialising and fetching by hand costs three lines and makes the first sync
+    /// behave exactly like the second, which is the property that makes this understandable.
+    ///
+    /// The progress is wired to the spinner rather than discarded. A mirror of a real project
+    /// is minutes of network, and silence that long is indistinguishable from a hang. Whether
+    /// the spinner is drawn is decided where a spinner is made, from the process's own
+    /// situation (`--json`, not a terminal) — not handed in as an instruction from a caller.
+    /// See `ui::Spinner`.
+    fn transfer(
+        url: &str,
+        path: &Path,
+        remote_name: &str,
+        refspecs: &[String],
+        message: &str,
+    ) -> Result<git2::Repository> {
         let repo = if path.join("HEAD").is_file() {
             git2::Repository::open_bare(path)
                 .context(format!("opening the mirror at {}", path.display()))?
@@ -109,10 +142,18 @@ impl Mirror {
 
         // `origin` is written on the first fetch and reused after that, so the URL survives
         // without skot keeping its own copy of it. A later `sync` reads it back with
-        // `remote_url`.
-        if repo.find_remote("origin").is_err() {
-            repo.remote("origin", url)
-                .context(format!("recording {url} as the mirror's `origin`"))?;
+        // `remote_url`. Any other remote belongs to a one-off source, so it is retargeted:
+        // importing from repository A and then repository B must fetch from B, not from A.
+        match repo.find_remote(remote_name) {
+            Ok(_) if remote_name == "origin" => {}
+            Ok(_) => {
+                repo.remote_set_url(remote_name, url)
+                    .context(format!("pointing `{remote_name}` at {url}"))?;
+            }
+            Err(_) => {
+                repo.remote(remote_name, url)
+                    .context(format!("recording {url} as the mirror's `{remote_name}`"))?;
+            }
         }
 
         let progress = ui::Progress::new(message);
@@ -123,10 +164,10 @@ impl Mirror {
 
         {
             let mut remote = repo
-                .find_remote("origin")
+                .find_remote(remote_name)
                 .context(format!("preparing a fetch from {url}"))?;
             remote
-                .fetch(&refspecs, Some(&mut options), None)
+                .fetch(refspecs, Some(&mut options), None)
                 .context(format!(
                     "fetching from {url}. If this says 'not found' or 'no such remote', check the URL and that you can reach it."
                 ))?;
@@ -135,7 +176,9 @@ impl Mirror {
             // (`refs/heads/master`, usually), which nothing points at after a wildcard fetch.
             // `init_bare` never guesses the remote's actual default branch, so HEAD dangles
             // and every bare `HEAD` lookup fails — including `skot check` with no ref
-            // argument. Point it at the remote's default branch instead.
+            // argument. Point it at the remote's default branch instead. Only `origin`'s
+            // fetch can be the mirror's first: `import` fetches into a mirror that already
+            // exists.
             // `head()` succeeds on an *unborn* HEAD — it resolves the symbolic ref without checking
             // that anything is there — so the test has to be for the ref actually pointing at a commit.
             let head_dangles = repo
@@ -143,7 +186,7 @@ impl Mirror {
                 .ok()
                 .and_then(|h| h.peel_to_commit().ok())
                 .is_none();
-            if head_dangles {
+            if head_dangles && remote_name == "origin" {
                 // `default_branch` is only answerable once the remote has connected, which is
                 // why this is inside the fetch's scope. It returns the *full* ref name.
                 let default = remote

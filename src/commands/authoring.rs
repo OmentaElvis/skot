@@ -98,8 +98,10 @@ pub fn base_tree_for_patch<'r>(
 /// of them want a checkout, so they share this rather than each calling `replay_series` and
 /// remembering to handle the failing case.
 pub fn replay(repo: &git2::Repository, base: &Sha, entries: &[Entry]) -> Result<check::Applied> {
-    check::replay_series(repo, base, entries)
-        .context(format!("replaying {} patch(es) against {base}", entries.len()))
+    check::replay_series(repo, base, entries).context(format!(
+        "replaying {} patch(es) against {base}",
+        entries.len()
+    ))
 }
 
 /// Check the sandbox is present and readable, with a message that says how to get there.

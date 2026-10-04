@@ -181,7 +181,7 @@ fn prepare_sandbox(layout: &Layout, base: &str, name: &str) -> Result<()> {
 /// series. So `/`, `\`, and anything that could escape the directory are refused outright
 /// rather than sanitised — a name the tool quietly rewrites is a name the user will not
 /// recognise in `skot list`.
-fn slug(name: &str) -> Result<String> {
+pub(super) fn slug(name: &str) -> Result<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         bail!("a patch needs a name");
@@ -368,19 +368,14 @@ mod tests {
     #[test]
     fn new_refuses_to_clobber_an_existing_patch() {
         let (_tmp, layout) = project();
-        std::fs::write(
-            layout.patches_dir().join("0001-trim-widgets.patch"),
-            "mine",
-        )
-        .unwrap();
+        std::fs::write(layout.patches_dir().join("0001-trim-widgets.patch"), "mine").unwrap();
 
         let err = create(&layout, "trim-widgets", None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("already exists"), "got {err}");
         assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0001-trim-widgets.patch"))
-                .unwrap(),
+            std::fs::read_to_string(layout.patches_dir().join("0001-trim-widgets.patch")).unwrap(),
             "mine",
             "the existing patch was overwritten"
         );

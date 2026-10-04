@@ -131,15 +131,17 @@ pub fn apply_locked(layout: &Layout, ref_name: Option<&str>) -> Result<Applied> 
 
     // Check out the tree the replay built. `force` because the sandbox may hold build
     // output that libgit2 would otherwise refuse to overwrite.
-    let tree = repo
-        .find_tree(applied.tree)
-        .context(format!("reading the tree the series produced ({})", applied.tree))?;
+    let tree = repo.find_tree(applied.tree).context(format!(
+        "reading the tree the series produced ({})",
+        applied.tree
+    ))?;
     let mut options = git2::build::CheckoutBuilder::new();
     options.force();
-    repo.checkout_tree(tree.as_object(), Some(&mut options)).context(format!(
-        "checking the patched tree into {}",
-        layout.sandbox_dir().display()
-    ))?;
+    repo.checkout_tree(tree.as_object(), Some(&mut options))
+        .context(format!(
+            "checking the patched tree into {}",
+            layout.sandbox_dir().display()
+        ))?;
 
     // *After* that checkout, not inside `reset_to`: the checkout above is the one that
     // actually decides what the sandbox holds, and it removes the same tracked files the

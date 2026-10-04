@@ -90,8 +90,7 @@ pub fn commit_tree<'a>(repo: &'a git2::Repository, rev: &str) -> Result<git2::Tr
                 .map_err(anyhow::Error::from)
                 .context(format!("{rev} is not a commit"))
         })?;
-    obj.tree()
-        .context(format!("reading the tree of {rev}"))
+    obj.tree().context(format!("reading the tree of {rev}"))
 }
 
 /// Is `path` inside a repository?

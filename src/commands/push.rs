@@ -138,7 +138,8 @@ mod tests {
         let series = layout.project().unwrap().1;
 
         let stack =
-            authoring::resolve_stack(&layout, &series, &State::default(), None, Move::Deeper).unwrap();
+            authoring::resolve_stack(&layout, &series, &State::default(), None, Move::Deeper)
+                .unwrap();
         assert_eq!(stack.names, vec!["0001-a.patch"]);
     }
 
@@ -212,10 +213,15 @@ mod tests {
         testsupport::write_series(&layout, &[("0001-a.patch", "")]);
         let series = layout.project().unwrap().1;
 
-        let err =
-            authoring::resolve_stack(&layout, &series, &State::default(), Some("nope"), Move::Deeper)
-                .unwrap_err()
-                .to_string();
+        let err = authoring::resolve_stack(
+            &layout,
+            &series,
+            &State::default(),
+            Some("nope"),
+            Move::Deeper,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("0001-a.patch"), "got {err}");
     }
 

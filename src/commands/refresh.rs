@@ -164,8 +164,7 @@ fn refresh(
     // is gone.
     verify_round_trip(&repo, &base, &patch, &target.name)?;
 
-    std::fs::write(&target.path, &patch)
-        .context(format!("writing {}", target.path.display()))?;
+    std::fs::write(&target.path, &patch).context(format!("writing {}", target.path.display()))?;
 
     let mut series = series;
     let registered = if no_register {
@@ -310,8 +309,9 @@ fn verify_round_trip(
     patch: &str,
     name: &str,
 ) -> Result<()> {
-    let diff = git2::Diff::from_buffer(patch.as_bytes())
-        .context(format!("the exported {name} is not a patch skot can read back"))?;
+    let diff = git2::Diff::from_buffer(patch.as_bytes()).context(format!(
+        "the exported {name} is not a patch skot can read back"
+    ))?;
     repo.apply_to_tree(base, &diff, None)
         .map(|_| ())
         .context(format!(
@@ -328,9 +328,7 @@ mod tests {
     #[test]
     fn refresh_needs_a_sandbox() {
         let (_tmp, layout) = testsupport::project();
-        let err = refresh(&layout, None, None, false)
-            .unwrap_err()
-            .to_string();
+        let err = refresh(&layout, None, None, false).unwrap_err().to_string();
         assert!(err.contains("skot apply"), "got {err}");
     }
 

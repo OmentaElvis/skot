@@ -121,7 +121,10 @@ fn scaffold(layout: &Layout, plan: &Plan) -> Result<()> {
     }
     match plan.policy {
         Some(policy) => {
-            template = template.replace(PLACEHOLDER_POLICY, &toml_line("policy", &policy.to_string()))
+            template = template.replace(
+                PLACEHOLDER_POLICY,
+                &toml_line("policy", &policy.to_string()),
+            )
         }
         None => template = template.replace(PLACEHOLDER_POLICY, &format!("# {PLACEHOLDER_POLICY}")),
     }
@@ -276,10 +279,11 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
             None
         } else {
             let all: Vec<usize> = (0..candidates.len()).collect();
-            let selected = inquire::MultiSelect::new("Paths that must survive a ref change", candidates)
-                .with_default(&all)
-                .prompt()
-                .context("asking which paths to protect")?;
+            let selected =
+                inquire::MultiSelect::new("Paths that must survive a ref change", candidates)
+                    .with_default(&all)
+                    .prompt()
+                    .context("asking which paths to protect")?;
             if selected.is_empty() {
                 None
             } else {
@@ -382,8 +386,9 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
             "edit the [hooks] section to describe how you build and where the result\n  \
              goes; post-build is where you copy it into place.\n",
         );
+        hints = hints.entry("skot build", "the whole run: fetch, apply, build, verify");
         if sync.is_none() {
-            hints = hints.entry("skot sync <ref>", "mirror the upstream repository");
+            hints = hints.entry("skot sync <ref>", "just mirror the upstream repository");
         }
         hints
             .entry("skot new <name>", "start a patch, with the series applied")
@@ -461,7 +466,10 @@ mod tests {
         scaffold(&layout, &p).unwrap();
 
         let written = read(&layout);
-        assert!(written.contains(&toml_line("policy", "ephemeral")), "{written}");
+        assert!(
+            written.contains(&toml_line("policy", "ephemeral")),
+            "{written}"
+        );
         assert!(written.contains("keep = [\"npm-cache\"]"), "{written}");
         assert!(!written.contains(PLACEHOLDER_KEEP), "{written}");
 
@@ -479,13 +487,22 @@ mod tests {
         // A live example is a guess that parses: commented, it stays visible as the
         // thing to fill in and commands see nothing at all.
         let written = read(&layout);
-        assert!(written.contains(&format!("# {PLACEHOLDER_URL}")), "{written}");
-        assert!(written.contains(&format!("# {PLACEHOLDER_REF}")), "{written}");
+        assert!(
+            written.contains(&format!("# {PLACEHOLDER_URL}")),
+            "{written}"
+        );
+        assert!(
+            written.contains(&format!("# {PLACEHOLDER_REF}")),
+            "{written}"
+        );
         assert!(
             written.contains(&format!("# {PLACEHOLDER_POLICY}")),
             "{written}"
         );
-        assert!(written.contains(&format!("# {PLACEHOLDER_KEEP}")), "{written}");
+        assert!(
+            written.contains(&format!("# {PLACEHOLDER_KEEP}")),
+            "{written}"
+        );
 
         let parsed: crate::config::Config = toml::from_str(&written).unwrap();
         assert_eq!(parsed.upstream.url, None);
@@ -509,7 +526,10 @@ mod tests {
 
         let written = read(&layout);
         assert!(written.contains(&toml_line("deps", "npm ci")), "{written}");
-        assert!(written.contains(&toml_line("pre-build", "make")), "{written}");
+        assert!(
+            written.contains(&toml_line("pre-build", "make")),
+            "{written}"
+        );
 
         let parsed: crate::config::Config = toml::from_str(&written).unwrap();
         assert_eq!(parsed.hooks.deps.as_deref(), Some("npm ci"));
@@ -565,11 +585,7 @@ mod tests {
         let layout = Layout::new(tmp.path());
         // A quote in the value is the interesting case: naive interpolation writes a
         // file that no longer parses, and skot would fail on its own output.
-        scaffold(
-            &layout,
-            &plan("https://example.invalid/\"quoted\""),
-        )
-        .unwrap();
+        scaffold(&layout, &plan("https://example.invalid/\"quoted\"")).unwrap();
 
         let parsed: crate::config::Config =
             toml::from_str(&std::fs::read_to_string(layout.config_file()).unwrap()).unwrap();

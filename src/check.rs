@@ -138,8 +138,8 @@ pub struct Applied {
 /// apply, which is what a caller needs in order to say "this much went on before it broke".
 pub fn replay_series(repo: &git2::Repository, base: &str, entries: &[Entry]) -> Result<Applied> {
     let label = base.to_string();
-    let tree = crate::git::commit_tree(repo, base)
-        .context(format!("reading the tree of {base}"))?;
+    let tree =
+        crate::git::commit_tree(repo, base).context(format!("reading the tree of {base}"))?;
 
     let mut replay = Replay {
         repo,
