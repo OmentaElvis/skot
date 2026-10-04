@@ -32,6 +32,14 @@ pub struct Header {
     pub date: Option<String>,
     /// Without the `[PATCH]` prefix.
     pub subject: Option<String>,
+    /// Header lines this type does not model, kept verbatim and re-emitted in order.
+    ///
+    /// The mail format allows headers beyond the four above, and dropping one would be
+    /// silent data loss: `import` records where a patch came from in an `X-Skot-Import`
+    /// line, which is how a later run recognises the same request. `refresh` parses the
+    /// existing header before re-exporting, so anything a parser forgot here would
+    /// disappear from the patch the first time it was refreshed.
+    pub extra: Vec<String>,
     /// Anything after the headers and before the `---` separator: the commit body.
     pub body: String,
 }
@@ -44,6 +52,7 @@ impl Header {
             author: None,
             date: None,
             subject: Some(subject.to_owned()),
+            extra: Vec::new(),
             body: String::new(),
         }
     }
@@ -59,6 +68,7 @@ impl Header {
             author: Some(signature.to_string()),
             date: Some(rfc2822(when.seconds())),
             subject: Some(subject.to_owned()),
+            extra: Vec::new(),
             body: String::new(),
         }
     }
@@ -88,6 +98,7 @@ impl Header {
             author: None,
             date: None,
             subject: None,
+            extra: Vec::new(),
             body: String::new(),
         };
         let mut after_headers = false;
@@ -108,6 +119,8 @@ impl Header {
                     header.date = Some(v.trim().to_owned());
                 } else if let Some(v) = line.strip_prefix("Subject: ") {
                     header.subject = Some(strip_patch_prefix(v));
+                } else {
+                    header.extra.push(line.to_owned());
                 }
                 continue;
             }
@@ -144,6 +157,12 @@ impl Header {
         }
         if let Some(subject) = self.subject.as_deref() {
             out.push_str(&format!("Subject: [PATCH] {subject}\n"));
+        }
+        for line in &self.extra {
+            out.push_str(line);
+            if !line.ends_with('\n') {
+                out.push('\n');
+            }
         }
         out.push('\n');
         if !self.body.is_empty() {
@@ -648,6 +667,7 @@ From abc1234 Mon Sep 17 00:00:00 2001
 From: A U Thor <author@example.com>
 Date: Thu, 1 Oct 2026 18:17:53 +0300
 Subject: [PATCH] trim the widgets
+X-Skot-Import: range:main..feat aaa111 bbb222 ccc333
 
 The body of the commit.
 
@@ -664,13 +684,26 @@ diff --git a/a.txt b/a.txt
             Some("A U Thor <author@example.com>")
         );
         assert_eq!(header.body, "The body of the commit.\n");
+        assert_eq!(
+            header.extra,
+            ["X-Skot-Import: range:main..feat aaa111 bbb222 ccc333"],
+            "a header line the parser does not model must not be dropped"
+        );
 
         // And re-emitting it keeps the author, which is the point: a refreshed patch must
-        // not re-stamp the committer.
+        // not re-stamp the committer. The provenance line survives with it, or the next
+        // import of the same request could not recognise the patch.
         let again = Header::parse(&header.render(Some(" a.txt | 1 +\n"))).unwrap();
         assert_eq!(again.author, header.author);
         assert_eq!(again.date, header.date);
         assert_eq!(again.subject, header.subject);
+        assert_eq!(again.extra, header.extra);
+        assert!(
+            again
+                .render(None)
+                .contains("X-Skot-Import: range:main..feat aaa111 bbb222 ccc333"),
+            "the provenance line must be re-emitted"
+        );
     }
 
     #[test]

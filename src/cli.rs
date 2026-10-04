@@ -84,6 +84,8 @@ pub enum Command {
     Unapply,
 
     /// Import a commit range, a fork's branch, or a pull request as a new patch.
+    /// Importing the same thing again updates the patch in place instead of adding
+    /// another one.
     Import(ImportArgs),
 
     /// Apply the next patch in the series, or a named one.
@@ -250,7 +252,9 @@ pub struct ImportArgs {
     #[arg(long, value_name = "URL")]
     pub repo: Option<String>,
 
-    /// Name for the new patch. Defaults to the subject of what is being imported.
+    /// Name for the new patch. Defaults to the subject of what is being imported: the
+    /// commit itself for a one-commit import, `PR N` for a pull request, or the range
+    /// as written.
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
 
