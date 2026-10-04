@@ -10,20 +10,22 @@
 //! patch the stack ends at, and every case where the answer would be a guess — lives in
 //! [`authoring::resolve_stack`] rather than here.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use log::{debug, info};
 use serde_json::json;
 
 use crate::cli::PatchArg;
 use crate::commands::authoring::{self, Move};
 use crate::commands::{Ctx, Exit, emit_json};
-use crate::git::Sha;
+use crate::git::{Sha, sandbox};
 use crate::hints::Hints;
 use crate::layout::Layout;
 use crate::state::State;
 
 /// What `push` did, presented by [`run`].
 struct Pushed {
+    /// The patch applied, or `None` for the empty answer.
+    added: Option<String>,
     ref_name: String,
     sha: Sha,
     names: Vec<String>,
@@ -31,26 +33,50 @@ struct Pushed {
 }
 
 /// Apply the next patch in the series, or the named one.
+///
+/// With the whole series already applied the answer is negative rather than broken:
+/// the report is the ordinary one — ref, sha, the applied list — with `added` null and
+/// `ok` false, the sandbox is left as it stands, and the exit code is `Exit::Failure`
+/// so a script can stop there.
 pub fn run(ctx: &Ctx, arg: &PatchArg) -> Result<Exit> {
     let pushed = push(&ctx.layout, arg.patch.as_deref())?;
+    let verdict = if pushed.added.is_some() {
+        Exit::Success
+    } else {
+        Exit::Failure
+    };
 
     if ctx.cli.json {
         emit_json(&json!({
-            "ok": true,
+            "ok": pushed.added.is_some(),
             "ref": pushed.ref_name,
             "sha": pushed.sha.as_str(),
             "applied": pushed.names,
             "tree": pushed.tree.to_string(),
-            "added": pushed.names.last(),
+            "added": pushed.added,
         }))?;
-        return Ok(Exit::Success);
+        return Ok(verdict);
     }
 
-    info!(
-        "pushed {} — the sandbox now holds {}",
-        pushed.names.last().map(String::as_str).unwrap_or("nothing"),
-        count(pushed.names.len(), "patch", "patches")
-    );
+    match &pushed.added {
+        Some(added) => info!(
+            "pushed {added} — the sandbox now holds {}",
+            count(pushed.names.len(), "patch", "patches")
+        ),
+        None => {
+            // Nothing was added, so there is no push to announce. Report the head the
+            // way `pop` does: the object a script reads is the exit code either way.
+            let holding = if pushed.names.is_empty() {
+                "upstream only".to_owned()
+            } else {
+                count(pushed.names.len(), "patch", "patches")
+            };
+            info!(
+                "The sandbox is on {} ({}), holding {holding}.",
+                pushed.ref_name, pushed.sha
+            );
+        }
+    }
     debug!("sandbox {}", ctx.layout.sandbox_dir().display());
     for name in &pushed.names {
         debug!("  {name}");
@@ -60,10 +86,14 @@ pub fn run(ctx: &Ctx, arg: &PatchArg) -> Result<Exit> {
         .entry("skot refresh", "export what you change next")
         .entry("skot pop", "take a patch off")
         .print();
-    Ok(Exit::Success)
+    Ok(verdict)
 }
 
 /// Replay the prefix up to the next (or named) patch and check it out.
+///
+/// With the whole series already applied and nothing named there is no next patch: the
+/// ref, the sha and the tree the sandbox already holds are still resolved and reported,
+/// but `added` comes back `None` and nothing is checked out.
 ///
 /// Everything below [`run`] is this: no clap, no stdout, no verdict — a `&Layout` and a
 /// scalar in, a description of the outcome out.
@@ -79,11 +109,37 @@ fn push(layout: &Layout, want: Option<&str>) -> Result<Pushed> {
 
     let lock = layout.lock()?;
     let (_mirror, sha) = super::sync::resolve_in_mirror(layout, &ref_name)?;
+
+    // The whole series already applied, and no patch named: the answer is negative, not
+    // broken. The recorded stack still has to be the series' own prefix — one that has
+    // drifted out of step falls through to `resolve_stack`, which says so and refuses.
+    let all = series.entries_lenient(layout);
+    let whole_series = want.is_none()
+        && state.applied.len() == all.len()
+        && state
+            .applied
+            .iter()
+            .zip(all.iter())
+            .all(|(applied, entry)| applied == &entry.name);
+    if whole_series {
+        let tree =
+            sandbox::head_tree_oid(layout)?.context("the sandbox holds no tree to report")?;
+        drop(lock);
+        return Ok(Pushed {
+            added: None,
+            ref_name,
+            sha,
+            names: state.applied,
+            tree,
+        });
+    }
+
     let stack = authoring::resolve_stack(layout, &series, &state, want, Move::Deeper)?;
     let tree = authoring::land(layout, &ref_name, &sha, &stack)?;
     drop(lock);
 
     Ok(Pushed {
+        added: stack.names.last().cloned(),
         ref_name,
         sha,
         names: stack.names,
@@ -99,6 +155,7 @@ pub(crate) fn count(n: usize, singular: &str, plural: &str) -> String {
 mod tests {
     use super::*;
     use crate::commands::testsupport;
+    use clap::Parser as _;
 
     fn state_of(names: &[&str]) -> State {
         State {
@@ -278,5 +335,36 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("lists only 1"), "got {err}");
+    }
+
+    #[test]
+    fn push_with_the_whole_series_applied_reports_the_usual_status_with_nothing_added() {
+        // Nothing is wrong, so nothing is refused: the report is the ordinary one —
+        // same object, `added` null — and the sandbox itself is left alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = testsupport::applied_two_patch_stack(tmp.path());
+
+        let pushed = push(&layout, None).unwrap();
+
+        assert_eq!(pushed.added, None);
+        assert_eq!(pushed.names, ["0001-a.patch", "0002-b.patch"]);
+    }
+
+    #[test]
+    fn push_with_nothing_left_exits_with_a_negative_verdict() {
+        // The verdict a script reads is the exit code: `Exit::Failure` with the ordinary
+        // report — no `Error:`, no panic.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = testsupport::applied_two_patch_stack(tmp.path());
+        let cli = crate::cli::Cli::try_parse_from(["skot", "push"]).unwrap();
+        let ctx = Ctx {
+            layout,
+            cli,
+            yes: false,
+        };
+
+        let exit = run(&ctx, &PatchArg { patch: None }).unwrap();
+
+        assert_eq!(exit, Exit::Failure);
     }
 }
