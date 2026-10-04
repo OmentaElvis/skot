@@ -20,7 +20,7 @@ fn main() -> ExitCode {
         Ok(Exit::Success) => ExitCode::SUCCESS,
         Ok(Exit::Failure) => ExitCode::FAILURE,
         Err(err) => {
-            log::error!("{err}");
+            log::error!("Error: {:?}", err);
             for cause in err.chain().skip(1) {
                 log::debug!("caused by: {cause}");
             }
