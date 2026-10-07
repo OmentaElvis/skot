@@ -24,17 +24,11 @@ pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
 
     let report = match wanted {
         Some(name) => {
-            let mirror = git::mirror::Mirror::open(&ctx.layout).ok();
-            let Some(mirror) = mirror else {
-                anyhow::bail!(
-                    "no mirror at {}, so `{name}` cannot be resolved.\n\
-                     Run `skot sync` to fetch it.",
-                    ctx.layout.mirror_dir().display()
-                );
-            };
-            let sha = mirror
-                .resolve(&name)
-                .context(format!("cannot resolve `{name}` against the mirror"))?;
+            // The same choke point as `apply`: make sure the mirror can serve this ref
+            // (fetching only if it cannot), then read it. `check` does not need a
+            // sandbox (the series is applied to the commit's tree in the mirror), so a
+            // ref the mirror lacks is fetched, not deferred to a `skot sync` round trip.
+            let (mirror, sha) = super::sync::resolve_in_mirror(&ctx.layout, &name)?;
             crate::check::check_series(mirror.repo(), &sha, &entries)
                 .context(format!("checking the series against {name} ({sha})"))?
         }
@@ -42,9 +36,11 @@ pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
             if !git::sandbox::is_repository(&ctx.layout) {
                 anyhow::bail!(
                     "nothing to check against.\n\
-                     There is no mirror at {} and no sandbox yet.\n\
-                     Run `skot sync <ref>` to create one.",
-                    ctx.layout.mirror_dir().display()
+                     No ref was given, `upstream.default-ref` is unset, and there is no \
+                     sandbox yet.\n\
+                     Pass one (`skot check main`), set `upstream.default-ref` in {}, or \
+                     run `skot build` first.",
+                    ctx.layout.config_file().display()
                 );
             }
             let repo = git::sandbox::open(&ctx.layout)?;

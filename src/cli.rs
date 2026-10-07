@@ -75,7 +75,7 @@ pub enum Command {
     // The working set. Every one of these is implemented; they are grouped here because they
     // are the commands people reach for in a loop, not because any of them is a stub.
     /// Mirror a remote and keep its refs current.
-    Sync(RefArg),
+    Sync(SyncArgs),
 
     /// Apply the whole series to the sandbox.
     Apply(RefArg),
@@ -218,6 +218,20 @@ pub struct RefArg {
     /// Ref: a tag, a branch, or a commit.
     #[arg(value_name = "REF")]
     pub ref_name: Option<String>,
+}
+
+/// Deliberately not [`RefArg`]: `skot sync --refresh` contacts the upstream even when the
+/// mirror already has the ref, and putting that flag on the shared type would hand it to
+/// `skot apply --refresh` too, where it could only mean something the apply path does
+/// not do.
+#[derive(Debug, Clone, Args)]
+pub struct SyncArgs {
+    /// Ref: a tag, a branch, or a commit. Defaults to `upstream.default-ref`.
+    #[arg(value_name = "REF")]
+    pub ref_name: Option<String>,
+    /// Contact the upstream even when the mirror already has the ref.
+    #[arg(long)]
+    pub refresh: bool,
 }
 
 /// A patch name, for the commands that act on the stack rather than on a ref.

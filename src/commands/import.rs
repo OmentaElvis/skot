@@ -4,10 +4,12 @@
 //! a local clone), or a pull request. All three end the same way: two trees in the mirror,
 //! one diff between them, one patch file, one line in the series.
 //!
-//! The network stays in the mirror layer, as everywhere else. `--repo` and `--pr` fetch
-//! into `.skot/mirror.git` through [`Mirror::fetch_refspecs`], so once the fetch finishes
-//! there is nothing external left to read from: the objects sit where every other command
-//! already looks for them, and `check` verifies the imported patch like any other.
+//! The network stays in the mirror layer, as everywhere else. Every fetch (the range's
+//! own refs from the origin, the source behind `--repo`, and `refs/pull/N/head` behind
+//! `--pr`) goes into `.skot/mirror.git` through [`Mirror::fetch_refspecs`], so once the
+//! fetch finishes there is nothing external left to read from: the objects sit where
+//! every other command already looks for them, and `check` verifies the imported patch
+//! like any other.
 //!
 //! What import does *not* do is apply anything. The patch joins the series at the end and
 //! the sandbox is untouched, so the next step is the same as after `new`: verify with
@@ -24,13 +26,13 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use log::{debug, info};
+use log::{debug, info, warn};
 use serde_json::json;
 
 use crate::cli::ImportArgs;
 use crate::commands::{Ctx, Exit, authoring, emit_json};
 use crate::git::diff;
-use crate::git::mirror::Mirror;
+use crate::git::mirror::{Mirror, is_commit_id};
 use crate::git::{self, Sha};
 use crate::hints::Hints;
 use crate::layout::Layout;
@@ -175,40 +177,138 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     let (config, mut series) = layout.project()?;
     let request = request(args)?;
 
-    let mirror = Mirror::open(layout).map_err(|_| {
-        anyhow::anyhow!(
-            "no mirror at {}.\n\
-             Run `skot sync` first: it is what every command reads refs and objects from.",
-            layout.mirror_dir().display()
-        )
-    })?;
+    // No mirror yet: start one, like every other command does, rather than sending the
+    // user away to run `skot sync` and come back. The fetch takes the range's first
+    // fetchable ref; the blocks below fill in whatever else the range reads.
+    let mirror = match Mirror::open(layout) {
+        Ok(mirror) => mirror,
+        Err(_) => {
+            let needed = needed_refs(&request, config.upstream.default_ref.as_deref());
+            let wanted = needed
+                .iter()
+                .find(|n| !is_commit_id(n))
+                .map(String::as_str)
+                .or(config.upstream.default_ref.as_deref());
+            super::sync::ensure(layout, wanted)?;
+            Mirror::open(layout).context(format!(
+                "opening the mirror at {}",
+                layout.mirror_dir().display()
+            ))?
+        }
+    };
+
+    // Fill the mirror from the origin for what this range actually reads. The fetch runs
+    // whenever there is a URL to ask (an upstream that moved the branch since the last
+    // import is seen now, not after an explicit refresh) and takes only the range's own
+    // refs at full depth: an import *walks* (a merge base, then the commits between the
+    // ends), and a mirror after an ordinary sync is a shallow, narrowed view. A mirror
+    // with no `origin` has nothing to ask; `resolve` gives the remedy for a ref that
+    // is still missing afterwards.
+    let needed = needed_refs(&request, config.upstream.default_ref.as_deref());
+    let fetchable: Vec<&str> = needed
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !is_commit_id(n))
+        .collect();
+    let by_id: Vec<&str> = needed
+        .iter()
+        .map(String::as_str)
+        .filter(|n| is_commit_id(n))
+        .collect();
+    let shallow = mirror.is_shallow();
+    // A raw commit id names no ref: only the history that contains it can be fetched,
+    // and which branch that is is not something an id says. A gap around an id (or a
+    // shallow mirror under one) therefore takes the whole upstream at full depth;
+    // otherwise the range's own refs are enough.
+    let wildcard =
+        !by_id.is_empty() && (shallow || by_id.iter().any(|n| mirror.try_resolve(n).is_none()));
+    if let Ok(url) = mirror.remote_url() {
+        let refspecs: Vec<String> = if wildcard {
+            vec![
+                "+refs/heads/*:refs/heads/*".into(),
+                "+refs/tags/*:refs/tags/*".into(),
+            ]
+        } else {
+            fetchable
+                .iter()
+                .flat_map(|name| refspecs_for(name, false))
+                .collect()
+        };
+        if !refspecs.is_empty() {
+            let held = needed.iter().all(|n| mirror.try_resolve(n).is_some());
+            fetch_or_fall_back(
+                &mirror,
+                &url,
+                "origin",
+                &refspecs,
+                "fetching what the range needs",
+                held,
+                format!("fetching the range's refs from {url}"),
+            )?;
+        }
+    }
 
     if let Some(source) = args.repo.as_deref() {
-        mirror
-            .fetch_refspecs(
-                source,
-                "import",
-                &[
-                    format!("+refs/heads/*:{NS}/heads/*"),
-                    format!("+refs/tags/*:{NS}/tags/*"),
-                ],
-                "fetching the source repository",
-            )
-            .context(format!("fetching from {source}"))?;
+        // The source is fetched for this range and nothing else: the names the range
+        // reads, under the namespace, at full depth: the merge base walks them. A
+        // branch the range does not name is not worth dragging across.
+        let source_needed = needed_refs(&request, None);
+        let refspecs: Vec<String> = source_needed
+            .iter()
+            .flat_map(|name| refspecs_for(name, true))
+            .collect();
+        let held = refspecs.iter().all(|spec| {
+            spec.split_once(':')
+                .is_some_and(|(_, dest)| mirror.try_resolve(dest).is_some())
+        });
+        fetch_or_fall_back(
+            &mirror,
+            source,
+            "import",
+            &refspecs,
+            "fetching the source repository",
+            held,
+            format!("fetching from {source}"),
+        )?;
     }
     if let Some(number) = request.pull {
         let url = mirror.remote_url().context(
             "the mirror records no `origin`, so there is nowhere to fetch the pull request \
              from.\nRun `skot sync` first.",
         )?;
-        mirror
-            .fetch_refspecs(
-                &url,
-                "origin",
-                &[format!("+refs/pull/{number}/head:refs/pull/{number}/head")],
-                &format!("fetching pull request {number}"),
-            )
-            .context(format!("fetching `refs/pull/{number}/head` from {url}"))?;
+        let held = mirror
+            .try_resolve(&format!("refs/pull/{number}/head"))
+            .is_some();
+        fetch_or_fall_back(
+            &mirror,
+            &url,
+            "origin",
+            &[format!("+refs/pull/{number}/head:refs/pull/{number}/head")],
+            &format!("fetching pull request {number}"),
+            held,
+            format!("fetching `refs/pull/{number}/head` from {url}"),
+        )?;
+    }
+
+    // After every fetch has had its chance: a ref the upstream does not have is said so
+    // here, with the fetch already part of the story, rather than surfacing later as
+    // advice to go run the sync that just happened. With `--repo` this check is
+    // skipped: `resolve` speaks for the source repository by name, and a ref that exists
+    // only over there is not a miss against the origin.
+    if args.repo.is_none() {
+        let mut check: Vec<&str> = needed.iter().map(String::as_str).collect();
+        if request.pull.is_some() {
+            check.push(&request.to);
+        }
+        if let Some(missing) = check
+            .into_iter()
+            .find(|n| !is_commit_id(n) && mirror.try_resolve(n).is_none())
+        {
+            bail!(
+                "`{missing}` is not in the mirror, and the upstream does not have it either.\n\
+                 Check the spelling; a ref published only just may need a moment."
+            );
+        }
     }
 
     let ends = resolve(&mirror, layout, &config, &request, args.repo.as_deref())?;
@@ -503,6 +603,85 @@ fn request(args: &ImportArgs) -> Result<Request> {
         base,
         pull: None,
     })
+}
+
+/// What the range reads out of a repository: the `to` end, whatever the base names, and
+/// the default ref only when the base *is* the default, the one case `resolve` reads it
+/// in. `default` is that ref, or `None` for a `--repo` source, whose namespace `resolve`
+/// never consults for it.
+///
+/// A pull request's own ref is excluded: its fetch below already brings it.
+fn needed_refs(request: &Request, default: Option<&str>) -> Vec<String> {
+    let mut names = Vec::new();
+    if request.pull.is_none() {
+        names.push(request.to.clone());
+    }
+    match &request.base {
+        Base::Named(name) => names.push(name.clone()),
+        Base::MergeBaseOf(a, b) => names.extend([a.clone(), b.clone()]),
+        Base::MergeWithDefault => {
+            if let Some(default) = default {
+                names.push(default.to_owned());
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// How one name is fetched: plainly from upstream, or under [`NS`] from a `--repo`
+/// source. A commit id names no ref, and a full ref path has no short form to map into
+/// the namespace. Neither can be fetched by name, so neither produces a refspec.
+fn refspecs_for(name: &str, into_ns: bool) -> Vec<String> {
+    if is_commit_id(name) {
+        return Vec::new();
+    }
+    if name.starts_with("refs/") {
+        return if into_ns {
+            Vec::new()
+        } else {
+            vec![format!("+{name}:{name}")]
+        };
+    }
+    let dest = |space: &str| {
+        if into_ns {
+            format!("{NS}/{space}/{name}")
+        } else {
+            format!("refs/{space}/{name}")
+        }
+    };
+    vec![
+        format!("+refs/heads/{name}:{}", dest("heads")),
+        format!("+refs/tags/{name}:{}", dest("tags")),
+    ]
+}
+
+/// One of import's fetches, run the way every import run runs: the upstream is asked
+/// first, so a ref that moved upstream is seen now rather than after an explicit
+/// refresh. When it cannot be reached, a mirror that already holds every destination
+/// (`held`) is enough to import from, said out loud, and when it does not, the
+/// failure is the answer.
+fn fetch_or_fall_back(
+    mirror: &Mirror,
+    url: &str,
+    remote_name: &str,
+    refspecs: &[String],
+    message: &str,
+    held: bool,
+    context: String,
+) -> Result<()> {
+    match mirror.fetch_refspecs(url, remote_name, refspecs, message, i32::MAX) {
+        Ok(()) => Ok(()),
+        Err(fetch_err) if held => {
+            warn!(
+                "the upstream at {url} could not be reached; using the mirror as it \
+                 stands: {fetch_err}"
+            );
+            Ok(())
+        }
+        Err(fetch_err) => Err(fetch_err).context(context),
+    }
 }
 
 /// The two ends as commit ids, after any fetch has put them in the mirror.
@@ -1006,6 +1185,82 @@ mod tests {
             1,
             "an update rewrites, it does not add:\n{series}"
         );
+    }
+
+    #[test]
+    fn an_import_rechecks_the_upstream_so_a_moved_branch_is_seen() {
+        // The mirror is warm when the branch moves upstream: the import must notice,
+        // not read the copy it already had.
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = tmp.path().join("up.git");
+        let repo = git2::Repository::init_bare(&upstream).unwrap();
+        let main = commit_file(&repo, "refs/heads/main", "base", b"base\n", &[]);
+        let feat = {
+            let parent = repo.find_commit(main).unwrap();
+            commit_file(
+                &repo,
+                "refs/heads/feat",
+                "add the second line",
+                b"second\n",
+                &[&parent],
+            )
+        };
+        drop(repo);
+
+        let layout = Layout::new(tmp.path().join("proj"));
+        std::fs::create_dir_all(layout.patches_dir()).unwrap();
+        std::fs::write(
+            layout.config_file(),
+            format!(
+                "[upstream]\nurl = \"{}\"\ndefault-ref = \"main\"\n",
+                upstream.display()
+            ),
+        )
+        .unwrap();
+        crate::commands::sync::fetch(&layout, Some("main")).unwrap();
+
+        let first = import(&layout, &args(Some("main..feat"))).unwrap();
+        assert_eq!(first.to_sha, feat.to_string());
+
+        // Upstream moves `feat` after that run.
+        let repo = git2::Repository::open_bare(&upstream).unwrap();
+        let moved = {
+            let parent = repo.find_commit(feat).unwrap();
+            commit_file(
+                &repo,
+                "refs/heads/feat",
+                "add a third line",
+                b"third\n",
+                &[&parent],
+            )
+        };
+        drop(repo);
+
+        let second = import(&layout, &args(Some("main..feat"))).unwrap();
+
+        assert_eq!(
+            second.outcome,
+            Outcome::Updated,
+            "the move upstream must be seen"
+        );
+        assert_eq!(second.to_sha, moved.to_string());
+    }
+
+    #[test]
+    fn an_unreachable_upstream_falls_back_to_the_mirror() {
+        // Every ref the range needs is already in the mirror; the URL on its `origin`
+        // cannot be reached. The import still runs, from what is held.
+        let (tmp, layout, _main) = fixture();
+        let repo = git2::Repository::open_bare(layout.mirror_dir()).unwrap();
+        repo.remote("origin", tmp.path().join("gone.git").to_str().unwrap())
+            .unwrap();
+        drop(repo);
+
+        let done = import(&layout, &args(Some("main..feat"))).unwrap();
+
+        assert_eq!(done.outcome, Outcome::Created);
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(text.contains("+second"), "the held change:\n{text}");
     }
 
     #[test]

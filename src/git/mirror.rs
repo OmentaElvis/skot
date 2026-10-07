@@ -43,9 +43,17 @@ impl Mirror {
         })
     }
 
-    /// Fetch refs and tags from the remote into the existing mirror.
-    pub fn sync(&self, ref_name: Option<&str>) -> Result<()> {
-        let url = self.remote_url()?;
+    /// Fetch the named ref from the remote into the existing mirror, or the whole
+    /// upstream, when no ref was named.
+    ///
+    /// The mirror's own `origin` is where a re-fetch comes from. A mirror built without
+    /// one falls back to `fallback` (the configured URL), and the fetch records that URL
+    /// as `origin` on the way through, so the mirror heals as it works.
+    pub fn sync(&self, fallback: Option<&str>, ref_name: Option<&str>) -> Result<()> {
+        let url = match self.remote_url() {
+            Ok(url) => url,
+            Err(err) => fallback.map(str::to_owned).ok_or(err)?,
+        };
         Self::fetch(&url, &self.path, ref_name, "fetching upstream").map(|_| ())
     }
 
@@ -57,14 +65,26 @@ impl Mirror {
     /// reads the same object store every other command already reads. A remote other than
     /// `origin` is retargeted to `url` on every call, because one project can be imported
     /// from several repositories; `origin` keeps the URL it was cloned with.
+    ///
+    /// `depth` bounds how much history comes back: `1` is the tip commit and its tree
+    /// (what a patch series diffs against), [`i32::MAX`] is everything, what `import`
+    /// needs for a merge base. A local URL ignores it; libgit2 refuses shallow fetches
+    /// over its own local transport.
     pub fn fetch_refspecs(
         &self,
         url: &str,
         remote_name: &str,
         refspecs: &[String],
         message: &str,
+        depth: i32,
     ) -> Result<()> {
-        Self::transfer(url, &self.path, remote_name, refspecs, message).map(|_| ())
+        Self::transfer(url, &self.path, remote_name, refspecs, message, None, depth).map(|_| ())
+    }
+
+    /// Whether the mirror holds truncated history: a shallow fetch over a network
+    /// transport, which is how a mirror of a huge upstream stays small.
+    pub fn is_shallow(&self) -> bool {
+        self.repo.is_shallow()
     }
 
     /// Resolve `name` to a commit id if it resolves at all, for callers that are probing
@@ -73,37 +93,50 @@ impl Mirror {
         super::try_commit(&self.repo, name)
     }
 
-    /// `sync`'s refspecs: every branch and tag, plus force-updates for `ref_name`.
+    /// `sync`'s refspecs: exactly the ref asked for, or the whole upstream when nothing
+    /// was.
     fn fetch(
         url: &str,
         path: &Path,
         ref_name: Option<&str>,
         message: &str,
     ) -> Result<git2::Repository> {
-        // Refspecs, not config, so a fetch behaves like `git clone --mirror` regardless of
-        // what the remote or the mirror's own config happens to say.
+        // Take the ref you are working on and nothing else. The mirror is a cache, not a
+        // clone: a ref that a later command needs is fetched when it is asked for
+        // (`resolve_in_mirror` points at `skot sync <ref>` for exactly that case), so
+        // pulling every branch and tag "to be safe" is how checking out one 10Mb tree
+        // costs hundreds of megabytes of history the series never reads.
         //
-        // The leading `+` forces the update: a rewritten upstream ref is taken as-is rather
-        // than rejected as a non-fast-forward. That is the entire point of
-        // `skot sync <ref>`, since a branch that force-pushes is precisely the one a mirror
-        // would otherwise refuse to advance.
-        //
-        // Note what `ref_name` does and does not do here. It force-updates the refs named by
-        // that name, and it does *not* narrow the fetch to them: the wildcards stay, so the
-        // mirror always holds every branch and tag. Naming a ref says "this one gets
-        // force-updated", not "only fetch this one", because skot's job is moving a patch
-        // series between bases and a mirror missing branches turns every other base into an
-        // extra fetch.
-        let mut refspecs: Vec<String> = vec![
-            "+refs/heads/*:refs/heads/*".into(),
-            "+refs/tags/*:refs/tags/*".into(),
-        ];
-        if let Some(name) = ref_name {
-            refspecs.push(format!("+refs/heads/{name}:refs/heads/{name}"));
-            refspecs.push(format!("+refs/tags/{name}:refs/tags/{name}"));
-        }
+        // A short name can be either a branch or a tag, so both refspecs are offered and
+        // libgit2 takes whichever the remote has; a refspec that matches nothing is not
+        // an error (unlike the git CLI, which refuses the whole fetch). The leading `+`
+        // forces the update: a rewritten upstream ref is taken as-is rather than
+        // rejected as a non-fast-forward, which is the entire point of syncing a branch
+        // that force-pushes.
+        let refspecs: Vec<String> = match ref_name {
+            None => vec![
+                "+refs/heads/*:refs/heads/*".into(),
+                "+refs/tags/*:refs/tags/*".into(),
+            ],
+            // A commit id names no ref upstream; the caller's post-fetch check reports
+            // it with a message that says so rather than a fetch that returns nothing.
+            Some(name) if is_commit_id(name) => Vec::new(),
+            Some(name) if name.starts_with("refs/") => vec![format!("+{name}:{name}")],
+            Some(name) => vec![
+                format!("+refs/heads/{name}:refs/heads/{name}"),
+                format!("+refs/tags/{name}:refs/tags/{name}"),
+            ],
+        };
 
-        Self::transfer(url, path, "origin", &refspecs, message)
+        Self::transfer(
+            url,
+            path,
+            "origin",
+            &refspecs,
+            message,
+            ref_name,
+            FETCH_DEPTH,
+        )
     }
 
     /// The one network call, shared by the initial fetch, every later `sync`, and `import`.
@@ -126,6 +159,8 @@ impl Mirror {
         remote_name: &str,
         refspecs: &[String],
         message: &str,
+        wanted: Option<&str>,
+        depth: i32,
     ) -> Result<git2::Repository> {
         let repo = if path.join("HEAD").is_file() {
             git2::Repository::open_bare(path)
@@ -156,48 +191,67 @@ impl Mirror {
             }
         }
 
+        // A depth limit is what keeps one checked-out tree cheap: beyond the tip commit
+        // and its tree there is nothing a patch series reads: patches diff trees, they
+        // do not walk history. libgit2 refuses shallow fetches over its local transport
+        // (path and `file://` URLs), so those take full history, which is what a local
+        // source should cost anyway.
+        let depth = if is_local_url(url) { 0 } else { depth };
+
         let progress = ui::Progress::new(message);
         let mut callbacks = git2::RemoteCallbacks::new();
         progress.attach_to(&mut callbacks);
         let mut options = git2::FetchOptions::new();
         options.remote_callbacks(callbacks);
+        if depth > 0 {
+            options.depth(depth);
+        }
 
         {
-            let mut remote = repo
-                .find_remote(remote_name)
-                .context(format!("preparing a fetch from {url}"))?;
-            remote
-                .fetch(refspecs, Some(&mut options), None)
-                .context(format!(
+            // An empty refspec list means there was nothing to ask for by name (a
+            // commit id, say). Nothing is fetched and no connection is needed; the
+            // caller's post-fetch check turns this into the right message.
+            if !refspecs.is_empty() {
+                let mut remote = repo
+                    .find_remote(remote_name)
+                    .context(format!("preparing a fetch from {url}"))?;
+                remote
+                    .fetch(refspecs, Some(&mut options), None)
+                    .context(format!(
                     "fetching from {url}. If this says 'not found' or 'no such remote', check the URL and that you can reach it."
                 ))?;
 
-            // A freshly initialised mirror has HEAD pointing at whatever git2's template chose
-            // (`refs/heads/master`, usually), which nothing points at after a wildcard fetch.
-            // `init_bare` never guesses the remote's actual default branch, so HEAD dangles
-            // and every bare `HEAD` lookup fails — including `skot check` with no ref
-            // argument. Point it at the remote's default branch instead. Only `origin`'s
-            // fetch can be the mirror's first: `import` fetches into a mirror that already
-            // exists.
-            // `head()` succeeds on an *unborn* HEAD — it resolves the symbolic ref without checking
-            // that anything is there — so the test has to be for the ref actually pointing at a commit.
-            let head_dangles = repo
-                .head()
-                .ok()
-                .and_then(|h| h.peel_to_commit().ok())
-                .is_none();
-            if head_dangles && remote_name == "origin" {
-                // `default_branch` is only answerable once the remote has connected, which is
-                // why this is inside the fetch's scope. It returns the *full* ref name.
-                let default = remote
-                    .default_branch()
+                // A freshly initialised mirror has HEAD pointing at whatever git2's template chose
+                // (`refs/heads/master`, usually), which nothing points at after a fetch of a
+                // different ref. `init_bare` never guesses the remote's actual default branch, so
+                // HEAD dangles and every bare `HEAD` lookup fails, including `skot check` with no
+                // ref argument. Point it at the ref that was just fetched: the fetch brought it,
+                // so no second round-trip asks the remote which branch it likes, falling back to
+                // the remote's default branch when the whole upstream came down instead.
+                let head_dangles = repo
+                    .head()
                     .ok()
-                    .and_then(|b| b.as_str().ok().map(str::to_owned));
-                if let Some(default) = default.as_deref().map(str::trim)
-                    && repo.find_reference(default).is_ok()
-                {
-                    repo.set_head(default)
-                        .context(format!("pointing the mirror's HEAD at {default}"))?;
+                    .and_then(|h| h.peel_to_commit().ok())
+                    .is_none();
+                if head_dangles && remote_name == "origin" {
+                    let pointed = wanted
+                        .map(|name| point_head_at(&repo, name))
+                        .transpose()?
+                        .unwrap_or(false);
+                    if !pointed {
+                        // `default_branch` is only answerable once the remote has connected, which
+                        // is why this is inside the fetch's scope. It returns the *full* ref name.
+                        let default = remote
+                            .default_branch()
+                            .ok()
+                            .and_then(|b| b.as_str().ok().map(str::to_owned));
+                        if let Some(default) = default.as_deref().map(str::trim)
+                            && repo.find_reference(default).is_ok()
+                        {
+                            repo.set_head(default)
+                                .context(format!("pointing the mirror's HEAD at {default}"))?;
+                        }
+                    }
                 }
             }
         }
@@ -284,6 +338,55 @@ impl Mirror {
     }
 }
 
+/// How much history a `sync`-driven fetch takes over a network transport: the tip commit
+/// and its tree, which is all a patch series ever diffs against. `import` asks for more
+/// when it needs a merge base. Local transports ignore it (see [`is_local_url`]).
+const FETCH_DEPTH: i32 = 1;
+
+/// Whether `url` names a local repository: a path, `file://`, or anything without a host
+/// in it. Only fetch depth cares: libgit2 refuses shallow fetches over its local
+/// transport, so those fetches take full history.
+fn is_local_url(url: &str) -> bool {
+    match url.split_once("://") {
+        Some((scheme, _)) => scheme == "file",
+        // The scp form, `host:path` or `user@host:path`, is a network transport; a path
+        // containing `/` before the colon is not.
+        None => match url.split_once(':') {
+            Some((head, _)) => head.contains('/'),
+            None => true,
+        },
+    }
+}
+
+/// A 40- or 64-character hex string: a commit id, which names no ref upstream.
+pub(crate) fn is_commit_id(name: &str) -> bool {
+    matches!(name.len(), 40 | 64) && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Point the mirror's HEAD at `name` as a branch, or detached at it as a tag. False
+/// when the mirror has neither, for the caller to fall back on.
+fn point_head_at(repo: &git2::Repository, name: &str) -> Result<bool> {
+    let candidates: Vec<String> = if name.starts_with("refs/") {
+        vec![name.to_owned()]
+    } else {
+        vec![format!("refs/heads/{name}"), format!("refs/tags/{name}")]
+    };
+    for candidate in &candidates {
+        let Ok(reference) = repo.find_reference(candidate) else {
+            continue;
+        };
+        if candidate.starts_with("refs/heads/") {
+            repo.set_head(candidate)
+                .context(format!("pointing the mirror's HEAD at {candidate}"))?;
+        } else if let Ok(commit) = reference.peel(git2::ObjectType::Commit) {
+            repo.set_head_detached(commit.id())
+                .context(format!("pointing the mirror's HEAD at {candidate}"))?;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Parse `v1.2.3` or `1.2.3` into a sortable triple. `None` for anything else.
 fn parse_version(tag: &str) -> Option<Vec<u32>> {
     let body = tag.strip_prefix('v').unwrap_or(tag);
@@ -339,10 +442,12 @@ mod tests {
     }
 
     #[test]
-    fn the_first_sync_fetches_every_branch_not_just_the_named_one() {
-        // `sync <ref>` force-updates the ref it is given; it must not quietly turn the
-        // mirror into a mirror of one branch. Losing branches here is the failure that is
-        // invisible until someone checks a series against a base they did not name.
+    fn the_first_sync_fetches_only_the_ref_it_was_asked_for() {
+        // The mirror is a cache, fetched from on demand: a base a later command needs is
+        // fetched when it is asked for (`resolve_in_mirror` points at `skot sync <ref>`),
+        // and pulling every branch "to be safe" is how checking out one 10Mb tree costs
+        // hundreds of megabytes of history the series never reads. HEAD follows what was
+        // fetched, so the bare `HEAD` lookups `skot check` does keep working.
         let tmp = tempfile::tempdir().unwrap();
         let url = upstream(tmp.path());
         let layout = layout_in(tmp.path());
@@ -354,9 +459,40 @@ mod tests {
         let branches: Vec<&str> = refs.branches.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             branches,
-            vec!["feature", "main", "release"],
-            "the mirror should hold every upstream branch, not just the requested one"
+            vec!["release"],
+            "only the ref that was asked for comes down"
         );
+        assert!(
+            mirror.resolve("main").is_err(),
+            "the other branches are fetched on demand, not eagerly"
+        );
+        assert_eq!(
+            mirror.resolve("HEAD").unwrap(),
+            mirror.resolve("release").unwrap(),
+            "HEAD follows the ref that was fetched"
+        );
+    }
+
+    #[test]
+    fn local_urls_are_the_ones_libgit2_will_not_shallow_fetch() {
+        // The depth limit is skipped for exactly these, because libgit2 refuses a shallow
+        // fetch over its own local transport.
+        assert!(is_local_url("/srv/upstream"));
+        assert!(is_local_url("./upstream.git"));
+        assert!(is_local_url("file:///srv/upstream"));
+        assert!(!is_local_url("https://example.com/up.git"));
+        assert!(!is_local_url("git://example.com/up.git"));
+        assert!(!is_local_url("git@example.com:up.git"));
+        assert!(!is_local_url("ssh://user@example.com/up.git"));
+    }
+
+    #[test]
+    fn a_commit_id_is_recognised_as_not_a_ref_name() {
+        assert!(is_commit_id("87eb48dca76453d80378bf69e829b31873ff5b28"));
+        assert!(is_commit_id(&"a".repeat(64)));
+        assert!(!is_commit_id("main"));
+        assert!(!is_commit_id("deadbeef"));
+        assert!(!is_commit_id("v1.2.3"));
     }
 
     #[test]
@@ -421,7 +557,7 @@ mod tests {
         }
 
         let mirror = Mirror::open(&layout).unwrap();
-        mirror.sync(None).unwrap();
+        mirror.sync(None, None).unwrap();
         let after = mirror.resolve("main").unwrap();
 
         assert_ne!(
@@ -444,7 +580,7 @@ mod tests {
 
         assert_eq!(mirror.remote_url().unwrap(), url.to_str().unwrap());
         // And a later sync needs no URL argument at all.
-        Mirror::open(&layout).unwrap().sync(None).unwrap();
+        Mirror::open(&layout).unwrap().sync(None, None).unwrap();
     }
 
     #[test]

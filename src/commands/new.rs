@@ -307,9 +307,25 @@ mod tests {
     fn new_honours_an_explicit_base() {
         // `--base` is the only way to say which upstream the patch belongs on, and silently
         // ignoring it would produce a patch built on the wrong tree. An unresolvable ref must
-        // fail loudly and leave the recorded base alone.
+        // fail loudly and leave the recorded base alone. After the fetch has had its
+        // chance, the answer names the ref the upstream does not have.
         let (_tmp, layout) = project();
         let before = crate::state::State::load(&layout).unwrap().ref_name;
+        let up = _tmp.path().join("upstream.git");
+        let repo = git2::Repository::init_bare(&up).unwrap();
+        let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let who = git2::Signature::now("t", "t@e").unwrap();
+        {
+            let tree = repo.find_tree(tree_oid).unwrap();
+            repo.commit(Some("refs/heads/main"), &who, &who, "base", &tree, &[])
+                .unwrap();
+        }
+        drop(repo);
+        std::fs::write(
+            layout.config_file(),
+            format!("[upstream]\nurl = \"{}\"\n", up.display()),
+        )
+        .unwrap();
 
         let err = create(&layout, "next", Some("nope"))
             .unwrap_err()

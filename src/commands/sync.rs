@@ -1,27 +1,39 @@
-//! `sync`: mirror the upstream repository, and keep its refs current.
+//! `sync`: bring the mirror up with what is missing, and present it.
 //!
 //! This is where upstream itself is fetched. `import` fetches too — a fork or a pull
 //! request — but only ever into this same mirror, through `git::mirror`, because that is
 //! where every command already reads from. Everything else just reads the mirror, which is
 //! what makes `check` and `apply` work offline.
 //!
-//! Two functions, with a deliberate boundary between them:
+//! Four functions, with a deliberate boundary between them:
 //!
-//! * [`fetch`] does the work and reports what it found. It takes a [`Layout`] and a ref
-//!   name — the only two things it acts on — so it is testable without a `Ctx`, a `Cli`,
-//!   or a clap parser anywhere near it. It logs, because a record is a record no matter
-//!   who called; it writes nothing to stdout.
-//! * [`run`] is the command. It orchestrates the lifetime: call the work, then decide
-//!   presentation — the one JSON document if `--json`, the "what to do next" advice if
-//!   not. `build` calls `fetch` directly and keeps its own narration; there is no
-//!   quiet-mode flag asking a callee to guess what its caller intends to print.
+//! * [`ensure`] is the local-first one: if the mirror can already serve the ref, nothing
+//!   is fetched: no connection, no negotiation, no failure because the network happens
+//!   to be down. This is what `build`'s sync phase runs, and what bare `skot sync` runs.
+//!   A ref the mirror lacks is fetched on the spot, narrowed to that ref.
+//! * [`fetch`] always contacts the upstream: `skot sync --refresh`, and the first fetch
+//!   of a project. It reports what it found, and refuses a ref the upstream does not
+//!   have rather than reporting a silent success.
+//! * [`resolve_in_mirror`] is what every ref-reading command goes through: it calls
+//!   [`ensure`] and then resolves, so a command reads what it needs instead of stopping
+//!   to tell the user to run this one first, the same way a build tool synchronizes a
+//!   missing dependency rather than refusing to compile.
+//! * [`run`] is the command. It picks between the first two from `--refresh`, then
+//!   decides presentation: the one JSON document if `--json`, the "what to do next"
+//!   advice if not. `build` calls `ensure` directly and keeps its own narration; there
+//!   is no quiet-mode flag asking a callee to guess what its caller intends to print.
+//!
+//! All the work functions take a [`Layout`] and a ref name (the only two things they act
+//! on) so they are testable without a `Ctx`, a `Cli`, or a clap parser anywhere near
+//! them. They log, because a record is a record no matter who called; they write nothing
+//! to stdout.
 
 use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
 
-use crate::cli::RefArg;
+use crate::cli::SyncArgs;
 use crate::commands::{Ctx, Exit, emit_json};
-use crate::git::mirror::Mirror;
+use crate::git::mirror::{self, Mirror};
 use crate::hints::Hints;
 use crate::layout::Layout;
 
@@ -32,49 +44,130 @@ pub struct SyncOutcome {
     pub url: String,
     /// False when the mirror already existed — an update, not a first fetch.
     pub created: bool,
+    /// Whether the network was used. False means the mirror already had the ref: the
+    /// report exists so a script can tell "synced" from "nothing to do".
+    pub fetched: bool,
     pub head: String,
     pub branches: Vec<String>,
     pub tags: Vec<String>,
 }
 
-/// Fetch from `upstream.url`, creating the mirror on the first run.
+/// Fetch from `upstream.url`, creating the mirror on the first run, and contacting the
+/// upstream even when the mirror is already warm. This is the explicit "update me":
+/// `skot sync --refresh`, and the first fetch of a project.
 ///
-/// Presentation decisions are not taken here. `--json` is already accounted for: the logger
-/// was silenced at startup and `ui::Spinner` declines to draw, so nothing this does can
-/// reach stdout or corrupt a document someone else is writing.
+/// A ref the upstream does not have is an error here, not a silent success: the caller
+/// asked for an update, so "there is nothing to update to" is the answer it needs.
 pub fn fetch(layout: &Layout, ref_name: Option<&str>) -> Result<SyncOutcome> {
+    sync(layout, ref_name, true)
+}
+
+/// Fetch only what the mirror cannot already serve.
+///
+/// With the ref in the mirror there is no network call at all: no connection, nothing to
+/// negotiate, and no failure when the connection would be down: the mirror is the local
+/// answer, which is exactly the state a warm build should run in. A missing ref (or a
+/// missing mirror) fetches just that ref, narrowed by name.
+pub fn ensure(layout: &Layout, ref_name: Option<&str>) -> Result<SyncOutcome> {
+    sync(layout, ref_name, false)
+}
+
+/// The shared body: decide whether the network is needed at all, then do or don't.
+fn sync(layout: &Layout, ref_name: Option<&str>, refresh: bool) -> Result<SyncOutcome> {
     let config = layout.config()?;
+    // The URL is only needed to *start* a mirror: a warm one re-fetches from the URL its
+    // own `origin` records, and a warm ref needs neither. So a missing `upstream.url` is
+    // an error only on the path that would have used it, never a reason to refuse an
+    // answer the mirror can already give.
     let url = config
         .upstream
         .url
         .as_deref()
         .map(str::trim)
-        .filter(|u| !u.is_empty());
-    let Some(url) = url else {
-        bail!(
-            "no `upstream.url` in {}.\n\
-             Add one, or re-run `skot init --url <repository>`.",
-            layout.config_file().display()
-        );
-    };
+        .filter(|u| !u.is_empty())
+        .map(str::to_owned);
+
+    // What is worth having: the ref the caller named, else the project's default. It is
+    // both the thing to report on and the thing that narrows the fetch when it comes to
+    // that; a commit id names no ref upstream and fetches nothing.
+    let wanted = ref_name
+        .map(str::to_owned)
+        .or_else(|| config.upstream.default_ref.clone());
+    let unfetchable = wanted.as_deref().is_some_and(mirror::is_commit_id);
 
     let existed = layout.mirror_dir().join("HEAD").is_file();
+
+    // A commit id names no ref upstream: fetch cannot bring it, whether the mirror is
+    // warm (it may already hold it, so report that) or cold (there is nothing to ask for).
+    if unfetchable {
+        let wanted = wanted.as_deref().unwrap_or_default();
+        if existed {
+            let mirror = Mirror::open(layout)?;
+            if let Ok(sha) = mirror.resolve(wanted) {
+                info!(target: "sync", "have {sha}");
+                debug!(target: "sync", "mirror {}", mirror.path().display());
+                return report(&mirror, url.as_deref(), false, false);
+            }
+        }
+        bail!(
+            "`{wanted}` is not in the mirror, and a commit id cannot be fetched by name.\n\
+             Sync the branch or tag that contains it."
+        );
+    }
+
+    // The warm path: the mirror can already serve the ref, so no connection is made,
+    // no round-trip, and no failure because the network happens to be down. `--refresh`
+    // is how an update is asked for; the default does not spend a round-trip confirming
+    // what it can see.
+    if existed
+        && !refresh
+        && let Some(wanted) = &wanted
+    {
+        let mirror = Mirror::open(layout)?;
+        if let Ok(sha) = mirror.resolve(wanted) {
+            let seen = if wanted == &sha {
+                format!("have {sha}")
+            } else {
+                format!("have {wanted} at {sha}")
+            };
+            info!(target: "sync", "{seen}");
+            debug!(target: "sync", "mirror {}", mirror.path().display());
+            return report(&mirror, url.as_deref(), false, false);
+        }
+    }
+
+    // The network path: the mirror is cold, the ref is missing, or an update was asked
+    // for. The fetch takes exactly `wanted` (or the whole upstream when nothing names a
+    // ref), so one checked-out tree does not drag every branch and tag behind it.
     let mirror = if existed {
         let mirror = Mirror::open(layout)?;
-        mirror.sync(ref_name)?;
+        mirror.sync(url.as_deref(), wanted.as_deref())?;
         mirror
     } else {
+        // Starting a mirror is the one place the configured URL is required.
+        let Some(url) = url.as_deref() else {
+            bail!(
+                "no `upstream.url` in {}.\n\
+                 Add one, or re-run `skot init --url <repository>`.",
+                layout.config_file().display()
+            );
+        };
         // Before the work, not after: a first fetch is minutes of network and the log is
         // the only sign it has begun.
         info!(target: "sync", "mirroring {url}");
-        Mirror::open_or_clone(layout, url, ref_name)?
+        Mirror::open_or_clone(layout, url, wanted.as_deref())?
     };
 
-    let refs = mirror.refs()?;
-    let head = mirror
-        .resolve("HEAD")
-        .unwrap_or_else(|_| "(unresolved)".to_owned());
+    if let Some(wanted) = &wanted
+        && mirror.resolve(wanted).is_err()
+    {
+        bail!(
+            "`{wanted}` is not in the mirror, and the upstream does not have it either.\n\
+             Check the spelling; a ref published only just may need a moment."
+        );
+    }
 
+    let refs = mirror.refs()?;
     info!(
         target: "sync",
         "{} {} branch refs and {} tag refs",
@@ -85,13 +178,17 @@ pub fn fetch(layout: &Layout, ref_name: Option<&str>) -> Result<SyncOutcome> {
     debug!(target: "sync", "mirror {}", mirror.path().display());
 
     // Naming the newest version tag is the fastest way to tell whether a sync actually
-    // brought anything new, and whether the default ref in the config still exists.
+    // brought anything new.
     if let Some(latest) = mirror.version_tags().ok().and_then(|t| t.last().cloned()) {
         debug!(target: "sync", "latest version tag {latest}");
     }
-    // A `default-ref` that does not resolve is the single most common misconfiguration, and it
-    // shows up much later as "no ref to apply against" from a different command.
-    if let Some(wanted) = config.upstream.default_ref.as_deref()
+    // A `default-ref` that does not resolve is the single most common misconfiguration,
+    // and it shows up much later as "no ref to apply against" from a different command.
+    // Only the un-narrowed fetch was supposed to bring it, though: a narrow fetch of some
+    // other ref leaves the default for its own fetch, on demand, and a warning about that
+    // would be noise on every `sync <other-ref>`.
+    if wanted.is_none()
+        && let Some(wanted) = config.upstream.default_ref.as_deref()
         && mirror.resolve(wanted).is_err()
     {
         warn!(
@@ -101,19 +198,40 @@ pub fn fetch(layout: &Layout, ref_name: Option<&str>) -> Result<SyncOutcome> {
         );
     }
 
+    report(&mirror, url.as_deref(), !existed, true)
+}
+
+/// Assemble the outcome both paths return: the same object whether the network was used
+/// or the mirror already had the answer. The mirror's own `origin` is the URL of record;
+/// the configured one only stands in when the mirror cannot say.
+fn report(mirror: &Mirror, url: Option<&str>, created: bool, fetched: bool) -> Result<SyncOutcome> {
+    let refs = mirror.refs()?;
+    let head = mirror
+        .resolve("HEAD")
+        .unwrap_or_else(|_| "(unresolved)".to_owned());
+    let url = match mirror.remote_url() {
+        Ok(url) => url,
+        Err(_) => url.unwrap_or_default().to_owned(),
+    };
     Ok(SyncOutcome {
         mirror: mirror.path().display().to_string(),
-        url: mirror.remote_url().unwrap_or_else(|_| url.to_owned()),
-        created: !existed,
+        url,
+        created,
+        fetched,
         head,
         branches: refs.branches.into_iter().map(|(n, _)| n).collect(),
         tags: refs.tags.into_iter().map(|(n, _)| n).collect(),
     })
 }
 
-/// `skot sync`: fetch, then present. The only place a document reaches stdout.
-pub fn run(ctx: &Ctx, args: &RefArg) -> Result<Exit> {
-    let out = fetch(&ctx.layout, args.ref_name.as_deref())?;
+/// `skot sync`: fetch what is missing (or, with `--refresh`, everything), then present.
+/// The only place a document reaches stdout.
+pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<Exit> {
+    let out = if args.refresh {
+        fetch(&ctx.layout, args.ref_name.as_deref())?
+    } else {
+        ensure(&ctx.layout, args.ref_name.as_deref())?
+    };
 
     if ctx.cli.json {
         emit_json(&out)?;
@@ -130,15 +248,20 @@ pub fn run(ctx: &Ctx, args: &RefArg) -> Result<Exit> {
     Ok(Exit::Success)
 }
 
-/// Resolve `name` against the mirror, with a message that says what to do when the
-/// mirror is missing rather than "no such ref".
+/// Resolve `name` against the mirror, fetching it first when the mirror cannot serve it.
+///
+/// This is the choke point every ref-reading command goes through, so it is where the
+/// cargo principle lives: synchronize what is missing, then act. A mirror that already
+/// has the ref pays no network (the common case, unchanged); one that does not gets the
+/// ref fetched rather than a referral to go run `skot sync` first. What is left as an
+/// error is what only an error can be: the remote is unreachable, or the upstream does
+/// not have the ref.
 pub fn resolve_in_mirror(layout: &Layout, name: &str) -> Result<(Mirror, crate::git::Sha)> {
-    let mirror = Mirror::open(layout).map_err(|e| {
-        anyhow::anyhow!(
-            "{e}\n\
-             Run `skot sync <ref>` to fetch it."
-        )
-    })?;
+    ensure(layout, Some(name))?;
+    let mirror = Mirror::open(layout).context(format!(
+        "opening the mirror at {}",
+        layout.mirror_dir().display()
+    ))?;
     let sha = mirror
         .resolve(name)
         .context(format!("cannot resolve `{name}` against the mirror"))?;
@@ -237,15 +360,110 @@ mod tests {
     }
 
     #[test]
-    fn resolve_in_mirror_points_at_sync_when_there_is_no_mirror() {
+    fn resolve_in_mirror_fetches_a_ref_the_mirror_does_not_have() {
+        // The choke point every ref-reading command goes through: a ref the mirror
+        // lacks is fetched on the spot, not deferred to a `skot sync` round trip.
         let tmp = tempfile::tempdir().unwrap();
-        let layout = Layout::new(tmp.path().to_path_buf());
+        let url = upstream_with_branch(tmp.path(), "other");
+        let layout = fixture(&tmp.path().join("proj"), &url);
+        fetch(&layout, Some("main")).unwrap();
+
+        let (mirror, sha) = resolve_in_mirror(&layout, "other").unwrap();
+
+        assert_eq!(mirror.resolve("other").unwrap(), sha);
+    }
+
+    #[test]
+    fn resolve_in_mirror_without_a_url_says_where_to_put_one() {
+        // What is left as an error after the fetch has been attempted: there is nowhere
+        // to fetch from. The advice names the fix rather than another command to run.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = fixture(&tmp.path().join("proj"), "");
 
         let err = match resolve_in_mirror(&layout, "main") {
             Err(e) => e.to_string(),
-            Ok(_) => panic!("there is no mirror, so this must not resolve"),
+            Ok(_) => panic!("there is nowhere to fetch from, so this must not resolve"),
         };
-        assert!(err.contains("skot sync"), "got {err}");
+
+        assert!(err.contains("upstream.url"), "got {err}");
+        assert!(err.contains("skot init --url"), "no remedy offered: {err}");
+    }
+
+    /// A bare repo standing in for the network, with an extra branch on top of `main`.
+    fn upstream_with_branch(dir: &std::path::Path, branch: &str) -> String {
+        let url = upstream(dir);
+        let repo = git2::Repository::open_bare(dir.join("upstream.git")).unwrap();
+        let main = repo
+            .revparse_single("main")
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        let tree = main.tree().unwrap();
+        let who = git2::Signature::now("t", "t@e").unwrap();
+        repo.commit(
+            Some(&format!("refs/heads/{branch}")),
+            &who,
+            &who,
+            branch,
+            &tree,
+            &[&main],
+        )
+        .unwrap();
+        url
+    }
+
+    #[test]
+    fn ensure_never_touches_the_network_when_the_mirror_has_the_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = upstream(tmp.path());
+        let layout = fixture(&tmp.path().join("proj"), &url);
+        fetch(&layout, Some("main")).unwrap();
+
+        // The URL now points nowhere: a fetch would fail loudly, so a pass here proves
+        // none was attempted. The warm mirror is the whole answer.
+        std::fs::write(
+            layout.config_file(),
+            "[upstream]\nurl = \"/nonexistent/never.git\"\ndefault-ref = \"main\"\n",
+        )
+        .unwrap();
+        let out = ensure(&layout, Some("main")).unwrap();
+
+        assert!(!out.fetched, "the mirror had main, so nothing was fetched");
+        assert!(!out.created, "the mirror already existed");
+        let mut branches = out.branches;
+        branches.sort();
+        assert_eq!(branches, ["main"]);
+    }
+
+    #[test]
+    fn ensure_fetches_a_ref_the_mirror_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = upstream_with_branch(tmp.path(), "other");
+        let layout = fixture(&tmp.path().join("proj"), &url);
+        fetch(&layout, Some("main")).unwrap();
+
+        let out = ensure(&layout, Some("other")).unwrap();
+
+        assert!(
+            out.fetched,
+            "`other` was not in the mirror, so it was fetched"
+        );
+        assert!(!out.created, "the mirror already existed");
+        let mut branches = out.branches;
+        branches.sort();
+        assert_eq!(branches, ["main", "other"]);
+    }
+
+    #[test]
+    fn a_ref_the_upstream_lacks_is_an_error_not_a_quiet_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = upstream(tmp.path());
+        let layout = fixture(&tmp.path().join("proj"), &url);
+
+        let err = fetch(&layout, Some("nope")).unwrap_err().to_string();
+
+        assert!(err.contains("nope"), "the ref must be named: {err}");
+        assert!(err.contains("upstream does not have"), "got {err}");
     }
 
     #[test]
@@ -255,10 +473,12 @@ mod tests {
             panic!("expected sync")
         };
         assert!(s.ref_name.is_none());
-        let cli = Cli::parse_from(["skot", "sync", "release/2.0"]);
+        assert!(!s.refresh, "without --refresh sync is the local-first one");
+        let cli = Cli::parse_from(["skot", "sync", "--refresh", "release/2.0"]);
         let Command::Sync(s) = cli.command else {
             panic!("expected sync")
         };
         assert_eq!(s.ref_name.as_deref(), Some("release/2.0"));
+        assert!(s.refresh);
     }
 }

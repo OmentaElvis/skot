@@ -32,9 +32,15 @@ pub fn resolve_ref(repo: &git2::Repository, name: &str) -> Result<Sha> {
     if let Some(id) = try_commit(repo, name) {
         return Ok(id);
     }
+    if mirror::is_commit_id(name) {
+        anyhow::bail!(
+            "`{name}` is not in the mirror, and a commit id cannot be fetched by name.\n\
+             Sync the branch or tag that contains it."
+        )
+    }
     anyhow::bail!(
         "`{name}` is not in the mirror.\n\
-         Run `skot sync` to fetch it, if it is new upstream."
+         Run `skot sync {name}` to fetch it, if it is new upstream."
     )
 }
 

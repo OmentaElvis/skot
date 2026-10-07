@@ -169,10 +169,11 @@ fn sync_phase(layout: &Layout, config: &Config, ref_name: &str, json: bool) -> R
     hooks::run_point(HookPoint::PreSync, &env, config, json)?;
 
     // The work, not a sub-command: `build` owns this run's narration and its JSON, and
-    // `fetch` is the piece that does both sync and any caller share — the logs flow up,
-    // no document reaches stdout, and an error propagates as an error rather than as an
-    // exit code nobody can produce.
-    crate::commands::sync::fetch(layout, Some(ref_name))?;
+    // `ensure` is the piece that does both: the logs flow up, no document reaches stdout,
+    // and an error propagates as an error rather than as an exit code nobody can produce.
+    // Local-first: a mirror that already has the ref means no network call at all, so a
+    // warm build runs even when the network would not.
+    crate::commands::sync::ensure(layout, Some(ref_name))?;
 
     let env = root_env(layout, ref_name, &current_sha(layout))?;
     hooks::run_point(HookPoint::PostSync, &env, config, json)?;
@@ -392,6 +393,20 @@ mod tests {
             std::fs::read_to_string(layout.sandbox_dir().join("f.txt")).unwrap(),
             "first\n"
         );
+    }
+
+    #[test]
+    fn the_sync_phase_never_touches_a_url_it_does_not_need() {
+        // `url = "unused"` is not a URL: any attempt to contact it fails loudly. The
+        // sync phase's job on a warm mirror is exactly not to try: `main` is in the
+        // mirror, so the phase has nothing to fetch and no network to fetch it from.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = buildable(tmp.path());
+        let (config, _) = layout.project().unwrap();
+
+        let ran = drive(&layout, &config, "main", &[Phase::Sync], false, 0).unwrap();
+
+        assert_eq!(ran, vec!["sync"]);
     }
 
     #[test]

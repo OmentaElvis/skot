@@ -339,6 +339,29 @@ mod tests {
             sha
         }
 
+        /// A bare upstream holding one `main`, recorded in the config as the URL to
+        /// fetch from, which a mirror without an `origin` falls back to.
+        fn real_upstream(&self) {
+            let path = self._tmp.path().join("upstream.git");
+            let repo = git2::Repository::init_bare(&path).unwrap();
+            let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+            let who = git2::Signature::now("t", "t@e").unwrap();
+            {
+                let tree = repo.find_tree(tree_oid).unwrap();
+                repo.commit(Some("refs/heads/main"), &who, &who, "base", &tree, &[])
+                    .unwrap();
+            }
+            drop(repo);
+            std::fs::write(
+                self.layout.config_file(),
+                format!(
+                    "[upstream]\nurl = \"{}\"\ndefault-ref = \"main\"\n",
+                    path.display()
+                ),
+            )
+            .unwrap();
+        }
+
         fn patch(&self, name: &str, body: &str) {
             std::fs::write(self.layout.patches_dir().join(name), body).unwrap();
         }
@@ -534,9 +557,13 @@ index 1111111..2222222 100644
     }
 
     #[test]
-    fn apply_against_a_ref_the_mirror_lacks_points_at_sync() {
+    fn apply_against_a_ref_the_upstream_lacks_says_so() {
+        // The new contract: a ref the mirror does not have is fetched on the spot, and
+        // an answer of "the upstream does not have it either" arrives with the ref
+        // named, with no detour through a `skot sync` round trip.
         let f = Fixture::new();
         f.with_upstream();
+        f.real_upstream();
         f.series(&["0001-a.patch"]);
         f.patch("0001-a.patch", "");
 
@@ -544,6 +571,10 @@ index 1111111..2222222 100644
             .unwrap_err()
             .to_string();
         assert!(err.contains("nonexistent"), "got {err}");
+        assert!(
+            err.contains("does not have it either"),
+            "the answer should say the upstream lacks it: {err}"
+        );
     }
 
     #[test]
