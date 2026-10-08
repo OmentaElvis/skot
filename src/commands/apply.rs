@@ -322,7 +322,7 @@ fn report_failure(report: &check::Report) {
     );
 }
 
-fn count(n: usize, singular: &str, plural: &str) -> String {
+pub(crate) fn count(n: usize, singular: &str, plural: &str) -> String {
     format!("{n} {}", if n == 1 { singular } else { plural })
 }
 

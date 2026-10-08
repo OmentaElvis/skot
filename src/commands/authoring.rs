@@ -200,17 +200,12 @@ pub struct Stack {
 ///
 /// Every refusal here is a case where the answer would otherwise be a guess. A guessed stack is
 /// a corrupt one: it looks like a valid prefix, passes `check`, and builds the wrong thing.
-pub fn resolve_stack(
-    layout: &Layout,
+/// The recorded stack has to be a prefix of the series before any of this means anything.
+fn validate_prefix(
+    all: &[Entry],
+    applied: &[String],
     series: &crate::series::Series,
-    state: &State,
-    want: Option<&str>,
-    move_: Move,
-) -> Result<Stack> {
-    let all = series.entries_lenient(layout);
-    let applied = &state.applied;
-
-    // The recorded stack has to be a prefix of the series before any of this means anything.
+) -> Result<()> {
     if applied.len() > all.len() {
         bail!(
             "the sandbox holds {} patch(es), but the series at {} lists only {}.\n\
@@ -224,8 +219,8 @@ pub fn resolve_stack(
         if recorded != &entry.name {
             bail!(
                 "the sandbox holds `{}` where the series has `{}`.\n\
-                 The recorded stack is not a prefix of the series at {}, so no `push` or \
-                 `pop` can tell which tree you meant.\n\
+                 The recorded stack is not a prefix of the series at {}, so no `push`, \
+                 `pop` or `build` can tell which tree you meant.\n\
                  `skot status` reports the same; `skot unapply` then `skot apply` \
                  rebuilds the stack.",
                 recorded,
@@ -234,7 +229,37 @@ pub fn resolve_stack(
             );
         }
     }
+    Ok(())
+}
 
+/// The stack exactly as recorded: no push, no pop, the prefix the sandbox already holds.
+///
+/// `build` replays this rather than the whole series, so a patch popped out for testing
+/// stays out through a build. Same prefix validation as [`resolve_stack`], because a
+/// recorded stack that is not a prefix of the series means nothing to any command.
+pub fn recorded_stack(
+    layout: &Layout,
+    series: &crate::series::Series,
+    state: &State,
+) -> Result<Stack> {
+    let all = series.entries_lenient(layout);
+    validate_prefix(&all, &state.applied, series)?;
+    let entries = all[..state.applied.len()].to_vec();
+    let names = entries.iter().map(|e| e.name.clone()).collect();
+    Ok(Stack { entries, names })
+}
+
+pub fn resolve_stack(
+    layout: &Layout,
+    series: &crate::series::Series,
+    state: &State,
+    want: Option<&str>,
+    move_: Move,
+) -> Result<Stack> {
+    let all = series.entries_lenient(layout);
+    validate_prefix(&all, &state.applied, series)?;
+
+    let applied = &state.applied;
     let growing = move_ == Move::Deeper;
 
     let end = match want {

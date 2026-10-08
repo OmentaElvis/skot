@@ -7,6 +7,11 @@
 //! nothing about any of that; it is why a `skot.toml` for a Rust crate and one for a
 //! Node monorepo differ only in the hook commands.
 //!
+//! The apply phase replays the pushed stack: what `push` and `pop` recorded, so a patch
+//! popped out for testing stays out through the build. A sandbox that has never held the
+//! series gets the whole series instead, so `import` followed by `build` applies
+//! everything on a first run.
+//!
 //! Three decisions shape this file:
 //!
 //! - **The sandbox outlives a failure.** A dependency cache is the expensive thing to rebuild,
@@ -24,6 +29,7 @@ use serde_json::json;
 
 use crate::cli::BuildArgs;
 use crate::commands::apply;
+use crate::commands::authoring;
 use crate::commands::{Ctx, Exit, emit_json};
 use crate::config::{Config, SandboxPolicy};
 use crate::git::sandbox;
@@ -202,6 +208,10 @@ fn sync_phase(layout: &Layout, config: &Config, ref_name: &str, json: bool) -> R
 }
 
 /// `apply`, with the apply hooks around it.
+///
+/// What lands in the sandbox depends on where it already is: a fresh one (never landed)
+/// gets the whole series, so `import` followed by `build` just works, and one holding a
+/// pushed stack gets that stack back, so a patch popped out for testing stays out.
 fn apply_phase(
     layout: &Layout,
     config: &Config,
@@ -217,7 +227,38 @@ fn apply_phase(
     } else {
         format!("{ref_name} ({sha})")
     };
-    info!(target: "build", "apply: applying the series against {against}");
+    let (_, series) = layout.project()?;
+    let total = series.entries_lenient(layout).len();
+    let state = State::load(layout)?;
+    let stack = if state.ref_name.is_none() {
+        None
+    } else {
+        Some(authoring::recorded_stack(layout, &series, &state)?)
+    };
+    let pushed = stack.as_ref().map_or(total, |s| s.entries.len());
+    if total == 0 {
+        info!(
+            target: "build",
+            "apply: the series is empty; the sandbox holds {against} only"
+        );
+    } else if pushed == 0 {
+        info!(
+            target: "build",
+            "apply: nothing pushed; the sandbox holds {against} alone"
+        );
+    } else if pushed == total {
+        info!(
+            target: "build",
+            "apply: applying the whole series ({}) against {against}",
+            apply::count(total, "patch", "patches")
+        );
+    } else {
+        info!(
+            target: "build",
+            "apply: applying the pushed stack, {pushed} of the {} against {against}",
+            apply::count(total, "patch", "patches")
+        );
+    }
     // `pre_apply` runs before `apply` has created the sandbox on a first run, so its
     // working directory is the project root (`HookPoint::runs_in_project_root`). A hook
     // that needs the patched tree belongs at `post_apply` or later.
@@ -228,24 +269,44 @@ fn apply_phase(
         json,
     )?;
 
-    // `apply_locked`, not `apply`: the run already holds the lock for the whole build, and
-    // `apply` would try to take it again and block against this process. When the sync
-    // phase ran in this run the ensured variant applies, which is the same replay without
-    // a second pass through the fetch-if-missing choke point.
-    let applied = if synced {
-        apply::apply_locked_ensured(layout, Some(ref_name))?
-    } else {
-        apply::apply_locked(layout, Some(ref_name))?
-    };
-    if !applied.ok {
-        // `applied.failure` rather than a generic "the series does not apply": this is the
-        // point where the user learns which of their patches is the problem, and it is the
-        // last place that information exists before the run stops.
-        bail!(
-            "the series does not apply to {ref_name} ({sha}); the run stopped.\n\
-             {failure}",
-            failure = applied.failure
-        );
+    match stack {
+        None => {
+            // `apply_locked`, not `apply`: the run already holds the lock for the whole
+            // build, and `apply` would try to take it again and block against this
+            // process. When the sync phase ran in this run the ensured variant applies,
+            // which is the same replay without a second pass through the choke point.
+            let applied = if synced {
+                apply::apply_locked_ensured(layout, Some(ref_name))?
+            } else {
+                apply::apply_locked(layout, Some(ref_name))?
+            };
+            if !applied.ok {
+                // `applied.failure` rather than a generic "the series does not apply":
+                // this is the point where the user learns which of their patches is the
+                // problem, and it is the last place that information exists before the
+                // run stops.
+                bail!(
+                    "the series does not apply to {ref_name} ({sha}); the run stopped.\n\
+                     {failure}",
+                    failure = applied.failure
+                );
+            }
+        }
+        Some(stack) => {
+            // The same `land` push and pop use, so build cannot disagree with them about
+            // what tree the recorded stack means.
+            let (_mirror, base) = if synced {
+                crate::commands::sync::resolve_local(layout, ref_name)?
+            } else {
+                crate::commands::sync::resolve_in_mirror(layout, ref_name)?
+            };
+            if let Err(e) = authoring::land(layout, ref_name, &base, &stack) {
+                bail!(
+                    "the pushed stack does not apply to {ref_name} ({sha}); \
+                     the run stopped.\n{e}"
+                );
+            }
+        }
     }
 
     let env = hook_env(layout, ref_name, &sha)?;
@@ -487,6 +548,75 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(layout.sandbox_dir().join("f.txt")).unwrap(),
             "first\n"
+        );
+    }
+
+    /// A project with a mirror, a two-patch series, a sandbox, and a recorded stack.
+    fn stacked(root: &std::path::Path, pushed: &[&str]) -> crate::layout::Layout {
+        let (layout, sha) = crate::commands::testsupport::project_with_sandbox(root);
+        crate::commands::testsupport::write_series(
+            &layout,
+            &[
+                ("0001-a.patch", crate::commands::testsupport::patch_one()),
+                ("0002-b.patch", crate::commands::testsupport::patch_two()),
+            ],
+        );
+        std::fs::write(
+            layout.config_file(),
+            "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
+        )
+        .unwrap();
+        let mut state = State::load(&layout).unwrap();
+        state.set_ref(&layout, "main", &sha).unwrap();
+        state
+            .set_applied(&layout, pushed.iter().map(|n| (*n).to_owned()).collect())
+            .unwrap();
+        layout
+    }
+
+    #[test]
+    fn build_respects_a_popped_stack() {
+        // push/pop and build must agree: a patch popped out for testing must stay out
+        // through a build, or the stack is useless for building without one.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = stacked(tmp.path(), &["0001-a.patch"]);
+        let (config, _) = layout.project().unwrap();
+
+        let ran = drive(&layout, &config, "main", &[Phase::Apply], false).unwrap();
+
+        assert_eq!(ran, vec!["apply"]);
+        let state = State::load(&layout).unwrap();
+        assert_eq!(
+            state.applied,
+            ["0001-a.patch"],
+            "the popped patch must stay popped"
+        );
+        assert_eq!(
+            std::fs::read_to_string(layout.sandbox_dir().join("f.txt")).unwrap(),
+            "first\n",
+            "only the pushed patch's tree, not the popped one's"
+        );
+    }
+
+    #[test]
+    fn build_with_nothing_pushed_builds_the_bare_ref() {
+        // Popped all the way out: build must build upstream alone, not re-apply the series.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = stacked(tmp.path(), &[]);
+        let (config, _) = layout.project().unwrap();
+
+        drive(&layout, &config, "main", &[Phase::Apply], false).unwrap();
+
+        let state = State::load(&layout).unwrap();
+        assert!(
+            state.applied.is_empty(),
+            "nothing pushed, nothing applied: {:?}",
+            state.applied
+        );
+        assert_eq!(
+            std::fs::read_to_string(layout.sandbox_dir().join("f.txt")).unwrap(),
+            "base\n",
+            "the bare upstream tree"
         );
     }
 
