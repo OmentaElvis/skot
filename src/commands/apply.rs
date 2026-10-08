@@ -49,17 +49,28 @@ pub fn run(ctx: &Ctx, args: &RefArg) -> Result<Exit> {
     if ctx.cli.json {
         emit(&applied.report, &applied.ref_name, &applied.sha, applied.ok)?;
     } else if applied.ok {
-        info!(
-            "applied {} to {} ({})",
-            count(applied.report.patch_count, "patch", "patches"),
-            applied.ref_name,
-            applied.sha
-        );
-        debug!("sandbox {}", ctx.layout.sandbox_dir().display());
-        for name in &applied.report.patches {
-            debug!("  {}", name.name);
+        if applied.report.patch_count == 0 {
+            // The sandbox was still reset to the ref: the honest answer is what the head
+            // holds, the way `pop` reports an empty stack, rather than "applied 0".
+            info!(
+                target: "apply",
+                "the series is empty; the sandbox is on {} ({}), holding upstream only.",
+                applied.ref_name, applied.sha
+            );
+        } else {
+            info!(
+                target: "apply",
+                "applied {} to {} ({})",
+                count(applied.report.patch_count, "patch", "patches"),
+                applied.ref_name,
+                applied.sha
+            );
+            debug!(target: "apply", "sandbox {}", ctx.layout.sandbox_dir().display());
+            for name in &applied.report.patches {
+                debug!(target: "apply", "  {}", name.name);
+            }
+            info!(target: "apply", "The sandbox now holds your series.");
         }
-        info!("The sandbox now holds your series.");
         Hints::new("next")
             .entry("skot build", "run your hooks from here")
             .print();
@@ -82,6 +93,21 @@ pub fn run(ctx: &Ctx, args: &RefArg) -> Result<Exit> {
 /// to produce exactly one document, so nesting apply's inside a caller's is unparseable
 /// rather than merely redundant.
 pub fn apply_locked(layout: &Layout, ref_name: Option<&str>) -> Result<Applied> {
+    apply_inner(layout, ref_name, false)
+}
+
+/// [`apply_locked`] for a run whose sync phase already ensured the ref in this process.
+///
+/// The fetch-if-missing choke point has been paid moments ago by the same run, so
+/// re-entering it would repeat config parsing, a mirror open and a ref resolution for
+/// nothing. This path is the lookup half only: no fetch, no create, an error if the
+/// mirror cannot serve the ref. Standalone callers keep [`apply_locked`], which must
+/// fetch what the mirror lacks itself.
+pub(crate) fn apply_locked_ensured(layout: &Layout, ref_name: Option<&str>) -> Result<Applied> {
+    apply_inner(layout, ref_name, true)
+}
+
+fn apply_inner(layout: &Layout, ref_name: Option<&str>, ensured: bool) -> Result<Applied> {
     let (config, series) = layout.project()?;
     let entries = series.require_resolvable(layout)?;
 
@@ -96,7 +122,11 @@ pub fn apply_locked(layout: &Layout, ref_name: Option<&str>) -> Result<Applied> 
         );
     };
 
-    let (mirror, sha) = super::sync::resolve_in_mirror(layout, &wanted)?;
+    let (mirror, sha) = if ensured {
+        super::sync::resolve_local(layout, &wanted)?
+    } else {
+        super::sync::resolve_in_mirror(layout, &wanted)?
+    };
 
     // Create before verifying: the check confirms the sandbox can reach the commit, so on a
     // first run there is no sandbox to check yet. `create` is idempotent, so doing it first
@@ -201,13 +231,16 @@ pub fn unapply(ctx: &Ctx) -> Result<Exit> {
     }
 
     if !done.sandbox {
-        debug!("no sandbox, so there is nothing to unapply");
+        debug!(target: "apply", "no sandbox, so there is nothing to unapply");
         return Ok(Exit::Success);
     }
     let wanted = done.ref_name.unwrap_or_default();
     let sha = done.sha.unwrap_or_default();
-    info!("sandbox reset to {wanted} ({sha})");
-    info!("The patch series is no longer applied. Your patch files are untouched.");
+    info!(target: "apply", "sandbox reset to {wanted} ({sha})");
+    info!(
+        target: "apply",
+        "The patch series is no longer applied. Your patch files are untouched."
+    );
     Ok(Exit::Success)
 }
 
@@ -275,12 +308,18 @@ fn emit(report: &check::Report, ref_name: &str, sha: &str, ok: bool) -> Result<(
 
 /// Print the same failure a `check` would, then say what happened to the sandbox.
 fn report_failure(report: &check::Report) {
-    error!("the series does not apply to {}", report.base);
+    error!(target: "apply", "the series does not apply to {}", report.base);
     for line in report.summary().lines() {
-        debug!("{line}");
+        debug!(target: "apply", "{line}");
     }
-    info!("The sandbox was reset, so it still holds only upstream. Nothing is half-applied.");
-    info!("Rebase the patch against this ref, then `skot refresh` to re-export it.");
+    info!(
+        target: "apply",
+        "The sandbox was reset, so it still holds only upstream. Nothing is half-applied."
+    );
+    info!(
+        target: "apply",
+        "Rebase the patch against this ref, then `skot refresh` to re-export it."
+    );
 }
 
 fn count(n: usize, singular: &str, plural: &str) -> String {
@@ -381,6 +420,29 @@ mod tests {
     }
 
     #[test]
+    fn the_ensured_apply_path_is_a_lookup_and_never_starts_a_mirror() {
+        // build's sync phase has already ensured the ref, so this variant must do none
+        // of the choke point's work: no clone, no fetch, a bare failure if the mirror
+        // a full run would have created is not there.
+        let f = Fixture::new();
+        f.real_upstream();
+        f.series(&[]);
+
+        let err = apply_locked_ensured(&f.layout, Some("main"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("opening the mirror"), "got {err}");
+        assert!(
+            !f.layout.mirror_dir().exists(),
+            "the ensured path may not create the mirror"
+        );
+
+        // The standalone path still fetches what the mirror lacks.
+        assert!(apply_locked(&f.layout, Some("main")).unwrap().ok);
+        assert!(f.layout.mirror_dir().exists());
+    }
+
+    #[test]
     fn apply_puts_the_series_in_the_sandbox() {
         let f = Fixture::new();
         f.with_upstream();
@@ -403,6 +465,27 @@ index 1111111..2222222 100644
         assert_eq!(
             crate::state::State::load(&f.layout).unwrap().applied,
             vec!["0001-a.patch".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_empty_series_puts_the_sandbox_on_upstream() {
+        // A project straight from `init` has no patches, and apply still has a job: put
+        // the sandbox on the ref. It answers with the head, the way `pop` does.
+        let f = Fixture::new();
+        f.with_upstream();
+        f.series(&[]);
+
+        let applied = apply_locked(&f.layout, None).unwrap();
+
+        assert!(applied.ok);
+        assert_eq!(applied.report.patch_count, 0);
+        assert_eq!(f.sandbox_file(), "base\n");
+        assert!(
+            crate::state::State::load(&f.layout)
+                .unwrap()
+                .applied
+                .is_empty()
         );
     }
 

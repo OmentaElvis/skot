@@ -55,19 +55,16 @@ post-sync = ""
 pre-apply = ""
 post-apply = ""
 
-# --- deps: installing dependencies ---
-# Just a hook. skot has no opinion about what a dependency is.
-deps = ""
-
 # --- build: producing whatever you are after ---
-# post-build is where you publish it. Copy to ~/.local/bin, keep a .bak, run a
-# smoke test, upload it. skot neither does this nor needs to know about it.
+# Three slots, in order. pre-build is everything that must happen before anything is
+# produced: install dependencies (npm ci), run ./configure, warm a cache. skot has no
+# opinion about any of that, and your package manager caches on its own.
 pre-build = ""
+# The build itself: the command that produces your artifact.
+build = ""
+# post-build runs against the finished artifact. Copy to ~/.local/bin, keep a .bak,
+# run it, smoke test it, upload it. skot neither does this nor needs to know about it.
 post-build = ""
-
-# --- verify: proving the result is good ---
-pre-verify = ""
-post-verify = ""
 
 # --- hooks outside the lifecycle ---
 # Invoked by name: `skot run <name>`.

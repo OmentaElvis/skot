@@ -97,17 +97,20 @@ pub fn run(ctx: &Ctx, arg: &RefArg) -> Result<Exit> {
             .map(|p| p.name.clone())
             .unwrap_or_default();
         error!(
+            target: "rebase",
             "`{failed}` does not apply to {} ({})",
             rebased.ref_name, rebased.sha
         );
         for line in rebased.report.summary().lines() {
-            debug!("{line}");
+            debug!(target: "rebase", "{line}");
         }
         info!(
+            target: "rebase",
             "No patch file was changed. {} still holds what it did.",
             ctx.layout.series_file().display()
         );
         info!(
+            target: "rebase",
             "Resolve it by hand: `skot apply {}` puts the series in the sandbox, \
              and `skot refresh <patch>` re-exports it against the new base.",
             rebased.ref_name
@@ -116,6 +119,7 @@ pub fn run(ctx: &Ctx, arg: &RefArg) -> Result<Exit> {
     }
 
     info!(
+        target: "rebase",
         "rebased {} onto {} ({})",
         rebased.rewritten.len(),
         rebased.ref_name,
@@ -127,9 +131,14 @@ pub fn run(ctx: &Ctx, arg: &RefArg) -> Result<Exit> {
         } else {
             "  ~"
         };
-        debug!("{marker} {}  {}", entry.name, diff::summarise(&entry.text));
+        debug!(
+            target: "rebase",
+            "{marker} {}  {}",
+            entry.name,
+            diff::summarise(&entry.text)
+        );
     }
-    debug!("  ~ rewritten,  = unchanged");
+    debug!(target: "rebase", "  ~ rewritten,  = unchanged");
     Hints::new("next")
         .entry("skot build", "the whole run onto the new base")
         .entry("skot check", "or just verify the rewritten series")
@@ -143,8 +152,8 @@ pub fn run(ctx: &Ctx, arg: &RefArg) -> Result<Exit> {
 /// scalars in, a description of the outcome out.
 fn rebase(layout: &Layout, ref_name: Option<&str>) -> Result<Rebased> {
     let (config, series) = layout.project()?;
-    // Checked before the files are resolved, so an empty series gets the advice that fits it
-    // rather than apply's "there is nothing to apply".
+    // Checked before the files are resolved: rebase with nothing to rebase has no honest
+    // answer but this one, and `new` is the step the user actually needs.
     if series.is_empty() {
         bail!(
             "the series at {} is empty, so there is nothing to rebase.\n\

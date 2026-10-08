@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use crate::config::{Config, ExtraHook};
 use crate::layout::Layout;
@@ -135,10 +135,19 @@ pub fn run_one(hook: &Resolved, env: &Env, config: &Config, json: bool) -> Resul
     let cwd = if hook.cwd.is_absolute() {
         hook.cwd.clone()
     } else {
-        env.sandbox.join(&hook.cwd)
+        // The base directory follows the point: the hooks that run before the sandbox
+        // exists on a first run measure from the project root, every other hook measures
+        // from the patched tree. Using the sandbox for `pre_sync` on a cold build would
+        // spawn `sh` in a directory that is not there yet.
+        let base = match hook.point {
+            Some(point) if point.runs_in_project_root() => &env.project_root,
+            _ => &env.sandbox,
+        };
+        base.join(&hook.cwd)
     };
 
-    info!("{} {}", hook.name, dim_cmd(&hook.cmd));
+    debug!(target: "hook", "{} cwd {}", hook.name, cwd.display());
+    debug!(target: "hook", "{} {}", hook.name, dim_cmd(&hook.cmd));
 
     // The parent environment is passed through, not cleared, for the same reason `make`
     // and `npm` pass theirs through: a build command needs PATH to find its compiler,
@@ -162,7 +171,7 @@ pub fn run_one(hook: &Resolved, env: &Env, config: &Config, json: bool) -> Resul
     ))?;
 
     if status.success() {
-        info!("{}", hook.name);
+        info!(target: "hook", "{} done", hook.name);
         Ok(Outcome::Ran)
     } else {
         let code = status
@@ -179,7 +188,7 @@ pub fn run_one(hook: &Resolved, env: &Env, config: &Config, json: bool) -> Resul
             // failed hook is explained twice.
             Err(anyhow::anyhow!("{message}"))
         } else {
-            warn!("{message}, continuing because required = false");
+            warn!(target: "hook", "{message}, continuing because required = false");
             Ok(Outcome::Failed)
         }
     }
@@ -190,6 +199,7 @@ pub fn run_one(hook: &Resolved, env: &Env, config: &Config, json: bool) -> Resul
 /// `json` is passed through to [`run_one`]; see there for why a hook's stdout has to move.
 pub fn run_point(point: HookPoint, env: &Env, config: &Config, json: bool) -> Result<Outcome> {
     let Some(cmd) = config.hook(point) else {
+        debug!(target: "hook", "no {point} hook configured");
         return Ok(Outcome::Skipped);
     };
     let hook = Resolved {
@@ -317,9 +327,9 @@ mod tests {
 
     #[test]
     fn plan_lists_configured_hooks_in_lifecycle_order() {
-        let cfg = Config::parse("[hooks]\npost-build = \"b\"\ndeps = \"d\"\n").unwrap();
+        let cfg = Config::parse("[hooks]\npost-build = \"b\"\nbuild = \"make\"\n").unwrap();
         let names: Vec<_> = plan(&cfg, None).into_iter().map(|h| h.name).collect();
-        assert_eq!(names, vec!["deps", "post_build"]);
+        assert_eq!(names, vec!["build", "post_build"]);
     }
 
     #[test]
@@ -417,10 +427,38 @@ mod tests {
         let (_tmp, l) = layout();
         let sandbox = l.sandbox_dir();
         std::fs::create_dir_all(&sandbox).unwrap();
-        let cfg = Config::parse("[hooks]\ndeps = \"pwd > where.txt\"\n").unwrap();
-        run_point(HookPoint::Deps, &env_in(&sandbox), &cfg, false).unwrap();
+        let cfg = Config::parse("[hooks]\nbuild = \"pwd > where.txt\"\n").unwrap();
+        run_point(HookPoint::Build, &env_in(&sandbox), &cfg, false).unwrap();
         let where_file = std::fs::read_to_string(sandbox.join("where.txt")).unwrap();
         assert_eq!(where_file.trim(), sandbox.display().to_string());
+    }
+
+    #[test]
+    fn the_hooks_that_run_before_the_sandbox_exists_run_in_the_project_root() {
+        let (_tmp, l) = layout();
+        let sandbox = l.sandbox_dir();
+        std::fs::create_dir_all(&sandbox).unwrap();
+        let points = [HookPoint::PreSync, HookPoint::PostSync, HookPoint::PreApply];
+        let mut config_text = String::from("[hooks]\n");
+        for point in points {
+            config_text.push_str(&format!(
+                "{} = \"pwd > {point}-where.txt\"\n",
+                point.toml_key()
+            ));
+        }
+        let cfg = Config::parse(&config_text).unwrap();
+        for point in points {
+            run_point(point, &env_in(&sandbox), &cfg, false).unwrap();
+            let marker = format!("{point}-where.txt");
+            assert_eq!(
+                std::fs::read_to_string(l.root().join(&marker))
+                    .unwrap()
+                    .trim(),
+                l.root().display().to_string(),
+                "{point} did not run in the project root"
+            );
+            assert!(!sandbox.join(marker).exists());
+        }
     }
 
     #[test]

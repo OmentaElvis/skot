@@ -103,7 +103,7 @@ pub enum Command {
     /// Replay the series onto a different ref.
     Rebase(RefArg),
 
-    /// Build: sandbox, apply, deps, then your hooks.
+    /// Build: sandbox, apply, then your hooks.
     Build(BuildArgs),
 }
 
@@ -311,7 +311,7 @@ pub struct BuildArgs {
     #[arg(long, value_name = "PHASE")]
     pub from: Option<Phase>,
 
-    /// Start at this phase and go to the end.
+    /// Run only this phase.
     #[arg(long, value_name = "PHASE", conflicts_with = "from")]
     pub only: Option<Phase>,
 }
@@ -369,17 +369,17 @@ mod tests {
 
     #[test]
     fn from_and_only_cannot_both_be_given() {
-        let err = Cli::try_parse_from(["skot", "build", "--from", "deps", "--only", "build"]);
+        let err = Cli::try_parse_from(["skot", "build", "--from", "sync", "--only", "apply"]);
         assert!(err.is_err(), "these two flags contradict each other");
     }
 
     #[test]
     fn phases_parse_by_name() {
-        let cli = Cli::try_parse_from(["skot", "build", "--from", "deps"]).unwrap();
+        let cli = Cli::try_parse_from(["skot", "build", "--from", "apply"]).unwrap();
         let Command::Build(args) = cli.command else {
             panic!("expected build")
         };
-        assert_eq!(args.from, Some(Phase::Deps));
+        assert_eq!(args.from, Some(Phase::Apply));
     }
 
     #[test]
@@ -399,7 +399,7 @@ mod tests {
             "--keep",
             "vendor",
             "--hook",
-            "deps=make deps",
+            "build=make",
             "--sync",
             "--force",
         ])
@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(args.default_ref.as_deref(), Some("main"));
         assert_eq!(args.policy, Some(SandboxPolicyChoice::Ephemeral));
         assert_eq!(args.keep, ["dist", "vendor"]);
-        assert_eq!(args.hook, ["deps=make deps"]);
+        assert_eq!(args.hook, ["build=make"]);
         assert!(args.sync, "--sync should parse");
         assert!(args.force, "--force should parse");
     }

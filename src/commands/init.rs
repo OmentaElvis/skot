@@ -8,6 +8,7 @@ use crate::commands::{Ctx, Exit};
 use crate::config::SandboxPolicy;
 use crate::hints::Hints;
 use crate::layout::{self, Layout};
+use crate::phase::HookPoint;
 
 const PLACEHOLDER_URL: &str = "url = \"https://github.com/example/project\"";
 const PLACEHOLDER_REF: &str = "default-ref = \"v1.0.0\"";
@@ -15,16 +16,14 @@ const PLACEHOLDER_POLICY: &str = "policy = \"persistent\"";
 const PLACEHOLDER_KEEP: &str = "keep = [\"node_modules\", \"target\"]";
 
 /// The keys of the `[hooks]` section, which is what `--hook` may name.
-const HOOK_KEYS: [&str; 9] = [
+const HOOK_KEYS: [&str; 7] = [
     "pre-sync",
     "post-sync",
     "pre-apply",
     "post-apply",
-    "deps",
     "pre-build",
+    "build",
     "post-build",
-    "pre-verify",
-    "post-verify",
 ];
 
 /// Directories that exist only to be reused, and so are worth offering as paths a ref
@@ -59,7 +58,7 @@ struct Plan {
 /// Split `NAME=COMMAND` into its halves, refusing names that are not `[hooks]` keys.
 fn parse_hook(spec: &str) -> Result<(String, String)> {
     let Some((name, cmd)) = spec.split_once('=') else {
-        bail!("`--hook` wants NAME=COMMAND, as in `--hook deps=\"npm ci\"`.");
+        bail!("`--hook` wants NAME=COMMAND, as in `--hook build=\"make\"`.");
     };
     let name = name.trim();
     if !HOOK_KEYS.contains(&name) {
@@ -75,6 +74,45 @@ fn parse_hook(spec: &str) -> Result<(String, String)> {
 fn non_empty(answer: String) -> Option<String> {
     let trimmed = answer.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// What the wizard says about a stage when asking for its hook.
+fn stage_help(point: HookPoint) -> &'static str {
+    match point {
+        HookPoint::PreSync => "Runs before the mirror is touched.",
+        HookPoint::PostSync => "Runs after the mirror is up to date.",
+        HookPoint::PreApply => "Runs before the series is applied; project root on a first run.",
+        HookPoint::PostApply => {
+            "Runs after the series is in the sandbox; a quick check belongs here."
+        }
+        HookPoint::PreBuild => "Runs before anything is produced: install dependencies here.",
+        HookPoint::Build => "Produces the artifact inside the sandbox.",
+        HookPoint::PostBuild => {
+            "Runs against the finished artifact: copy it into place, smoke test it."
+        }
+    }
+}
+
+/// An example worth showing where one says more than a description can.
+fn stage_example(point: HookPoint) -> Option<&'static str> {
+    match point {
+        HookPoint::PreBuild => Some("npm ci"),
+        HookPoint::Build => Some("make"),
+        HookPoint::PostBuild => Some("cp dist/app ~/.local/bin/"),
+        _ => None,
+    }
+}
+
+/// A hook value as it belongs in a menu line: one line, bounded length.
+fn one_line(cmd: &str) -> String {
+    let flat = cmd.replace(['\n', '\r'], " ");
+    let mut chars = flat.chars();
+    let head: String = chars.by_ref().take(48).collect();
+    if chars.next().is_some() {
+        format!("{head}...")
+    } else {
+        head
+    }
 }
 
 /// Which of [`KEEP_CANDIDATES`] are actually sitting in `root`.
@@ -139,9 +177,24 @@ fn scaffold(layout: &Layout, plan: &Plan) -> Result<()> {
         }
         _ => template = template.replace(PLACEHOLDER_KEEP, &format!("# {PLACEHOLDER_KEEP}")),
     }
-    for (name, cmd) in &plan.hooks {
-        template = template.replace(&format!("{name} = \"\""), &toml_line(name, cmd));
-    }
+    // Whole lines only: `build = ""` is a substring of both `pre-build = ""` and
+    // `post-build = ""`, so a bare substring replace would write one answer over every
+    // slot whose name ends in it.
+    let filled: Vec<(String, String)> = plan
+        .hooks
+        .iter()
+        .map(|(name, cmd)| (format!("{name} = \"\""), toml_line(name, cmd)))
+        .collect();
+    template = template
+        .split('\n')
+        .map(
+            |line| match filled.iter().find(|(wanted, _)| line == wanted) {
+                Some((_, replacement)) => replacement.clone(),
+                None => line.to_owned(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let series_path = layout.series_file();
     let series_existed = series_path.exists();
@@ -161,10 +214,11 @@ fn scaffold(layout: &Layout, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
-/// What the scaffold deliberately left open, said out loud.
+/// What the scaffold left open that blocks a command, said out loud.
 ///
-/// A project with a URL but no build command is not finished, and init should never
-/// present it as if it were.
+/// A missing url or default-ref stops commands cold, so both belong in the report. An
+/// unset build hook does not: an apply-only project is finished as it stands, and the
+/// `next` hints already point at the `[hooks]` section for anyone who wants one.
 fn todo_notes(layout: &Layout, plan: &Plan) -> Vec<String> {
     let config = layout.config_file().display().to_string();
     let mut notes = Vec::new();
@@ -178,20 +232,17 @@ fn todo_notes(layout: &Layout, plan: &Plan) -> Vec<String> {
             "upstream.default-ref is not set — pass a ref (as in `skot apply main`), or edit {config}"
         ));
     }
-    if !plan.hooks.iter().any(|(name, _)| name == "pre-build") {
-        notes.push(format!(
-            "no build command — `skot build` will not produce anything until \
-             `pre-build` is set in {config}"
-        ));
-    }
     notes
 }
 
 /// `skot init`: ask for what is missing, scaffold, then carry the user to the next step.
 ///
-/// Every question has a flag — `--url`, `--default-ref`, `--policy`, `--keep`, `--hook`,
-/// `--sync` — and a value passed on the command line skips its question, so nothing here
-/// is unavailable to a script. Without a TTY (or under `--json`) it asks nothing at all.
+/// Every question has a flag (`--url`, `--default-ref`, `--policy`, `--keep`, `--hook`,
+/// `--sync`) and a value passed on the command line skips its question, so nothing here
+/// is unavailable to a script. Hooks sit behind one yes/no: a yes opens the `[hooks]`
+/// menu, where a stage is picked, answered, and returned to until `done`; a no finishes
+/// with the empty table the template documents. Without a TTY (or under `--json`) it
+/// asks nothing at all.
 pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
     let root = match &ctx.cli.dir {
         Some(d) => layout::absolute(d),
@@ -294,28 +345,56 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
         None
     };
 
-    if ask && !hooks.iter().any(|(name, _)| name == "deps") {
-        let answer = inquire::Text::new("Dependencies command")
+    // Hooks are a table of stages, not one stray question about "build": one yes/no, then
+    // a menu where a stage is picked, answered, and returned to until `done`. A no finishes
+    // the init with every slot empty, which is a finished project too, and the template's
+    // comments explain each slot to whoever edits the file later.
+    if ask {
+        let configure = inquire::Confirm::new("Configure hooks?")
+            .with_default(false)
             .with_help_message(
-                "Runs in the sandbox before the build. Leave empty if there is nothing to install.",
+                "The [hooks] table: what runs at each stage of `skot build`. \
+                 All optional, all editable later.",
             )
-            .with_placeholder("npm ci")
             .prompt()
-            .context("asking for the dependencies command")?;
-        if let Some(cmd) = non_empty(answer) {
-            hooks.push(("deps".to_owned(), cmd));
-        }
-    }
-    if ask && !hooks.iter().any(|(name, _)| name == "pre-build") {
-        let answer = inquire::Text::new("Build command")
-            .with_help_message(
-                "Produces your artifact inside the sandbox. Leave empty to fill it in later.",
-            )
-            .with_placeholder("cargo build --release")
-            .prompt()
-            .context("asking for the build command")?;
-        if let Some(cmd) = non_empty(answer) {
-            hooks.push(("pre-build".to_owned(), cmd));
+            .context("asking whether to configure hooks")?;
+        if configure {
+            // Reaching one hook must not cost a walk through the other six, so the menu
+            // comes back after every answer wearing the new value.
+            loop {
+                let options: Vec<String> = HookPoint::ALL
+                    .iter()
+                    .map(|point| {
+                        let key = point.toml_key();
+                        match hooks.iter().find(|(name, _)| name == key) {
+                            Some((_, cmd)) => format!("{key} = {}", one_line(cmd)),
+                            None => format!("{key} (unset)"),
+                        }
+                    })
+                    .chain(std::iter::once("done".to_owned()))
+                    .collect();
+                let chosen = inquire::Select::new("Which hook to configure", options)
+                    .prompt()
+                    .context("asking which hook to configure")?;
+                let key = chosen.split([' ', '(']).next().unwrap_or("");
+                let Some(point) = HookPoint::ALL.iter().find(|p| p.toml_key() == key) else {
+                    break; // `done`
+                };
+                let label = format!("Configure `{key}`");
+                let mut prompt = inquire::Text::new(&label).with_help_message(stage_help(*point));
+                if let Some(example) = stage_example(*point) {
+                    prompt = prompt.with_placeholder(example);
+                }
+                let answer = prompt
+                    .prompt()
+                    .context(format!("asking for the `{key}` hook"))?;
+                if let Some(cmd) = non_empty(answer) {
+                    match hooks.iter_mut().find(|(name, _)| name == key) {
+                        Some(slot) => slot.1 = cmd,
+                        None => hooks.push((key.to_owned(), cmd)),
+                    }
+                }
+            }
         }
     }
 
@@ -386,7 +465,7 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
             "edit the [hooks] section to describe how you build and where the result\n  \
              goes; post-build is where you copy it into place.\n",
         );
-        hints = hints.entry("skot build", "the whole run: fetch, apply, build, verify");
+        hints = hints.entry("skot build", "the whole run: fetch, apply, build");
         if sync.is_none() {
             hints = hints.entry("skot sync <ref>", "just mirror the upstream repository");
         }
@@ -517,23 +596,28 @@ mod tests {
         let layout = Layout::new(tmp.path());
         let p = Plan {
             hooks: vec![
-                ("deps".to_owned(), "npm ci".to_owned()),
-                ("pre-build".to_owned(), "make".to_owned()),
+                ("pre-build".to_owned(), "npm ci".to_owned()),
+                ("build".to_owned(), "make".to_owned()),
             ],
             ..plan("https://example.invalid/proj")
         };
         scaffold(&layout, &p).unwrap();
 
         let written = read(&layout);
-        assert!(written.contains(&toml_line("deps", "npm ci")), "{written}");
         assert!(
-            written.contains(&toml_line("pre-build", "make")),
+            written.contains(&toml_line("pre-build", "npm ci")),
             "{written}"
         );
+        assert!(written.contains(&toml_line("build", "make")), "{written}");
 
         let parsed: crate::config::Config = toml::from_str(&written).unwrap();
-        assert_eq!(parsed.hooks.deps.as_deref(), Some("npm ci"));
-        assert_eq!(parsed.hooks.pre_build.as_deref(), Some("make"));
+        assert_eq!(parsed.hooks.pre_build.as_deref(), Some("npm ci"));
+        assert_eq!(parsed.hooks.build.as_deref(), Some("make"));
+        assert_eq!(
+            parsed.hooks.post_build.as_deref(),
+            Some(""),
+            "one answer must not plaster itself over the slots it is a substring of"
+        );
         assert_eq!(
             parsed.hooks.pre_sync.as_deref(),
             Some(""),
@@ -544,8 +628,8 @@ mod tests {
     #[test]
     fn a_hook_is_named_and_split_on_the_first_equals() {
         assert_eq!(
-            parse_hook("deps=npm ci").unwrap(),
-            ("deps".to_owned(), "npm ci".to_owned())
+            parse_hook("build=make").unwrap(),
+            ("build".to_owned(), "make".to_owned())
         );
         assert_eq!(
             parse_hook("pre-build=FOO=1 make").unwrap(),
@@ -557,14 +641,14 @@ mod tests {
     fn an_unknown_hook_name_is_refused_listing_the_real_ones() {
         let err = parse_hook("bogus=rm -rf /").unwrap_err().to_string();
         assert!(err.contains("`bogus` is not a hook"), "{err}");
-        for name in ["deps", "pre-build", "pre-verify"] {
+        for name in ["build", "pre-build", "post-apply"] {
             assert!(err.contains(name), "the error should list {name}: {err}");
         }
     }
 
     #[test]
     fn a_hook_without_a_command_is_refused() {
-        let err = parse_hook("deps").unwrap_err().to_string();
+        let err = parse_hook("build").unwrap_err().to_string();
         assert!(err.contains("NAME=COMMAND"), "{err}");
     }
 

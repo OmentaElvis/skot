@@ -1,14 +1,16 @@
 //! `build`: the whole run, end to end.
 //!
-//! Five phases in a fixed order — sync, apply, deps, build, verify — each with its own hooks.
-//! skot does the first two with libgit2 and knows nothing about the last three; your hooks
-//! are the build system. That is the whole contract, and it is why a `skot.toml` for a Rust
-//! crate and one for a Node monorepo differ only in the hook commands.
+//! Three phases in a fixed order: sync, apply, build. The first two are skot's own
+//! libgit2 work; the third is entirely your hooks, in three slots: `pre-build` to
+//! prepare (install dependencies, configure), `build` to produce the artifact, and
+//! `post-build` to finish with it (copy it into place, smoke test it). skot knows
+//! nothing about any of that; it is why a `skot.toml` for a Rust crate and one for a
+//! Node monorepo differ only in the hook commands.
 //!
 //! Three decisions shape this file:
 //!
 //! - **The sandbox outlives a failure.** A dependency cache is the expensive thing to rebuild,
-//!   and a run that fails at `verify` should not throw it away. Cleanup happens on success
+//!   and a run that fails in `build` should not throw it away. Cleanup happens on success
 //!   (for `ephemeral`) or never (for `persistent`), so a CI policy still cannot leak a
 //!   directory on the failure path.
 //! - **State is checkpointed per phase**, so a run interrupted by Ctrl-C reports which phase
@@ -25,7 +27,7 @@ use crate::commands::apply;
 use crate::commands::{Ctx, Exit, emit_json};
 use crate::config::{Config, SandboxPolicy};
 use crate::git::sandbox;
-use crate::hooks::{self, Env, Outcome};
+use crate::hooks::{self, Env};
 use crate::layout::Layout;
 use crate::phase::{HookPoint, Phase, Selection};
 use crate::state::State;
@@ -43,26 +45,28 @@ pub fn run(ctx: &Ctx, args: &BuildArgs) -> Result<Exit> {
         only: args.only,
     };
     let phases = selection.resolve();
+    info!(target: "build", "building {ref_name}");
+    debug!(
+        target: "build",
+        "phases: {}",
+        phases.iter().map(|p| p.name()).collect::<Vec<_>>().join(" → ")
+    );
 
     let lock = ctx.lock()?;
+    debug!(target: "build", "lock acquired; held until the run ends");
     let mut state = State::load(&ctx.layout)?;
     state.begin(&ctx.layout, "build")?;
+    debug!(target: "build", "state: run in flight (command `build`)");
 
     let ephemeral = config.sandbox.policy == SandboxPolicy::Ephemeral;
-    let result = drive(
-        &ctx.layout,
-        &config,
-        &ref_name,
-        &phases,
-        ctx.cli.json,
-        ctx.cli.verbose,
-    );
+    let result = drive(&ctx.layout, &config, &ref_name, &phases, ctx.cli.json);
 
     // The result, not the exit path, decides cleanup. A failed run keeps its sandbox.
     if result.is_ok() && ephemeral {
         // Only on success: an ephemeral sandbox that survives a failed CI run is a leak on
         // the runner, and one that a developer is trying to debug is a feature. Success is the
         // case where neither argument applies.
+        debug!(target: "build", "removing the ephemeral sandbox; the run succeeded");
         sandbox::remove(&ctx.layout)?;
     }
     // Reload rather than reusing the copy `begin` took: the phases wrote their own state
@@ -70,6 +74,7 @@ pub fn run(ctx: &Ctx, args: &BuildArgs) -> Result<Exit> {
     // before they ran would write those records back the way they were — empty.
     let mut state = State::load(&ctx.layout)?;
     state.finish(&ctx.layout)?;
+    debug!(target: "build", "state: run finished; nothing in flight");
     drop(lock);
 
     // A failure still owes the caller a document. `check`, `apply` and `status` all report
@@ -102,8 +107,8 @@ pub fn run(ctx: &Ctx, args: &BuildArgs) -> Result<Exit> {
         }))?;
     } else {
         info!(
-            "{} — the sandbox at {} is ready.",
-            ran.join(" → "),
+            target: "build",
+            "complete; the sandbox at {} is ready.",
             ctx.layout.sandbox_dir().display()
         );
     }
@@ -115,44 +120,53 @@ pub fn run(ctx: &Ctx, args: &BuildArgs) -> Result<Exit> {
 /// `layout` only supplies the config file's path for the message; the parameters are all
 /// scalars, so this is testable without a command line.
 fn the_ref(layout: &Layout, config: &Config, ref_name: Option<&str>) -> Result<String> {
-    ref_name
-        .map(str::to_owned)
-        .or_else(|| config.upstream.default_ref.clone())
-        .context(format!(
-            "no ref to build.\n\
+    if let Some(name) = ref_name {
+        debug!(target: "build", "ref from the argument: {name}");
+        return Ok(name.to_owned());
+    }
+    debug!(
+        target: "build",
+        "no ref argument; consulting `upstream.default-ref`"
+    );
+    config.upstream.default_ref.clone().context(format!(
+        "no ref to build.\n\
              Pass one (`skot build v1.2.0`) or set `upstream.default-ref` in {}.",
-            layout.config_file().display()
-        ))
+        layout.config_file().display()
+    ))
 }
 
 /// Run the selected phases in order, and return the names of the ones that ran.
 ///
 /// No exit code and no output: a phase either runs or the whole run errors, and `run` states
-/// the verdict and writes any document. `json` and `verbose` are hook narration switches, not
-/// a command line.
+/// the verdict and writes any document. `json` is a hook narration switch, not a command line.
 fn drive(
     layout: &Layout,
     config: &Config,
     ref_name: &str,
     phases: &[Phase],
     json: bool,
-    verbose: u8,
 ) -> Result<Vec<&'static str>> {
     let mut ran: Vec<&'static str> = Vec::new();
+
+    // Whether this run has already paid the fetch-if-missing choke point: it has when the
+    // sync phase is in the selection, and apply can then resolve against the mirror
+    // directly instead of ensuring the same ref all over again.
+    let synced = phases.contains(&Phase::Sync);
 
     for phase in phases {
         let mut state = State::load(layout)?;
         state.checkpoint(layout, *phase)?;
+        debug!(target: "build", "checkpoint: {phase} is the phase in flight");
 
         match phase {
             Phase::Sync => {
                 sync_phase(layout, config, ref_name, json)?;
             }
             Phase::Apply => {
-                apply_phase(layout, config, ref_name, json)?;
+                apply_phase(layout, config, ref_name, json, synced)?;
             }
-            Phase::Deps | Phase::Build | Phase::Verify => {
-                hook_phase(layout, config, ref_name, *phase, json, verbose)?;
+            Phase::Build => {
+                hook_phase(layout, config, ref_name, *phase, json)?;
             }
         }
         ran.push(phase.name());
@@ -163,9 +177,16 @@ fn drive(
 
 /// `sync`, with the sync hooks around it.
 fn sync_phase(layout: &Layout, config: &Config, ref_name: &str, json: bool) -> Result<()> {
-    // `pre_sync` runs before there is a sandbox on a first run, so it runs in the project
-    // root. Hooks that want the tree wait for `deps`.
-    let env = root_env(layout, ref_name, "")?;
+    // Stated before the work: `ensure` can be a network fetch taking minutes, and this is
+    // the line that says what the silence (or the spinner) is for.
+    info!(
+        target: "build",
+        "sync: making sure {ref_name} is in the mirror"
+    );
+    // `pre_sync` runs before there is a sandbox on a first run, so its working directory
+    // is the project root (`HookPoint::runs_in_project_root`). Hooks that want the tree
+    // wait for `post_apply`.
+    let env = hook_env(layout, ref_name, "")?;
     hooks::run_point(HookPoint::PreSync, &env, config, json)?;
 
     // The work, not a sub-command: `build` owns this run's narration and its JSON, and
@@ -175,26 +196,47 @@ fn sync_phase(layout: &Layout, config: &Config, ref_name: &str, json: bool) -> R
     // warm build runs even when the network would not.
     crate::commands::sync::ensure(layout, Some(ref_name))?;
 
-    let env = root_env(layout, ref_name, &current_sha(layout))?;
+    let env = hook_env(layout, ref_name, &current_sha(layout))?;
     hooks::run_point(HookPoint::PostSync, &env, config, json)?;
     Ok(())
 }
 
 /// `apply`, with the apply hooks around it.
-fn apply_phase(layout: &Layout, config: &Config, ref_name: &str, json: bool) -> Result<()> {
+fn apply_phase(
+    layout: &Layout,
+    config: &Config,
+    ref_name: &str,
+    json: bool,
+    synced: bool,
+) -> Result<()> {
     let sha = current_sha(layout);
-    // `pre_apply` runs before `apply` has created the sandbox on a first run, so it runs in
-    // the project root. A hook that needs the patched tree belongs in `deps`.
+    // The sha comes from state, which a cold run has not filled in yet: on a first run
+    // there is nothing to say but the ref itself.
+    let against = if sha.is_empty() {
+        ref_name.to_owned()
+    } else {
+        format!("{ref_name} ({sha})")
+    };
+    info!(target: "build", "apply: applying the series against {against}");
+    // `pre_apply` runs before `apply` has created the sandbox on a first run, so its
+    // working directory is the project root (`HookPoint::runs_in_project_root`). A hook
+    // that needs the patched tree belongs at `post_apply` or later.
     hooks::run_point(
         HookPoint::PreApply,
-        &root_env(layout, ref_name, &sha)?,
+        &hook_env(layout, ref_name, &sha)?,
         config,
         json,
     )?;
 
     // `apply_locked`, not `apply`: the run already holds the lock for the whole build, and
-    // `apply` would try to take it again and block against this process.
-    let applied = apply::apply_locked(layout, Some(ref_name))?;
+    // `apply` would try to take it again and block against this process. When the sync
+    // phase ran in this run the ensured variant applies, which is the same replay without
+    // a second pass through the fetch-if-missing choke point.
+    let applied = if synced {
+        apply::apply_locked_ensured(layout, Some(ref_name))?
+    } else {
+        apply::apply_locked(layout, Some(ref_name))?
+    };
     if !applied.ok {
         // `applied.failure` rather than a generic "the series does not apply": this is the
         // point where the user learns which of their patches is the problem, and it is the
@@ -206,7 +248,7 @@ fn apply_phase(layout: &Layout, config: &Config, ref_name: &str, json: bool) -> 
         );
     }
 
-    let env = sandbox_env(layout, ref_name, &sha)?;
+    let env = hook_env(layout, ref_name, &sha)?;
     hooks::run_point(HookPoint::PostApply, &env, config, json)?;
     Ok(())
 }
@@ -218,38 +260,42 @@ fn hook_phase(
     ref_name: &str,
     phase: Phase,
     json: bool,
-    verbose: u8,
 ) -> Result<()> {
     let sha = current_sha(layout);
-    let env = sandbox_env(layout, ref_name, &sha)?;
+    let env = hook_env(layout, ref_name, &sha)?;
     hooks::ensure_sandbox(&env.sandbox)?;
 
-    // `Phase::Deps` names the same hook point twice, so that its `hooks()` array has the same
-    // shape as every other phase's. Deduplicating is what stops that shape from doubling every
-    // dependency install; doing it generically means a future phase with the same quirk is
-    // covered without touching this.
-    for point in unique_points(phase) {
-        match hooks::run_point(point, &env, config, json)? {
-            Outcome::Ran | Outcome::Failed => {}
-            Outcome::Skipped => {
-                if verbose > 0 {
-                    debug!("  no hook at {point}");
-                }
-            }
-        }
+    // Stated with the exact points about to run, so a failure below names its stage. A
+    // phase with nothing configured logs nothing: nothing is running and nothing went
+    // wrong, and `run_point` already says so per point at debug.
+    let points = unique_points(phase);
+    let configured: Vec<String> = points
+        .iter()
+        .filter(|point| config.hook(**point).is_some())
+        .map(|point| point.to_string())
+        .collect();
+    if !configured.is_empty() {
+        info!(
+            target: "build",
+            "{phase}: running {}",
+            configured.join(" → ")
+        );
+    }
+
+    for point in points {
+        hooks::run_point(point, &env, config, json)?;
     }
     Ok(())
 }
 
 /// A phase's hook points, each once, in order.
 ///
-/// `Phase::Deps` has a single point but reports it twice, so that `hooks()` has the same
-/// `[pre, post]` shape as every other phase and `--from`/`--only` reasoning never has to
-/// special-case it. Taken literally that would run a dependency install twice per build, so
-/// the duplicates are dropped here — the single place that runs hooks for a phase.
+/// `hooks()` has no duplicates, so this is a defensive pass: the one place that runs
+/// hooks for a phase must never run a configured command twice, whatever shape a
+/// future phase's point list takes.
 pub(crate) fn unique_points(phase: Phase) -> Vec<HookPoint> {
-    let mut out: Vec<HookPoint> = Vec::with_capacity(2);
-    for point in phase.hooks() {
+    let mut out: Vec<HookPoint> = Vec::with_capacity(3);
+    for &point in phase.hooks() {
         if !out.contains(&point) {
             out.push(point);
         }
@@ -269,19 +315,11 @@ fn current_sha(layout: &Layout) -> String {
         .unwrap_or_default()
 }
 
-/// The hook environment for a hook that may run before the sandbox exists.
-fn root_env(layout: &Layout, ref_name: &str, sha: &str) -> Result<Env> {
-    Ok(Env {
-        project_root: layout.root().to_path_buf(),
-        sandbox: layout.sandbox_dir(),
-        ref_name: ref_name.to_owned(),
-        sha: sha.to_owned(),
-        version: Env::version_from_ref(ref_name),
-    })
-}
-
-/// The hook environment for a hook that needs the patched tree.
-fn sandbox_env(layout: &Layout, ref_name: &str, sha: &str) -> Result<Env> {
+/// The hook environment for a lifecycle hook: the project, the ref, the commit.
+///
+/// Which directory a relative hook `cwd` resolves against is not this function's
+/// business; that rule lives on the point itself, in `HookPoint::runs_in_project_root`.
+fn hook_env(layout: &Layout, ref_name: &str, sha: &str) -> Result<Env> {
     Ok(Env {
         project_root: layout.root().to_path_buf(),
         sandbox: layout.sandbox_dir(),
@@ -331,21 +369,78 @@ mod tests {
     fn a_missing_sandbox_stops_a_hook_phase_with_a_message_that_says_why() {
         let (_tmp, layout) = testsupport::project();
         let config = Config::default();
-        let err = hook_phase(&layout, &config, "main", Phase::Deps, false, 0)
+        let err = hook_phase(&layout, &config, "main", Phase::Build, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("no sandbox"), "got {err}");
     }
 
     #[test]
-    fn the_deps_phase_runs_its_hook_once_not_twice() {
-        // `Phase::Deps` repeats `HookPoint::Deps` so its `hooks()` array matches the other
-        // phases' shape. Taking that literally would double every dependency install.
-        assert_eq!(Phase::Deps.hooks(), [HookPoint::Deps, HookPoint::Deps]);
-        assert_eq!(unique_points(Phase::Deps), vec![HookPoint::Deps]);
+    fn a_cold_sync_runs_its_hooks_in_the_project_root() {
+        // On a first run the sandbox does not exist yet when `pre_sync` runs, so its
+        // working directory has to be the project root: spawning `sh` in the missing
+        // sandbox is what a cold build used to die on.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::mirror_with_one_commit(tmp.path());
+        std::fs::write(
+            layout.config_file(),
+            "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n\n\
+             [hooks]\npre-sync = \"pwd > where.txt\"\n",
+        )
+        .unwrap();
+        let (config, _) = layout.project().unwrap();
+        assert!(!layout.sandbox_dir().exists());
+
+        let ran = drive(&layout, &config, "main", &[Phase::Sync], false).unwrap();
+        assert_eq!(ran, vec!["sync"]);
+        assert_eq!(
+            std::fs::read_to_string(layout.root().join("where.txt"))
+                .unwrap()
+                .trim(),
+            layout.root().display().to_string()
+        );
+        assert!(
+            !layout.sandbox_dir().exists(),
+            "sync does not build a sandbox"
+        );
+    }
+
+    #[test]
+    fn an_empty_series_still_builds() {
+        // A fresh project, empty series and all: build runs the whole lifecycle with
+        // nothing to replay instead of refusing at the door.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::mirror_with_one_commit(tmp.path());
+        testsupport::write_series(&layout, &[]);
+        let (config, _) = layout.project().unwrap();
+
+        let ran = drive(&layout, &config, "main", &Phase::ORDER, false).unwrap();
+
+        assert_eq!(ran, vec!["sync", "apply", "build"]);
+        assert_eq!(
+            std::fs::read_to_string(layout.sandbox_dir().join("f.txt")).unwrap(),
+            "base\n"
+        );
+    }
+
+    #[test]
+    fn the_build_phase_runs_its_three_points_in_order() {
+        assert_eq!(
+            Phase::Build.hooks(),
+            &[HookPoint::PreBuild, HookPoint::Build, HookPoint::PostBuild]
+        );
         assert_eq!(
             unique_points(Phase::Build),
-            vec![HookPoint::PreBuild, HookPoint::PostBuild]
+            vec![HookPoint::PreBuild, HookPoint::Build, HookPoint::PostBuild]
+        );
+        // The other phases are pairs around work skot does itself.
+        assert_eq!(
+            unique_points(Phase::Sync),
+            vec![HookPoint::PreSync, HookPoint::PostSync]
+        );
+        assert_eq!(
+            unique_points(Phase::Apply),
+            vec![HookPoint::PreApply, HookPoint::PostApply]
         );
     }
 
@@ -387,7 +482,7 @@ mod tests {
         let layout = buildable(tmp.path());
         let (config, _) = layout.project().unwrap();
 
-        let ran = drive(&layout, &config, "main", &[Phase::Apply], false, 0).unwrap();
+        let ran = drive(&layout, &config, "main", &[Phase::Apply], false).unwrap();
         assert_eq!(ran, vec!["apply"]);
         assert_eq!(
             std::fs::read_to_string(layout.sandbox_dir().join("f.txt")).unwrap(),
@@ -404,7 +499,7 @@ mod tests {
         let layout = buildable(tmp.path());
         let (config, _) = layout.project().unwrap();
 
-        let ran = drive(&layout, &config, "main", &[Phase::Sync], false, 0).unwrap();
+        let ran = drive(&layout, &config, "main", &[Phase::Sync], false).unwrap();
 
         assert_eq!(ran, vec!["sync"]);
     }
@@ -415,8 +510,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = buildable(tmp.path());
         let (config, _) = layout.project().unwrap();
-        drive(&layout, &config, "main", &[Phase::Apply], false, 0).unwrap();
-        drive(&layout, &config, "main", &[Phase::Apply], false, 0).unwrap();
+        drive(&layout, &config, "main", &[Phase::Apply], false).unwrap();
+        drive(&layout, &config, "main", &[Phase::Apply], false).unwrap();
     }
 
     #[test]
@@ -467,7 +562,7 @@ mod tests {
         // --from and --only are the same axis, so asking for both is a contradiction rather
         // than a silent precedence rule.
         assert!(
-            crate::cli::Cli::try_parse_from(["skot", "build", "--from", "sync", "--only", "deps"])
+            crate::cli::Cli::try_parse_from(["skot", "build", "--from", "sync", "--only", "apply"])
                 .is_err()
         );
     }

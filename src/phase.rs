@@ -1,9 +1,10 @@
 //! Build phases.
 //!
-//! A run is a sequence of phases. Each phase has optional `pre_` and `post_` hook
-//! points, except `Deps`, which has the single point `deps`. Ordering lives here
-//! rather than in a struct field order so that `--from` / `--only` and the hook
-//! execution order can never disagree with each other.
+//! A run is a sequence of phases. `sync` and `apply` sandwich work skot does itself
+//! between their `pre_` and `post_` points; `build` is three points where your hooks
+//! do everything: prepare, build, finish. Ordering lives here rather than in a struct
+//! field order so that `--from` / `--only` and the hook execution order can never
+//! disagree with each other.
 
 use std::fmt;
 use std::str::FromStr;
@@ -17,11 +18,9 @@ pub enum HookPoint {
     PostSync,
     PreApply,
     PostApply,
-    Deps,
     PreBuild,
+    Build,
     PostBuild,
-    PreVerify,
-    PostVerify,
 }
 
 impl HookPoint {
@@ -32,11 +31,9 @@ impl HookPoint {
             Self::PostSync => "post_sync",
             Self::PreApply => "pre_apply",
             Self::PostApply => "post_apply",
-            Self::Deps => "deps",
             Self::PreBuild => "pre_build",
+            Self::Build => "build",
             Self::PostBuild => "post_build",
-            Self::PreVerify => "pre_verify",
-            Self::PostVerify => "post_verify",
         }
     }
 
@@ -50,25 +47,33 @@ impl HookPoint {
             Self::PostSync => "post-sync",
             Self::PreApply => "pre-apply",
             Self::PostApply => "post-apply",
-            Self::Deps => "deps",
             Self::PreBuild => "pre-build",
+            Self::Build => "build",
             Self::PostBuild => "post-build",
-            Self::PreVerify => "pre-verify",
-            Self::PostVerify => "post-verify",
         }
     }
 
+    /// Whether a relative hook `cwd` for this point is measured from the project root
+    /// rather than from the sandbox.
+    ///
+    /// `pre_sync`, `post_sync`, and `pre_apply` run before the sandbox exists on a first
+    /// run, so measuring from it would make a cold build fail on a hook whose working
+    /// directory was never there. The points from `post_apply` on run against the patched
+    /// tree, where the sandbox is exactly what the hook should see; a hook that wants the
+    /// tree belongs at `post_apply` or later.
+    pub const fn runs_in_project_root(self) -> bool {
+        matches!(self, Self::PreSync | Self::PostSync | Self::PreApply)
+    }
+
     /// Every hook point, in lifecycle order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 7] = [
         Self::PreSync,
         Self::PostSync,
         Self::PreApply,
         Self::PostApply,
-        Self::Deps,
         Self::PreBuild,
+        Self::Build,
         Self::PostBuild,
-        Self::PreVerify,
-        Self::PostVerify,
     ];
 }
 
@@ -86,41 +91,27 @@ impl fmt::Display for HookPoint {
 pub enum Phase {
     Sync,
     Apply,
-    Deps,
     Build,
-    Verify,
 }
 
 impl Phase {
     /// Every phase, in execution order.
-    pub const ORDER: [Self; 5] = [
-        Self::Sync,
-        Self::Apply,
-        Self::Deps,
-        Self::Build,
-        Self::Verify,
-    ];
+    pub const ORDER: [Self; 3] = [Self::Sync, Self::Apply, Self::Build];
 
     pub const fn name(self) -> &'static str {
         match self {
             Self::Sync => "sync",
             Self::Apply => "apply",
-            Self::Deps => "deps",
             Self::Build => "build",
-            Self::Verify => "verify",
         }
     }
 
     /// The hook points that run in this phase, in order.
-    pub const fn hooks(self) -> [HookPoint; 2] {
+    pub const fn hooks(self) -> &'static [HookPoint] {
         match self {
-            Self::Sync => [HookPoint::PreSync, HookPoint::PostSync],
-            Self::Apply => [HookPoint::PreApply, HookPoint::PostApply],
-            // `deps` is a phase whose work *is* the hook; there is nothing for
-            // skot itself to do between pre_build and post_build.
-            Self::Deps => [HookPoint::Deps, HookPoint::Deps],
-            Self::Build => [HookPoint::PreBuild, HookPoint::PostBuild],
-            Self::Verify => [HookPoint::PreVerify, HookPoint::PostVerify],
+            Self::Sync => &[HookPoint::PreSync, HookPoint::PostSync],
+            Self::Apply => &[HookPoint::PreApply, HookPoint::PostApply],
+            Self::Build => &[HookPoint::PreBuild, HookPoint::Build, HookPoint::PostBuild],
         }
     }
 }
@@ -172,13 +163,15 @@ impl Selection {
     }
 
     /// Expand into the concrete phases to run.
+    ///
+    /// `only` is that phase alone; `from` is that phase and everything after it.
     pub fn resolve(self) -> Vec<Phase> {
         if let Some(only) = self.only {
             let i = Phase::ORDER
                 .iter()
                 .position(|p| *p == only)
                 .expect("phase is from ORDER");
-            return Phase::ORDER[i..].to_vec();
+            return Phase::ORDER[i..=i].to_vec();
         }
         match self.from {
             Some(from) => {
@@ -214,12 +207,12 @@ mod tests {
     }
 
     #[test]
-    fn only_means_that_phase_and_everything_after() {
+    fn only_means_just_that_phase() {
         let sel = Selection {
             from: None,
-            only: Some(Phase::Build),
+            only: Some(Phase::Apply),
         };
-        assert_eq!(sel.resolve(), vec![Phase::Build, Phase::Verify]);
+        assert_eq!(sel.resolve(), vec![Phase::Apply]);
     }
 
     #[test]
@@ -228,29 +221,37 @@ mod tests {
             from: Some(Phase::Apply),
             only: None,
         };
-        assert_eq!(
-            sel.resolve(),
-            vec![Phase::Apply, Phase::Deps, Phase::Build, Phase::Verify]
-        );
+        assert_eq!(sel.resolve(), vec![Phase::Apply, Phase::Build]);
     }
 
     #[test]
     fn from_and_only_together_means_only() {
         let sel = Selection {
             from: Some(Phase::Sync),
-            only: Some(Phase::Deps),
+            only: Some(Phase::Apply),
         };
-        assert_eq!(
-            sel.resolve(),
-            vec![Phase::Deps, Phase::Build, Phase::Verify]
-        );
+        assert_eq!(sel.resolve(), vec![Phase::Apply]);
     }
 
     #[test]
     fn every_hook_point_is_reachable_from_some_phase() {
-        let reached: std::collections::BTreeSet<_> =
-            Phase::ORDER.iter().flat_map(|p| p.hooks()).collect();
+        let reached: std::collections::BTreeSet<_> = Phase::ORDER
+            .iter()
+            .flat_map(|p| p.hooks().iter().copied())
+            .collect();
         let all: std::collections::BTreeSet<_> = HookPoint::ALL.into_iter().collect();
         assert_eq!(reached, all, "a hook point exists that no phase ever runs");
+    }
+
+    #[test]
+    fn the_points_that_run_on_a_cold_run_measure_from_the_project_root() {
+        let cold_run = [HookPoint::PreSync, HookPoint::PostSync, HookPoint::PreApply];
+        for point in HookPoint::ALL {
+            assert_eq!(
+                point.runs_in_project_root(),
+                cold_run.contains(&point),
+                "{point} has the wrong base directory"
+            );
+        }
     }
 }

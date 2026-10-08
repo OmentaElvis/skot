@@ -60,18 +60,19 @@ pub fn run(ctx: &Ctx, arg: &PatchArg) -> Result<Exit> {
     }
 
     if let Some(removed) = &popped.removed {
-        info!("popped {removed}");
+        info!(target: "pop", "popped {removed}");
     }
     let holding = if popped.names.is_empty() {
         "upstream only".to_owned()
     } else {
         count(popped.names.len(), "patch", "patches")
     };
-    debug!("the sandbox now holds {holding}");
+    debug!(target: "pop", "the sandbox now holds {holding}");
     for name in &popped.names {
-        debug!("  {name}");
+        debug!(target: "pop", "  {name}");
     }
     info!(
+        target: "pop",
         "The sandbox is on {} ({}), holding {holding}.",
         popped.ref_name, popped.sha
     );

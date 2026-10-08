@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use log::debug;
 
 use super::{Sha, resolve_ref};
 use crate::layout::Layout;
@@ -127,6 +128,13 @@ impl Mirror {
                 format!("+refs/tags/{name}:refs/tags/{name}"),
             ],
         };
+        // What this fetch actually asks for, before any of it becomes network: the
+        // decision to take one ref, a tag, a whole upstream, or nothing at all.
+        if refspecs.is_empty() {
+            debug!(target: "git", "no named ref to ask for (a commit id); not connecting");
+        } else {
+            debug!(target: "git", "asking for {}", refspecs.join(" "));
+        }
 
         Self::transfer(
             url,
@@ -196,7 +204,24 @@ impl Mirror {
         // do not walk history. libgit2 refuses shallow fetches over its local transport
         // (path and `file://` URLs), so those take full history, which is what a local
         // source should cost anyway.
-        let depth = if is_local_url(url) { 0 } else { depth };
+        let depth = if is_local_url(url) {
+            if depth > 0 {
+                debug!(
+                    target: "git",
+                    "{url} is a local transport, which libgit2 will not shallow-fetch; \
+                     taking full history"
+                );
+            }
+            0
+        } else {
+            depth
+        };
+        debug!(
+            target: "git",
+            "fetching into {} at depth {}",
+            path.display(),
+            if depth == 0 { "unlimited".to_owned() } else { depth.to_string() }
+        );
 
         let progress = ui::Progress::new(message);
         let mut callbacks = git2::RemoteCallbacks::new();
@@ -238,7 +263,13 @@ impl Mirror {
                         .map(|name| point_head_at(&repo, name))
                         .transpose()?
                         .unwrap_or(false);
-                    if !pointed {
+                    if pointed {
+                        debug!(
+                            target: "git",
+                            "HEAD dangled after init; pointed it at {}",
+                            wanted.unwrap_or_default()
+                        );
+                    } else {
                         // `default_branch` is only answerable once the remote has connected, which
                         // is why this is inside the fetch's scope. It returns the *full* ref name.
                         let default = remote
@@ -250,6 +281,7 @@ impl Mirror {
                         {
                             repo.set_head(default)
                                 .context(format!("pointing the mirror's HEAD at {default}"))?;
+                            debug!(target: "git", "HEAD dangled after init; pointed it at {default}");
                         }
                     }
                 }

@@ -73,21 +73,25 @@ pub fn run(ctx: &Ctx, args: &RefreshArgs) -> Result<Exit> {
     }
 
     if !done.changed {
-        info!("{} is already up to date", done.name);
+        info!(target: "refresh", "{} is already up to date", done.name);
         info!(
+            target: "refresh",
             "The sandbox matches it. Edit {} to change anything.",
             ctx.layout.sandbox_dir().display()
         );
         return Ok(Exit::Success);
     }
 
-    info!("refreshed {}", done.name);
-    debug!("  {}", done.summary);
-    debug!("  {}", done.path.display());
+    info!(target: "refresh", "refreshed {}", done.name);
+    debug!(target: "refresh", "  {}", done.summary);
+    debug!(target: "refresh", "  {}", done.path.display());
     if done.registered {
-        debug!("registered in the series");
+        debug!(target: "refresh", "registered in the series");
     } else {
-        debug!("already in the series, so the series was left alone");
+        debug!(
+            target: "refresh",
+            "already in the series, so the series was left alone"
+        );
     }
     Hints::new("next")
         .entry("skot check", "re-verify the whole series")

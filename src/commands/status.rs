@@ -36,7 +36,7 @@ pub fn run(ctx: &Ctx, _args: &StatusArgs) -> Result<Exit> {
 
     // An interrupted run is the single most important thing to say, so it comes first.
     if let Some(message) = state.interrupted() {
-        warn!("{message}");
+        warn!(target: "status", "{message}");
         report::line("Re-run the same command; skot resets the sandbox before it starts.");
         report::line("`skot clean` discards the sandbox entirely if you would rather start over.");
     }

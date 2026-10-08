@@ -13,7 +13,11 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
             emit_json(&serde_json::json!({ "patches": [] }))?;
             return Ok(Exit::Success);
         }
-        warn!("the series at {} lists no patches", series.path().display());
+        warn!(
+            target: "list",
+            "the series at {} lists no patches",
+            series.path().display()
+        );
         report::note("Add one with: skot new <name>");
         return Ok(Exit::Success);
     }
@@ -60,7 +64,7 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
     }
 
     if !missing.is_empty() {
-        warn!("{} patch file(s) listed but not on disk:", missing.len());
+        warn!(target: "list", "{} patch file(s) listed but not on disk:", missing.len());
         for name in &missing {
             report::line(&report::bad(name));
         }

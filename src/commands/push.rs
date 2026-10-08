@@ -60,7 +60,8 @@ pub fn run(ctx: &Ctx, arg: &PatchArg) -> Result<Exit> {
 
     match &pushed.added {
         Some(added) => info!(
-            "pushed {added} — the sandbox now holds {}",
+            target: "push",
+            "pushed {added}; the sandbox now holds {}",
             count(pushed.names.len(), "patch", "patches")
         ),
         None => {
@@ -72,16 +73,21 @@ pub fn run(ctx: &Ctx, arg: &PatchArg) -> Result<Exit> {
                 count(pushed.names.len(), "patch", "patches")
             };
             info!(
+                target: "push",
                 "The sandbox is on {} ({}), holding {holding}.",
                 pushed.ref_name, pushed.sha
             );
         }
     }
-    debug!("sandbox {}", ctx.layout.sandbox_dir().display());
+    debug!(target: "push", "sandbox {}", ctx.layout.sandbox_dir().display());
     for name in &pushed.names {
-        debug!("  {name}");
+        debug!(target: "push", "  {name}");
     }
-    debug!("  on {} ({})", pushed.ref_name, pushed.sha);
+    debug!(
+        target: "push",
+        "  on {} ({})",
+        pushed.ref_name, pushed.sha
+    );
     Hints::new("next")
         .entry("skot refresh", "export what you change next")
         .entry("skot pop", "take a patch off")

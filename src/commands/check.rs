@@ -71,12 +71,16 @@ pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
         for patch in &report.patches {
             print_patch(patch);
         }
-        report::line(&report::ok(&format!(
-            "all {} apply",
-            count(report.patch_count, "patch", "patches")
-        )));
+        if report.patch_count == 0 {
+            report::line(&report::ok("no patches; nothing to check"));
+        } else {
+            report::line(&report::ok(&format!(
+                "all {} apply",
+                count(report.patch_count, "patch", "patches")
+            )));
+        }
         Hints::new("next")
-            .entry("skot build", "the whole run: fetch, apply, build, verify")
+            .entry("skot build", "the whole run: fetch, apply, build")
             .print();
         return Ok(Exit::Success);
     }
@@ -89,7 +93,7 @@ pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
         }
         let total = count(report.patch_count, "patch", "patches");
         let subject = count(failed.len(), "patch does", "patches do");
-        error!("{subject} not apply: {} of {total}", failed.len());
+        error!(target: "check", "{subject} not apply: {} of {total}", failed.len());
         return Ok(Exit::Failure);
     }
 
@@ -97,7 +101,7 @@ pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
         print_patch(patch);
     }
     let first = &failed[0];
-    error!("`{}` does not apply here.", first.name);
+    error!(target: "check", "`{}` does not apply here.", first.name);
     if failed.len() > 1 {
         report::note(&format!(
             "{} later {} also failed. Use --all to see them.",

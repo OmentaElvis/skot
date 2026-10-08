@@ -135,36 +135,41 @@ pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<Exit> {
 
     match done.outcome {
         Outcome::Created => info!(
+            target: "import",
             "imported {} into {}",
             super::push::count(done.commits, "commit", "commits"),
             done.patch
         ),
         Outcome::Updated => match done.previous_commits {
             Some(before) => info!(
+                target: "import",
                 "updated {} ({} to {})",
                 done.patch,
                 super::push::count(before, "commit", "commits"),
                 super::push::count(done.commits, "commit", "commits")
             ),
             None => info!(
+                target: "import",
                 "updated {} to {}",
                 done.patch,
                 super::push::count(done.commits, "commit", "commits")
             ),
         },
-        Outcome::Unchanged => info!("{} already imports this — nothing to do.", done.patch),
+        Outcome::Unchanged => {
+            info!(target: "import", "{} already imports this; nothing to do.", done.patch)
+        }
     }
     if done.registered_now {
-        info!("Added it to the series.");
+        info!(target: "import", "Added it to the series.");
     }
-    debug!("  {} -> {}", done.from, done.to);
-    debug!("  {}", done.summary);
+    debug!(target: "import", "  {} -> {}", done.from, done.to);
+    debug!(target: "import", "  {}", done.summary);
     if done.series_line.is_none() {
-        info!("Not added to the series (--no-register).");
+        info!(target: "import", "Not added to the series (--no-register).");
     }
     Hints::new("next")
         .entry("skot check", "verify the series applies")
-        .entry("skot build", "the whole run: fetch, apply, build, verify")
+        .entry("skot build", "the whole run: fetch, apply, build")
         .print();
     Ok(Exit::Success)
 }
@@ -675,6 +680,7 @@ fn fetch_or_fall_back(
         Ok(()) => Ok(()),
         Err(fetch_err) if held => {
             warn!(
+                target: "import",
                 "the upstream at {url} could not be reached; using the mirror as it \
                  stands: {fetch_err}"
             );

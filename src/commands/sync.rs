@@ -239,7 +239,7 @@ pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<Exit> {
     }
 
     Hints::new("next")
-        .entry("skot build", "the whole run: fetch, apply, build, verify")
+        .entry("skot build", "the whole run: fetch, apply, build")
         .entry(
             "skot check <ref>",
             "verify the series applies, without building",
@@ -258,6 +258,15 @@ pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<Exit> {
 /// not have the ref.
 pub fn resolve_in_mirror(layout: &Layout, name: &str) -> Result<(Mirror, crate::git::Sha)> {
     ensure(layout, Some(name))?;
+    resolve_local(layout, name)
+}
+
+/// Resolve `name` against the mirror that is already on disk. No fetch, no create.
+///
+/// For a caller that has ensured the ref earlier in the same run (build's sync phase):
+/// the choke point has been paid, and this is only the lookup half of it. Everyone else
+/// wants [`resolve_in_mirror`], which fetches what the mirror cannot serve.
+pub fn resolve_local(layout: &Layout, name: &str) -> Result<(Mirror, crate::git::Sha)> {
     let mirror = Mirror::open(layout).context(format!(
         "opening the mirror at {}",
         layout.mirror_dir().display()
@@ -387,6 +396,33 @@ mod tests {
 
         assert!(err.contains("upstream.url"), "got {err}");
         assert!(err.contains("skot init --url"), "no remedy offered: {err}");
+    }
+
+    #[test]
+    fn resolve_local_is_a_lookup_and_never_starts_a_mirror() {
+        // The half of the choke point a caller uses when the ref was ensured earlier in
+        // the same run: no fetch, no clone, just the mirror that must already be there.
+        let tmp = tempfile::tempdir().unwrap();
+        let url = upstream(tmp.path());
+        let layout = fixture(&tmp.path().join("proj"), &url);
+
+        let err = match resolve_local(&layout, "main") {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("there is no mirror yet, so this must not resolve"),
+        };
+        assert!(err.contains("opening the mirror"), "got {err}");
+        assert!(
+            !layout.mirror_dir().exists(),
+            "resolve_local must not create the mirror"
+        );
+
+        fetch(&layout, None).unwrap();
+        let (_mirror, sha) = resolve_local(&layout, "main").unwrap();
+        assert_eq!(
+            Mirror::open(&layout).unwrap().resolve("main").unwrap(),
+            sha,
+            "got {sha}"
+        );
     }
 
     /// A bare repo standing in for the network, with an extra branch on top of `main`.

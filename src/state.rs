@@ -152,11 +152,11 @@ mod tests {
         let mut s = State::default();
         s.set_ref(&l, "v1.2.3", "abc").unwrap();
         s.begin(&l, "build").unwrap();
-        s.checkpoint(&l, Phase::Deps).unwrap();
+        s.checkpoint(&l, Phase::Apply).unwrap();
 
         let msg = s.interrupted().unwrap();
         assert!(msg.contains("build"), "got {msg}");
-        assert!(msg.contains("deps"), "got {msg}");
+        assert!(msg.contains("apply"), "got {msg}");
         assert!(msg.contains("v1.2.3"), "got {msg}");
     }
 

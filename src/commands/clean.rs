@@ -97,7 +97,7 @@ pub fn run(ctx: &Ctx, args: &CleanArgs) -> Result<Exit> {
     report::note("skot never deletes patches/ or the series.");
 
     if !ctx.yes {
-        warn!("dry run. Re-run with --yes to do it.");
+        warn!(target: "clean", "dry run. Re-run with --yes to do it.");
         return Ok(Exit::Success);
     }
 

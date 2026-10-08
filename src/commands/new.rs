@@ -19,13 +19,12 @@
 //! An empty series is fine here: the first patch in a project is created against a bare
 //! upstream, and `skot check` has nothing to complain about until the patch has content.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use log::{debug, info};
 use serde_json::json;
 
 use crate::cli::NewArgs;
 use crate::commands::{Ctx, Exit, authoring, emit_json};
-use crate::git::sandbox;
 use crate::hints::Hints;
 use crate::layout::Layout;
 use crate::series;
@@ -56,9 +55,13 @@ pub fn run(ctx: &Ctx, args: &NewArgs) -> Result<Exit> {
         return Ok(Exit::Success);
     }
 
-    info!("created {}", created.name);
-    debug!("{}", created.path.display());
-    debug!("registered at line {} of the series", created.line);
+    info!(target: "new", "created {}", created.name);
+    debug!(target: "new", "{}", created.path.display());
+    debug!(
+        target: "new",
+        "registered at line {} of the series",
+        created.line
+    );
 
     // The sandbox is on the base by now, so there is only one place to edit and one next step.
     Hints::new("next")
@@ -136,42 +139,26 @@ fn create(layout: &Layout, name: &str, base: Option<&str>) -> Result<Created> {
 
 /// Put the sandbox on `base` with the series applied to it, recording what it did.
 ///
-/// This is `apply` without the narration, plus the one case `apply` refuses: an empty series.
-/// The first patch in a project is created against a bare upstream, and there is nothing to
-/// replay there — but the sandbox still has to exist and be at the right commit, or the user's
-/// first edit lands somewhere arbitrary.
+/// This is `apply` without the narration, and there is deliberately no second path: the
+/// first patch in a project is created against a bare upstream with nothing to replay,
+/// and `apply_locked` handles that by resetting the sandbox to `base` and applying zero
+/// patches. One path means `new` cannot put the sandbox somewhere `apply` would not.
 fn prepare_sandbox(layout: &Layout, base: &str, name: &str) -> Result<()> {
-    let (config, series) = layout.project()?;
-    let entries = series.entries(layout)?;
-    if !entries.is_empty() {
-        let applied = crate::commands::apply::apply_locked(layout, Some(base))?;
-        if !applied.ok {
-            // Checked, not `?`'d: `apply_locked` reports a failed replay by *returning* a
-            // verdict rather than by erroring, because the caller decides whether that
-            // is fatal. Ignoring it here means `new` puts the new patch on a sandbox that
-            // does not hold the series, and the first `refresh` then folds the missing work
-            // into that new patch instead of failing.
-            anyhow::bail!(
-                "the existing series does not apply to {base}, so there is nowhere sensible to \
-                 start `{name}`.\n\
-                 {failure}\n\
-                 Fix or rebase that patch first. Nothing was written.",
-                failure = applied.failure
-            );
-        }
-        return Ok(());
+    let applied = crate::commands::apply::apply_locked(layout, Some(base))?;
+    if !applied.ok {
+        // Checked, not `?`'d: `apply_locked` reports a failed replay by *returning* a
+        // verdict rather than by erroring, because the caller decides whether that
+        // is fatal. Ignoring it here means `new` puts the new patch on a sandbox that
+        // does not hold the series, and the first `refresh` then folds the missing work
+        // into that new patch instead of failing.
+        anyhow::bail!(
+            "the existing series does not apply to {base}, so there is nowhere sensible to \
+             start `{name}`.\n\
+             {failure}\n\
+             Fix or rebase that patch first. Nothing was written.",
+            failure = applied.failure
+        );
     }
-
-    let (mirror, sha) = super::sync::resolve_in_mirror(layout, base)?;
-    sandbox::create(layout, &mirror).context(format!(
-        "creating the sandbox at {}",
-        layout.sandbox_dir().display()
-    ))?;
-    sandbox::reset_to(layout, &sha, &config.sandbox.keep)?;
-
-    let mut state = State::load(layout)?;
-    state.set_ref(layout, base, &sha)?;
-    state.clear_applied(layout)?;
     Ok(())
 }
 

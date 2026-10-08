@@ -564,6 +564,16 @@ index 3333333..4444444 100644
     }
 
     #[test]
+    fn an_empty_series_replays_as_ok() {
+        // Zero patches apply to anything, so a fresh project's check is a success, not
+        // an error about having nothing to do.
+        let (_dir, repo, sha) = repo_with(&[("f.txt", BASE)]);
+        let report = check_series(&repo, &sha, &[]).unwrap();
+        assert!(report.ok);
+        assert_eq!(report.patch_count, 0);
+    }
+
+    #[test]
     fn a_clean_series_reports_ok() {
         let tmp = tempfile::tempdir().unwrap();
         let a = entry(tmp.path(), "0001-a.patch", CONFLICTING_A);

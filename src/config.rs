@@ -130,11 +130,9 @@ pub struct Hooks {
     pub post_sync: Option<String>,
     pub pre_apply: Option<String>,
     pub post_apply: Option<String>,
-    pub deps: Option<String>,
     pub pre_build: Option<String>,
+    pub build: Option<String>,
     pub post_build: Option<String>,
-    pub pre_verify: Option<String>,
-    pub post_verify: Option<String>,
 }
 
 impl Hooks {
@@ -144,11 +142,9 @@ impl Hooks {
             HookPoint::PostSync => &self.post_sync,
             HookPoint::PreApply => &self.pre_apply,
             HookPoint::PostApply => &self.post_apply,
-            HookPoint::Deps => &self.deps,
             HookPoint::PreBuild => &self.pre_build,
+            HookPoint::Build => &self.build,
             HookPoint::PostBuild => &self.post_build,
-            HookPoint::PreVerify => &self.pre_verify,
-            HookPoint::PostVerify => &self.post_verify,
         };
         s.as_deref()
     }
@@ -216,7 +212,7 @@ mod tests {
             [hooks]
             post-build = "b"
             pre-sync = "s"
-            deps = "d"
+            build = "make"
             "#,
         )
         .unwrap();
@@ -225,7 +221,7 @@ mod tests {
             .into_iter()
             .map(|(p, _)| p.key())
             .collect();
-        assert_eq!(keys, vec!["pre_sync", "deps", "post_build"]);
+        assert_eq!(keys, vec!["pre_sync", "build", "post_build"]);
     }
 
     #[test]
@@ -319,10 +315,10 @@ mod tests {
     #[test]
     fn the_display_name_and_the_config_key_are_different_and_both_used() {
         // If these ever collapsed, `skot hooks` would display a key that could not be
-        // pasted into skot.toml. `deps` is the exception: it has no prefix, so there
+        // pasted into skot.toml. `build` is the exception: it has no prefix, so there
         // is nothing for kebab-case to change.
         for point in HookPoint::ALL {
-            if point == HookPoint::Deps {
+            if point == HookPoint::Build {
                 assert_eq!(point.key(), point.toml_key());
                 continue;
             }

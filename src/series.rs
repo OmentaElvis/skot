@@ -22,8 +22,6 @@ pub struct Entry {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SeriesError {
-    #[error("the series is empty: there is nothing to apply")]
-    Empty,
     #[error("{}:{}: patch listed in the series does not exist: {}", .series.display(), .line, .name)]
     MissingPatch {
         series: PathBuf,
@@ -129,12 +127,12 @@ impl Series {
             .collect()
     }
 
-    /// Error if the series has no patches or references a file that is gone.
+    /// Error if a file listed in the series is gone.
+    ///
+    /// An empty series is a valid state, not an error: a project straight from `init` has
+    /// one, and `build`, `check`, and `apply` all run with nothing to replay.
     pub fn require_resolvable(&self, layout: &Layout) -> Result<Vec<Entry>, SeriesError> {
         let entries = self.entries(layout)?;
-        if entries.is_empty() {
-            return Err(SeriesError::Empty);
-        }
         for entry in &entries {
             if !entry.path.is_file() {
                 return Err(SeriesError::MissingPatch {
@@ -413,10 +411,12 @@ mod tests {
     }
 
     #[test]
-    fn require_resolvable_rejects_an_empty_series() {
+    fn require_resolvable_accepts_an_empty_series() {
+        // An empty series is a fresh project, not a broken one: `init` writes one, and
+        // build, check, and apply all run with nothing to replay.
         let (_tmp, l) = layout();
-        let err = s("# nothing yet\n").require_resolvable(&l).unwrap_err();
-        assert!(matches!(err, SeriesError::Empty));
+        let entries = s("# nothing yet\n").require_resolvable(&l).unwrap();
+        assert!(entries.is_empty());
     }
 
     #[test]
