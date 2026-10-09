@@ -1,4 +1,4 @@
-//! `refresh`: turn what you changed in the sandbox into a patch file.
+//! `patch refresh`: turn what you changed in the sandbox into a patch file.
 //!
 //! This is the command that makes patch authoring a loop rather than a chore. You edit in the
 //! sandbox, run `refresh`, and the patch on disk is the diff — no commit, no branch, no
@@ -26,6 +26,7 @@ use crate::cli::RefreshArgs;
 use crate::commands::{Ctx, Exit, authoring, emit_json};
 use crate::git::diff;
 use crate::hints::Hints;
+use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
 use crate::series::{self, Series};
 use crate::state::State;
@@ -94,8 +95,8 @@ pub fn run(ctx: &Ctx, args: &RefreshArgs) -> Result<Exit> {
         );
     }
     Hints::new("next")
-        .entry("skot check", "re-verify the whole series")
-        .entry("skot push", "apply the next patch")
+        .entry(skot("check"), "re-verify the whole series")
+        .entry(skot("push"), "apply the next patch")
         .print();
     Ok(Exit::Success)
 }
@@ -156,10 +157,12 @@ fn refresh(
         bail!(
             "there is nothing in the sandbox to export for {}, but that patch is not empty.\n\
              The change it describes is not in {} right now.\n\
-             If you meant to undo it, `skot pop` and delete the patch; if the sandbox was \
-             reset, `skot apply` puts the series back.",
+             If you meant to undo it, `{}` and delete the patch; if the sandbox was \
+             reset, `{}` puts the series back.",
             target.name,
-            layout.sandbox_dir().display()
+            layout.sandbox_dir().display(),
+            skot("pop"),
+            skot("apply")
         );
     }
 
@@ -259,15 +262,17 @@ fn choose(
             Some(top) => anyhow::bail!(
                 "`{}` has {} on top of it in the sandbox, so its changes cannot be told apart \
                  from the ones above it.\n\
-                 `skot pop` takes the patches above it off, then `skot refresh {}` exports \
+                 `{}` takes the patches above it off, then `{}` exports \
                  just this one.",
                 found.name,
                 top,
-                found.name
+                skot("pop"),
+                skot_args("refresh", &found.name)
             ),
             None => anyhow::bail!(
                 "nothing is applied to the sandbox, so there is nothing to refresh.\n\
-                 Run `skot apply` first.",
+                 Run `{}` first.",
+                skot("apply")
             ),
         }
         let index = entries
@@ -284,13 +289,16 @@ fn choose(
         if entries.is_empty() {
             bail!(
                 "the series at {} is empty, so there is nothing to refresh.\n\
-                 `skot new <name>` starts a patch.",
-                series.path().display()
+                 `{}` starts a patch.",
+                series.path().display(),
+                skot_args("new", "<name>")
             );
         }
         bail!(
             "nothing is applied to the sandbox, so there is no patch to refresh.\n\
-             Run `skot apply` first, or name the patch: `skot refresh {}`.",
+             Run `{}` first, or name the patch: `{} {}`.",
+            skot("apply"),
+            skot("refresh"),
             entries.last().map(|e| e.name.as_str()).unwrap_or("")
         );
     };
@@ -300,7 +308,8 @@ fn choose(
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "the last applied patch is `{last_applied}`, which the series does not list.\n\
-                 Name the one to refresh: `skot refresh <patch>`."
+                 Name the one to refresh: `{}`.",
+                skot_args("refresh", "<patch>")
             )
         })?;
     Ok((entries[index].clone(), index))
@@ -333,7 +342,7 @@ mod tests {
     fn refresh_needs_a_sandbox() {
         let (_tmp, layout) = testsupport::project();
         let err = refresh(&layout, None, None, false).unwrap_err().to_string();
-        assert!(err.contains("skot apply"), "got {err}");
+        assert!(err.contains(&skot("apply")), "got {err}");
     }
 
     #[test]
@@ -344,7 +353,7 @@ mod tests {
         let err = choose(&layout, &series, &State::default(), None)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("skot new"), "got {err}");
+        assert!(err.contains(&skot("new")), "got {err}");
     }
 
     #[test]
@@ -371,7 +380,7 @@ mod tests {
         let err = choose(&layout, &series, &State::default(), None)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("skot apply"), "got {err}");
+        assert!(err.contains(&skot("apply")), "got {err}");
         assert!(
             err.contains("0001-a.patch"),
             "the message should name it: {err}"
@@ -492,7 +501,7 @@ mod tests {
             "it should say what is on top: {err}"
         );
         assert!(
-            err.contains("skot pop"),
+            err.contains(&skot("pop")),
             "it should offer the way out: {err}"
         );
         assert_eq!(

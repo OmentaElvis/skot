@@ -1,13 +1,13 @@
-//! `remove`: take a patch out of the series for good.
+//! `patch drop`: take a patch out of the series for good.
 //!
-//! A patch is two things: its line in `series` and its file in `patches/`. `remove` takes
+//! A patch is two things: its line in `series` and its file in `patches/`. `drop` takes
 //! both, and renumbers the patches after it down so the numbers stay contiguous, the same
 //! promise `new --at` and `import --at` keep in the other direction. Lexical order stays
 //! application order either way.
 //!
 //! It refuses a patch that is applied rather than leaving the sandbox holding something
-//! the series no longer lists: `skot pop` puts it down, `remove` takes it out, and
-//! `skot apply` picks the set up again (interactively, it opens the picker). The refusal
+//! the series no longer lists: `skot patch pop` puts it down, `drop` takes it out, and
+//! `skot patch apply` picks the set up again (interactively, it opens the picker). The refusal
 //! is the whole safety story; nothing here ever guesses, and the file the guard will not
 //! delete is reported rather than silently kept.
 
@@ -15,14 +15,15 @@ use anyhow::{Result, bail};
 use log::{debug, info, warn};
 use serde_json::json;
 
-use crate::cli::RemoveArgs;
+use crate::cli::DropArgs;
 use crate::commands::{Ctx, Exit, emit_json};
 use crate::hints::Hints;
+use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
 use crate::series::FileGone;
 use crate::state::State;
 
-/// What `remove` did, presented by [`run`].
+/// What `drop` did, presented by [`run`].
 #[derive(Debug)]
 struct Removed {
     /// The patch's name as it was in the series.
@@ -44,7 +45,7 @@ struct Removed {
 /// patch, an out-of-series file squatting on a tail rename) is an error rather than a
 /// negative verdict, because the series is untouched and the remedy is a different
 /// command, not a different exit code.
-pub fn run(ctx: &Ctx, args: &RemoveArgs) -> Result<Exit> {
+pub fn run(ctx: &Ctx, args: &DropArgs) -> Result<Exit> {
     let removed = remove(&ctx.layout, &args.patch)?;
 
     if ctx.cli.json {
@@ -75,23 +76,23 @@ pub fn run(ctx: &Ctx, args: &RemoveArgs) -> Result<Exit> {
             super::push::count(removed.left, "patch", "patches")
         )
     };
-    info!(target: "remove", "removed {}; {holding}", removed.name);
+    info!(target: "drop", "removed {}; {holding}", removed.name);
     match &removed.file {
         FileGone::Kept(path) => warn!(
-            target: "remove",
+            target: "drop",
             "the file stays where it is: {} is outside the layout, which skot never deletes from",
             path.display()
         ),
-        FileGone::Missing => debug!(target: "remove", "its file was already gone"),
+        FileGone::Missing => debug!(target: "drop", "its file was already gone"),
         FileGone::Deleted => {}
     }
-    debug!(target: "remove", "series now:");
+    debug!(target: "drop", "series now:");
     for (from, to) in &removed.renames {
-        debug!(target: "remove", "  {from} -> {to}");
+        debug!(target: "drop", "  {from} -> {to}");
     }
     Hints::new("next")
-        .entry("skot check", "verify the series applies")
-        .entry("skot list", "the series as it stands")
+        .entry(skot("check"), "verify the series applies")
+        .entry(skot("list"), "the series as it stands")
         .print();
     Ok(Exit::Success)
 }
@@ -112,7 +113,10 @@ fn remove(layout: &Layout, want: &str) -> Result<Removed> {
         i
     } else if let Ok(position) = want.parse::<usize>() {
         if position == 0 {
-            bail!("positions are 1-based: `skot remove 1` is the front of the series");
+            bail!(
+                "positions are 1-based: `{}` is the front of the series",
+                skot_args("drop", "1")
+            );
         }
         if position > names.len() {
             bail!(
@@ -133,10 +137,12 @@ fn remove(layout: &Layout, want: &str) -> Result<Removed> {
 
     if state.applied.contains(&name) {
         bail!(
-            "`{name}` is applied, so removing it would leave the sandbox holding a patch the \
+            "`{name}` is applied, so dropping it would leave the sandbox holding a patch the \
              series no longer lists.\n\
-             `skot pop {name}` takes it off (and the patches above it); `skot apply` picks the \
-             set up again afterwards."
+             `{}` takes it off (and the patches above it); `{}` picks the \
+             set up again afterwards.",
+            skot_args("pop", &name),
+            skot("apply")
         );
     }
 
@@ -254,7 +260,7 @@ mod tests {
             err.contains("is applied"),
             "the refusal states the reason: {err}"
         );
-        assert!(err.contains("skot pop"), "it names the remedy: {err}");
+        assert!(err.contains(&skot("pop")), "it names the remedy: {err}");
         assert_eq!(
             std::fs::read_to_string(layout.series_file()).unwrap(),
             "0001-a.patch\n0002-b.patch\n",
@@ -382,7 +388,7 @@ mod tests {
     #[test]
     fn run_reports_the_removal_as_a_success() {
         let (tmp, layout) = three_patches();
-        let cli = Cli::try_parse_from(["skot", "remove", "0003-c.patch"]).unwrap();
+        let cli = Cli::try_parse_from(["skot", "patch", "drop", "0003-c.patch"]).unwrap();
         let ctx = Ctx {
             layout,
             cli,
@@ -391,7 +397,7 @@ mod tests {
 
         let exit = run(
             &ctx,
-            &RemoveArgs {
+            &DropArgs {
                 patch: "0003-c.patch".to_owned(),
             },
         )

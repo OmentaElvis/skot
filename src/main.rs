@@ -1,15 +1,17 @@
 use std::process::ExitCode;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::FromArgMatches;
 
-use skot::cli::{Cli, Command};
+use skot::cli::{Cli, Command, build_cli};
 use skot::commands::{self, Exit};
 use skot::hints;
 use skot::ui;
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // One tree for parsing and for help: `--help` is what `build_cli` dresses up.
+    let matches = build_cli().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     ui::set_json(cli.json);
     hints::set_enabled(!cli.no_hints);
     ui::install_logger(cli.json);

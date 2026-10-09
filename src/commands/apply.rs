@@ -1,4 +1,4 @@
-//! `apply`: put patches into the sandbox, in order.
+//! `patch apply`: put patches into the sandbox, in order.
 //!
 //! The sandbox is a linked worktree of the mirror, so applying is three libgit2 calls:
 //! reset the worktree to the base commit, replay the chosen patches into a tree, check that
@@ -18,6 +18,7 @@ use crate::cli::RefArg;
 use crate::commands::{Ctx, Exit};
 use crate::git::sandbox;
 use crate::hints::Hints;
+use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
 
 /// What an apply did, presented by [`run`].
@@ -107,7 +108,7 @@ pub fn run(ctx: &Ctx, args: &RefArg) -> Result<Exit> {
             }
         }
         Hints::new("next")
-            .entry("skot build", "run your hooks from here")
+            .entry(skot("build"), "run your hooks from here")
             .print();
     } else {
         report_failure(&applied.report);
@@ -226,7 +227,8 @@ fn apply_inner(
     let Some(wanted) = wanted else {
         bail!(
             "no ref to apply against.\n\
-             Pass one (`skot apply main`) or set `upstream.default-ref` in {}.",
+             Pass one (`{}`) or set `upstream.default-ref` in {}.",
+            skot_args("apply", "main"),
             layout.config_file().display()
         );
     };
@@ -384,7 +386,8 @@ fn unapply_to_upstream(layout: &Layout) -> Result<Unapplied> {
         bail!(
             "cannot tell which ref the sandbox was applied to.\n\
              `.skot/state.json` does not record one and `upstream.default-ref` is unset.\n\
-             Re-apply against the ref you want, or `skot clean sandbox` and start over."
+             Re-apply against the ref you want, or `{}` and start over.",
+            skot_args("clean", "sandbox")
         );
     };
 
@@ -433,7 +436,8 @@ fn report_failure(report: &check::Report) {
     );
     info!(
         target: "apply",
-        "Rebase the patch against this ref, then `skot refresh` to re-export it."
+        "Rebase the patch against this ref, then `{}` to re-export it.",
+        skot("refresh")
     );
 }
 
@@ -444,7 +448,7 @@ pub(crate) fn count(n: usize, singular: &str, plural: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{Cli, Command};
+    use crate::cli::{Cli, Command, PatchCommand};
     use clap::Parser as _;
 
     /// A project with a mirror, a sandbox, and a one-file upstream, all built with libgit2.
@@ -800,7 +804,10 @@ index 1111111..2222222 100644
 
         let err = apply_locked(&f.layout, None).unwrap_err().to_string();
         assert!(err.contains("no ref to apply against"), "got {err}");
-        assert!(err.contains("skot apply main"), "no remedy offered: {err}");
+        assert!(
+            err.contains(&skot_args("apply", "main")),
+            "no remedy offered: {err}"
+        );
     }
 
     #[test]
@@ -979,11 +986,11 @@ index 1111111..2222222 100644
 
     #[test]
     fn the_apply_and_unapply_subcommands_parse() {
-        let cli = Cli::try_parse_from(["skot", "apply"]).unwrap();
-        let Command::Apply(a) = cli.command else {
+        let cli = Cli::try_parse_from(["skot", "patch", "apply"]).unwrap();
+        let Command::Patch(PatchCommand::Apply(a)) = cli.command else {
             panic!("expected apply")
         };
         assert!(a.ref_name.is_none());
-        assert!(Cli::try_parse_from(["skot", "unapply"]).is_ok());
+        assert!(Cli::try_parse_from(["skot", "patch", "unapply"]).is_ok());
     }
 }

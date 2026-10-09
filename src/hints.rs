@@ -11,10 +11,11 @@
 //!
 //! ```
 //! use skot::hints::Hints;
+//! use skot::invocation::skot;
 //!
 //! Hints::new("next")
-//!     .entry("skot check", "re-verify the whole series")
-//!     .entry("skot push", "apply the next patch")
+//!     .entry(skot("check"), "re-verify the whole series")
+//!     .entry(skot("push"), "apply the next patch")
 //!     .print();
 //! ```
 
@@ -22,10 +23,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ui::Styled;
 
-/// Width of the command column: wide enough for `skot refresh <name>`, the longest entry
-/// today, so every description starts in the same place and the block reads as pairs rather
-/// than as prose.
-const CMD: usize = 22;
+/// Width of the command column: wide enough for `skot patch refresh <name>`, the longest
+/// entry today, so every description starts in the same place and the block reads as pairs
+/// rather than as prose.
+const CMD: usize = 25;
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 
@@ -125,13 +126,14 @@ mod tests {
     /// pins the column.
     #[test]
     fn a_block_is_a_heading_then_rows_with_the_command_padded_to_the_column() {
+        let command_line = crate::invocation::skot("check");
         let out = Hints::new("next")
-            .entry("skot check", "re-verify the series")
+            .entry(command_line.as_str(), "re-verify the series")
             .line("edit the config")
             .render();
 
         let heading = Styled::new().bold().underlined().render("next");
-        let command = Styled::new().bold().render("skot check            ");
+        let command = Styled::new().bold().render(format!("{command_line:<CMD$}"));
         assert_eq!(
             out,
             format!("\n{heading}\n  {command}  re-verify the series\n  edit the config\n")

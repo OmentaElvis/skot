@@ -4,6 +4,7 @@ use log::warn;
 use crate::cli::StatusArgs;
 use crate::commands::{Ctx, Exit, emit_json};
 use crate::git;
+use crate::invocation::{skot, skot_args};
 use crate::layout::{self, Layout};
 use crate::report;
 use crate::state::State;
@@ -39,7 +40,10 @@ pub fn run(ctx: &Ctx, _args: &StatusArgs) -> Result<Exit> {
     if let Some(message) = state.interrupted() {
         warn!(target: "status", "{message}");
         report::line("Re-run the same command; skot resets the sandbox before it starts.");
-        report::line("`skot clean` discards the sandbox entirely if you would rather start over.");
+        report::line(&format!(
+            "`{}` discards the sandbox entirely if you would rather start over.",
+            skot("clean")
+        ));
     }
 
     layout::print_inventory(layout);
@@ -73,8 +77,9 @@ fn print_series(layout: &Layout, series: Option<&crate::series::Series>, applied
     let Some(series) = series else {
         report::section("series");
         report::note(&format!(
-            "{} Create one with `skot init`.",
-            report::absent("absent.")
+            "{} Create one with `{}`.",
+            report::absent("absent."),
+            skot("init")
         ));
         return;
     };
@@ -100,8 +105,9 @@ fn print_mirror(layout: &Layout) {
     let path = layout.mirror_dir();
     if !path.join("HEAD").is_file() {
         report::note(&format!(
-            "{} `skot sync` creates it.",
-            report::absent("absent.")
+            "{} `{}` creates it.",
+            report::absent("absent."),
+            skot("sync")
         ));
         return;
     }
@@ -135,8 +141,9 @@ fn print_sandbox(layout: &Layout, series: Option<&crate::series::Series>, state:
     let path = layout.sandbox_dir();
     if !path.exists() {
         report::note(&format!(
-            "{} `skot apply` creates it.",
-            report::absent("absent.")
+            "{} `{}` creates it.",
+            report::absent("absent."),
+            skot("apply")
         ));
         return;
     }
@@ -158,8 +165,10 @@ fn print_sandbox(layout: &Layout, series: Option<&crate::series::Series>, state:
             Err(e) => report::field("head", &report::bad(&format!("unreadable: {e}"))),
         },
         Err(_) => report::note(&format!(
-            "{} `skot clean sandbox` then `skot apply`.",
-            report::bad("not a skot worktree.")
+            "{} `{}` then `{}`.",
+            report::bad("not a skot worktree."),
+            skot_args("clean", "sandbox"),
+            skot("apply")
         )),
     }
 

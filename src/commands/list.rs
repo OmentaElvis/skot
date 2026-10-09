@@ -3,6 +3,7 @@ use log::warn;
 
 use crate::cli::ListArgs;
 use crate::commands::{Ctx, Exit, emit_json};
+use crate::invocation::skot_args;
 use crate::report;
 
 pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
@@ -18,7 +19,7 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
             "the series at {} lists no patches",
             series.path().display()
         );
-        report::note("Add one with: skot new <name>");
+        report::note(&format!("Add one with: {}", skot_args("new", "<name>")));
         return Ok(Exit::Success);
     }
 

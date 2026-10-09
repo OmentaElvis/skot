@@ -112,7 +112,7 @@ fn apply_json_is_a_single_document() {
     let layout = bare_project(tmp.path());
     write_series(&layout, "0001-a.patch", patch_one());
 
-    let out = skot(tmp.path(), &["apply", "main", "--json"]);
+    let out = skot(tmp.path(), &["patch", "apply", "main", "--json"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let text = stdout(&out);
     serde_json::from_str::<serde_json::Value>(&text)
@@ -133,7 +133,7 @@ fn a_series_that_does_not_apply_fails_loudly() {
         "diff --git a/f.txt b/f.txt\nindex 1111111..2222222 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,1 @@\n-nonexistent\n+first\n",
     );
 
-    let out = skot(tmp.path(), &["apply", "main"]);
+    let out = skot(tmp.path(), &["patch", "apply", "main"]);
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -290,7 +290,7 @@ fn a_keep_path_survives_a_base_that_dropped_it_without_taking_the_sandbox_with_i
     skot::git::sandbox::reset_to(&layout, &old_commit.to_string(), &[]).unwrap();
     assert!(sandbox.join("kept.txt").exists(), "fixture did not set up");
 
-    let out = skot(root, &["apply", "main"]);
+    let out = skot(root, &["patch", "apply", "main"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 
     assert_eq!(
@@ -329,7 +329,7 @@ fn an_untracked_cache_survives_repeated_applies() {
     std::fs::write(sandbox.join("node_modules/dep/index.js"), "cached\n").unwrap();
 
     for round in 1..=3 {
-        let out = skot(root, &["apply", "main"]);
+        let out = skot(root, &["patch", "apply", "main"]);
         assert_eq!(
             out.status.code(),
             Some(0),

@@ -1,4 +1,4 @@
-//! `import`: turn commits from somewhere else into a patch in the series.
+//! `patch import`: turn commits from somewhere else into a patch in the series.
 //!
 //! The range can be refs already in the mirror, a repository skot does not track (a fork,
 //! a local clone), or a pull request. All three end the same way: two trees in the mirror,
@@ -36,6 +36,7 @@ use crate::git::diff;
 use crate::git::mirror::{Mirror, is_commit_id};
 use crate::git::{self, Sha};
 use crate::hints::Hints;
+use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
 use crate::series;
 
@@ -113,7 +114,7 @@ struct Ends {
     to_sha: Sha,
 }
 
-/// `skot import`: resolve the range, fetch whatever it is missing, write the patch.
+/// `skot patch import`: resolve the range, fetch whatever it is missing, write the patch.
 pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<Exit> {
     let done = import(&ctx.layout, args)?;
 
@@ -169,8 +170,8 @@ pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<Exit> {
         info!(target: "import", "Not added to the series (--no-register).");
     }
     Hints::new("next")
-        .entry("skot check", "verify the series applies")
-        .entry("skot build", "the whole run: fetch, apply, build")
+        .entry(skot("check"), "verify the series applies")
+        .entry(skot("build"), "the whole run: fetch, apply, build")
         .print();
     Ok(Exit::Success)
 }
@@ -278,10 +279,11 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         )?;
     }
     if let Some(number) = request.pull {
-        let url = mirror.remote_url().context(
+        let url = mirror.remote_url().context(format!(
             "the mirror records no `origin`, so there is nowhere to fetch the pull request \
-             from.\nRun `skot sync` first.",
-        )?;
+             from.\nRun `{}` first.",
+            skot("sync")
+        ))?;
         let held = mirror
             .try_resolve(&format!("refs/pull/{number}/head"))
             .is_some();
@@ -371,7 +373,7 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     };
 
     // A name the user gave is the subject the same way it is for `new`: read back from the
-    // filename, so `skot list` and the patch header say the same words. The number is not
+    // filename, so `skot patch list` and the patch header say the same words. The number is not
     // part of those words — it only appears once the patch is placed in the series — so any
     // placeholder prefix reads the same words the real one will.
     let subject = if args.name.is_some() {
@@ -534,7 +536,7 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     } else {
         // The tail renumbers first (this may be what frees the name), the series is saved
         // to match, and only then is the file written: a failure anywhere before the
-        // write leaves at worst a listed patch with no file, which `skot list` calls out.
+        // write leaves at worst a listed patch with no file, which `skot patch list` calls out.
         let (line, renames) = series.insert_renumbering(layout, &patch_name, index)?;
         series.save(layout)?;
         std::fs::write(&path, &text).context(format!("writing {}", path.display()))?;
@@ -577,8 +579,11 @@ fn request(args: &ImportArgs) -> Result<Request> {
     let Some(range) = args.range.as_deref() else {
         bail!(
             "nothing to import.\n\
-             Give a range (`skot import main..my-branch`), a ref (`skot import my-branch`), \
-             or a pull request (`skot import --pr 42`)."
+             Give a range (`{}`), a ref (`{}`), \
+             or a pull request (`{}`).",
+            skot_args("import", "main..my-branch"),
+            skot_args("import", "my-branch"),
+            skot_args("import", "--pr 42")
         );
     };
 
@@ -721,10 +726,10 @@ fn resolve(
         Base::MergeWithDefault => {
             let default = config.upstream.default_ref.clone().context(format!(
                 "cannot work out what `{}` is based on.\n\
-                 Pass a base (`skot import --from <ref> {}`), or set `upstream.default-ref` \
+                 Pass a base (`{}`), or set `upstream.default-ref` \
                  in {}.",
                 request.to,
-                request.to,
+                skot_args("import", &format!("--from <ref> {}", request.to)),
                 layout.config_file().display()
             ))?;
             let default_sha = mirror.resolve(&default).with_context(|| {
@@ -749,7 +754,7 @@ fn resolve(
 /// Resolve one end of the range.
 ///
 /// In `--repo` mode the fetched namespace is tried first, because the name was written
-/// against that repository: `skot import --repo ../fork main..feat` means *that* repo's
+/// against that repository: `skot patch import --repo ../fork main..feat` means *that* repo's
 /// `main` and `feat`. The mirror is the fallback, which is how the upstream end of a range
 /// resolves when the fork does not carry it.
 fn resolve_named(mirror: &Mirror, source: Option<&str>, name: &str) -> Result<Sha> {
@@ -1462,7 +1467,10 @@ mod tests {
 
         let err = import(&layout, &args(None)).unwrap_err().to_string();
 
-        assert!(err.contains("skot import --pr"), "no remedy offered: {err}");
+        assert!(
+            err.contains(&skot_args("import", "--pr")),
+            "no remedy offered: {err}"
+        );
         assert!(err.contains("main..my-branch"), "no example offered: {err}");
     }
 

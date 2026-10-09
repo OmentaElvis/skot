@@ -1,4 +1,5 @@
-//! Shared plumbing for the authoring commands: `new`, `refresh`, `push`, `pop`, `rebase`.
+//! Shared plumbing for the authoring commands: `patch new`, `patch refresh`, `patch push`,
+//! `patch pop`, and `rebase`.
 //!
 //! These five all move between three states — the series on disk, the sandbox working tree,
 //! and the recorded state — and each of them has to work out the same three things first:
@@ -11,26 +12,28 @@ use anyhow::{Context, Result, bail};
 use crate::check;
 use crate::config::Config;
 use crate::git::{Sha, diff, sandbox};
+use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
 use crate::series::Entry;
 use crate::state::State;
 
 /// Resolve the ref a command should work against: the argument, then the configured default.
 ///
-/// `command` is the name the advice should show (`"rebase"`), kept as a plain scalar so this
-/// stays callable from tests without a clap `Ctx` behind it.
+/// `command_line` is what the advice tells the user to run, already resolved through
+/// [`crate::invocation`] so a command that moves updates this message too. Kept as a
+/// plain scalar so this stays callable from tests without a clap `Ctx` behind it.
 pub fn wanted_ref(
     layout: &Layout,
     ref_name: Option<&str>,
     config: &Config,
-    command: &'static str,
+    command_line: &str,
 ) -> Result<String> {
     ref_name
         .map(str::to_owned)
         .or_else(|| config.upstream.default_ref.clone())
         .context(format!(
             "no ref to work against.\n\
-             Pass one (as in `skot {command} <ref>`) or set `upstream.default-ref` in {}.",
+             Pass one (as in `{command_line} <ref>`) or set `upstream.default-ref` in {}.",
             layout.config_file().display()
         ))
 }
@@ -115,8 +118,9 @@ pub fn require_sandbox(layout: &Layout) -> Result<git2::Repository> {
     if !sandbox::is_repository(layout) {
         bail!(
             "no sandbox at {}.\n\
-             Run `skot apply` first.",
-            layout.sandbox_dir().display()
+             Run `{}` first.",
+            layout.sandbox_dir().display(),
+            skot("apply")
         );
     }
     sandbox::open(layout)
@@ -173,8 +177,9 @@ pub fn stack_ref(layout: &Layout, state: &State, config: &Config) -> Result<Stri
         .context(format!(
             "cannot tell which ref the sandbox is on.\n\
              `.skot/state.json` records none and `upstream.default-ref` is unset in {}.\n\
-             Run `skot apply <ref>` first.",
-            layout.config_file().display()
+             Run `{} <ref>` first.",
+            layout.config_file().display(),
+            skot("apply")
         ))
 }
 
@@ -205,7 +210,9 @@ fn validate_set(all: &[Entry], applied: &[String], series: &crate::series::Serie
             bail!(
                 "the sandbox records `{recorded}` twice.\n\
                  The recorded set at .skot/state.json is corrupt.\n\
-                 `skot unapply` then `skot apply` rebuilds it.",
+                 `{}` then `{}` rebuilds it.",
+                skot("unapply"),
+                skot("apply"),
             );
         }
         if !all.iter().any(|e| &e.name == recorded) {
@@ -213,9 +220,12 @@ fn validate_set(all: &[Entry], applied: &[String], series: &crate::series::Serie
                 "the sandbox holds `{recorded}`, which the series at {} does not list.\n\
                  The recorded set and the series have drifted apart, so no `push`, \
                  `pop` or `build` can tell which patches you meant.\n\
-                 `skot status` reports the same; `skot unapply` then `skot apply` \
+                 `{}` reports the same; `{}` then `{}` \
                  rebuilds the set",
-                series.path().display()
+                series.path().display(),
+                skot("status"),
+                skot("unapply"),
+                skot("apply")
             );
         }
     }
@@ -294,9 +304,9 @@ pub fn resolve_stack(
                     if on[position] {
                         bail!(
                             "`{}` is already applied.\n\
-                             `skot pop {}` takes it back off.",
+                             `{}` takes it back off.",
                             all[position].name,
-                            all[position].name
+                            skot_args("pop", &all[position].name)
                         );
                     }
                     // Enable it and everything below: 0003 cannot stand alone, so pushing a
@@ -326,8 +336,10 @@ pub fn resolve_stack(
                     bail!(
                         "the applied set already reaches the end of the series, so there \
                          is no next patch.\n\
-                         `skot apply` chooses which patches are on; `skot new <name>` \
-                         starts another."
+                         `{}` chooses which patches are on; `{}` \
+                         starts another.",
+                        skot("apply"),
+                        skot_args("new", "<name>")
                     );
                 }
                 on[next] = true;

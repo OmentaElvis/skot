@@ -41,8 +41,9 @@ impl Layout {
         }
         bail!(
             "no {CONFIG_FILE} found in {} or any parent directory.\n\
-             Run `skot init` inside the project you want to manage patches for.",
-            start.display()
+             Run `{}` inside the project you want to manage patches for.",
+            start.display(),
+            crate::invocation::skot("init")
         )
     }
 
@@ -64,8 +65,9 @@ impl Layout {
         if !path.is_file() {
             bail!(
                 "no {} here.\n\
-                 Run `skot init` to create one.",
-                path.display()
+                 Run `{}` to create one.",
+                path.display(),
+                crate::invocation::skot("init")
             );
         }
         crate::config::Config::load(&path)
@@ -205,7 +207,7 @@ impl Layout {
             if std::time::Instant::now() >= deadline {
                 anyhow::bail!(
                     "could not take the sandbox lock at {} within {}ms.\n\
-                     Another skot run is probably active. If you are sure it is not, \
+                     Another skot process is probably active. If you are sure it is not, \
                      wait for it to finish and try again.",
                     resource.display(),
                     LOCK_WAIT.as_millis()
@@ -461,7 +463,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let err = Layout::discover(tmp.path()).unwrap_err().to_string();
         assert!(err.contains(CONFIG_FILE));
-        assert!(err.contains("skot init"));
+        assert!(err.contains(&crate::invocation::skot("init")));
     }
 
     #[test]

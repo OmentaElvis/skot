@@ -42,7 +42,7 @@ pub enum SeriesError {
         line: usize,
         name: String,
     },
-    #[error("{}: `{}` already exists and is not in the series.\nPick another name, or `skot clean` if you think it is stale", .path.display(), .name)]
+    #[error("{}: `{}` already exists and is not in the series.\nPick another name, or `{}` if you think it is stale", .path.display(), .name, crate::invocation::skot("clean"))]
     OccupiedTarget { path: PathBuf, name: String },
 }
 

@@ -47,8 +47,9 @@ pub fn create(layout: &Layout, mirror: &Mirror) -> Result<()> {
     if !mirror.is_initialised() {
         bail!(
             "no mirror at {}, so there is nothing for the sandbox to check out.\n\
-             Run `skot sync` first.",
-            mirror.path().display()
+             Run `{}` first.",
+            mirror.path().display(),
+            crate::invocation::skot("sync")
         );
     }
 
@@ -66,8 +67,9 @@ pub fn create(layout: &Layout, mirror: &Mirror) -> Result<()> {
             bail!(
                 "{} has files in it but is not a skot worktree.\n\
                  This usually means an earlier run was interrupted. \
-                 `skot clean sandbox` removes it.",
-                dir.display()
+                 `{}` removes it.",
+                dir.display(),
+                crate::invocation::skot_args("clean", "sandbox")
             );
         }
         std::fs::remove_dir(&dir)
@@ -97,7 +99,7 @@ pub fn create(layout: &Layout, mirror: &Mirror) -> Result<()> {
 /// Make the new sandbox a detached checkout, and remove the branch libgit2 made for it.
 ///
 /// `Repository::worktree` creates a branch named after the worktree and points the worktree's
-/// HEAD at it — so `skot apply` would leave a `sandbox` branch sitting in the mirror. Two
+/// HEAD at it, so `skot patch apply` would leave a `sandbox` branch sitting in the mirror. Two
 /// problems with that: it shows up in `skot check sandbox` and `skot status` as though it
 /// were something upstream published, and it *goes stale*, because a sandbox reset detaches
 /// HEAD without touching the branch. A stale branch in a mirror is exactly the kind of thing
@@ -146,8 +148,9 @@ pub fn open(layout: &Layout) -> Result<git2::Repository> {
     let mirror = Mirror::open(layout)?;
     let worktree = mirror.repo().find_worktree(WORKTREE_NAME).context(format!(
         "the mirror at {} has no `{WORKTREE_NAME}` worktree, so there is no sandbox.\n\
-             Run `skot apply` to create one.",
-        mirror.path().display()
+             Run `{}` to create one.",
+        mirror.path().display(),
+        crate::invocation::skot("apply")
     ))?;
     git2::Repository::open_from_worktree(&worktree)
         .context(format!("opening the sandbox at {}", dir.display()))
@@ -361,9 +364,12 @@ pub fn verify_objects(layout: &Layout, mirror: &Mirror, sha: &Sha) -> Result<()>
             "{what}\n\
              The sandbox at {} shares its objects with the mirror at {}, so it cannot work \
              without it.\n\
-             Fix it with `skot clean sandbox && skot sync && skot apply`.",
+             Fix it with `{} && {} && {}`.",
             layout.sandbox_dir().display(),
             mirror.path().display(),
+            crate::invocation::skot_args("clean", "sandbox"),
+            crate::invocation::skot("sync"),
+            crate::invocation::skot("apply"),
         )
     };
 
@@ -402,7 +408,7 @@ pub fn verify_objects(layout: &Layout, mirror: &Mirror, sha: &Sha) -> Result<()>
 /// Remove the sandbox, unregistering the worktree from the mirror.
 ///
 /// The worktree has to be pruned from the mirror, not just deleted from disk: a stale
-/// registration is what makes a later `skot apply` fail with a confusing "worktree already
+/// registration is what makes a later `skot patch apply` fail with a confusing "worktree already
 /// exists" instead of creating one.
 pub fn remove(layout: &Layout) -> Result<()> {
     let dir = layout.sandbox_dir();
@@ -539,7 +545,8 @@ mod tests {
         reset_to(&layout, &sha, &[]).unwrap();
         assert!(
             mirror.refs().unwrap().branches.is_empty(),
-            "a reset must not leave a stale sandbox branch for `skot check sandbox` to find"
+            "a reset must not leave a stale sandbox branch for `{}` to find",
+            crate::invocation::skot_args("check", "sandbox")
         );
     }
 
@@ -774,7 +781,7 @@ mod tests {
             .to_string();
         assert!(err.contains("mirror"), "must name what broke: {err}");
         assert!(
-            err.contains("skot clean sandbox"),
+            err.contains(&crate::invocation::skot_args("clean", "sandbox")),
             "no remedy offered: {err}"
         );
     }
@@ -796,7 +803,7 @@ mod tests {
             .to_string();
         assert!(err.contains("no `sandbox` worktree registered"), "{err}");
         assert!(
-            err.contains("skot clean sandbox"),
+            err.contains(&crate::invocation::skot_args("clean", "sandbox")),
             "no remedy offered: {err}"
         );
     }

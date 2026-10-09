@@ -34,6 +34,7 @@ use crate::commands::{Ctx, Exit, emit_json};
 use crate::config::{Config, SandboxPolicy};
 use crate::git::sandbox;
 use crate::hooks::{self, Env};
+use crate::invocation::skot_args;
 use crate::layout::Layout;
 use crate::phase::{HookPoint, Phase, Selection};
 use crate::state::State;
@@ -136,7 +137,8 @@ fn the_ref(layout: &Layout, config: &Config, ref_name: Option<&str>) -> Result<S
     );
     config.upstream.default_ref.clone().context(format!(
         "no ref to build.\n\
-             Pass one (`skot build v1.2.0`) or set `upstream.default-ref` in {}.",
+             Pass one (`{}`) or set `upstream.default-ref` in {}.",
+        skot_args("build", "v1.2.0"),
         layout.config_file().display()
     ))
 }
@@ -404,7 +406,7 @@ mod tests {
         let err = the_ref(&layout, &config, None).unwrap_err().to_string();
         assert!(err.contains("no ref to build"), "got {err}");
         assert!(
-            err.contains("skot build v1.2.0"),
+            err.contains(&skot_args("build", "v1.2.0")),
             "no example offered: {err}"
         );
     }

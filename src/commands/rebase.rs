@@ -32,6 +32,7 @@ use crate::commands::{Ctx, Exit, emit_json};
 use crate::git::Sha;
 use crate::git::diff;
 use crate::hints::Hints;
+use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
 use crate::series::{self, Series};
 use crate::state::State;
@@ -112,9 +113,10 @@ pub fn run(ctx: &Ctx, arg: &RefArg) -> Result<Exit> {
         );
         info!(
             target: "rebase",
-            "Resolve it by hand: `skot apply {}` puts the series in the sandbox, \
-             and `skot refresh <patch>` re-exports it against the new base.",
-            rebased.ref_name
+            "Resolve it by hand: `{}` puts the series in the sandbox, \
+             and `{}` re-exports it against the new base.",
+            skot_args("apply", &rebased.ref_name),
+            skot_args("refresh", "<patch>")
         );
         return Ok(Exit::Failure);
     }
@@ -141,8 +143,8 @@ pub fn run(ctx: &Ctx, arg: &RefArg) -> Result<Exit> {
     }
     debug!(target: "rebase", "  ~ rewritten,  = unchanged");
     Hints::new("next")
-        .entry("skot build", "the whole run onto the new base")
-        .entry("skot check", "or just verify the rewritten series")
+        .entry(skot("build"), "the whole run onto the new base")
+        .entry(skot("check"), "or just verify the rewritten series")
         .print();
     Ok(Exit::Success)
 }
@@ -158,13 +160,14 @@ fn rebase(layout: &Layout, ref_name: Option<&str>) -> Result<Rebased> {
     if series.is_empty() {
         bail!(
             "the series at {} is empty, so there is nothing to rebase.\n\
-             `skot new <name>` starts a patch.",
-            series.path().display()
+             `{}` starts a patch.",
+            series.path().display(),
+            skot_args("new", "<name>")
         );
     }
     let entries = series.require_resolvable(layout)?;
 
-    let new_base = authoring::wanted_ref(layout, ref_name, &config, "rebase")?;
+    let new_base = authoring::wanted_ref(layout, ref_name, &config, &skot("rebase"))?;
     let lock = layout.lock()?;
     let (_mirror, sha) = super::sync::resolve_in_mirror(layout, &new_base)?;
 

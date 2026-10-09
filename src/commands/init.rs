@@ -7,6 +7,7 @@ use crate::cli::InitArgs;
 use crate::commands::{Ctx, Exit};
 use crate::config::SandboxPolicy;
 use crate::hints::Hints;
+use crate::invocation::{skot, skot_args};
 use crate::layout::{self, Layout};
 use crate::phase::HookPoint;
 
@@ -224,12 +225,14 @@ fn todo_notes(layout: &Layout, plan: &Plan) -> Vec<String> {
     let mut notes = Vec::new();
     if plan.url.is_none() {
         notes.push(format!(
-            "upstream.url is not set — run `skot init --url <repository>` again, or edit {config}"
+            "upstream.url is not set: run `{}` again, or edit {config}",
+            skot_args("init", "--url <repository>")
         ));
     }
     if plan.default_ref.is_none() {
         notes.push(format!(
-            "upstream.default-ref is not set — pass a ref (as in `skot apply main`), or edit {config}"
+            "upstream.default-ref is not set: pass a ref (as in `{}`), or edit {config}",
+            skot_args("apply", "main")
         ));
     }
     notes
@@ -352,10 +355,11 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
     if ask {
         let configure = inquire::Confirm::new("Configure hooks?")
             .with_default(false)
-            .with_help_message(
-                "The [hooks] table: what runs at each stage of `skot build`. \
+            .with_help_message(&format!(
+                "The [hooks] table: what runs at each stage of `{}`. \
                  All optional, all editable later.",
-            )
+                skot("build")
+            ))
             .prompt()
             .context("asking whether to configure hooks")?;
         if configure {
@@ -428,9 +432,10 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
         } else if ask {
             inquire::Confirm::new("Mirror the upstream repository now?")
                 .with_default(true)
-                .with_help_message(
-                    "Fetches it into the local mirror so `skot new` can start a patch.",
-                )
+                .with_help_message(&format!(
+                    "Fetches it into the local mirror so `{}` can start a patch.",
+                    skot("new")
+                ))
                 .prompt()
                 .context("asking whether to mirror the repository")?
         } else {
@@ -465,12 +470,18 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
             "edit the [hooks] section to describe how you build and where the result\n  \
              goes; post-build is where you copy it into place.\n",
         );
-        hints = hints.entry("skot build", "the whole run: fetch, apply, build");
+        hints = hints.entry(skot("build"), "the whole run: fetch, apply, build");
         if sync.is_none() {
-            hints = hints.entry("skot sync <ref>", "just mirror the upstream repository");
+            hints = hints.entry(
+                skot_args("sync", "<ref>"),
+                "just mirror the upstream repository",
+            );
         }
         hints
-            .entry("skot new <name>", "start a patch, with the series applied")
+            .entry(
+                skot_args("new", "<name>"),
+                "start a patch, with the series applied",
+            )
             .print();
     }
     Ok(Exit::Success)

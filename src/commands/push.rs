@@ -1,4 +1,4 @@
-//! `push`: apply the next patch in the series, or a named one.
+//! `patch push`: apply the next patch in the series, or a named one.
 //!
 //! The applied set is an ordered *subset* of the series (any patch can be on or off), and
 //! `push` moves up it quilt-style: with a name it enables that patch and everything below
@@ -20,6 +20,7 @@ use crate::commands::authoring::{self, Move};
 use crate::commands::{Ctx, Exit, emit_json};
 use crate::git::{Sha, sandbox};
 use crate::hints::Hints;
+use crate::invocation::skot;
 use crate::layout::Layout;
 use crate::state::State;
 
@@ -90,8 +91,8 @@ pub fn run(ctx: &Ctx, arg: &PatchArg) -> Result<Exit> {
         pushed.ref_name, pushed.sha
     );
     Hints::new("next")
-        .entry("skot refresh", "export what you change next")
-        .entry("skot pop", "take a patch off")
+        .entry(skot("refresh"), "export what you change next")
+        .entry(skot("pop"), "take a patch off")
         .print();
     Ok(verdict)
 }
@@ -283,7 +284,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("skot new"), "got {err}");
+        assert!(err.contains(&skot("new")), "got {err}");
     }
 
     #[test]
@@ -301,7 +302,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("skot pop"), "got {err}");
+        assert!(err.contains(&skot("pop")), "got {err}");
     }
 
     #[test]
@@ -428,7 +429,7 @@ mod tests {
         // report — no `Error:`, no panic.
         let tmp = tempfile::tempdir().unwrap();
         let layout = testsupport::applied_two_patch_stack(tmp.path());
-        let cli = crate::cli::Cli::try_parse_from(["skot", "push"]).unwrap();
+        let cli = crate::cli::Cli::try_parse_from(["skot", "patch", "push"]).unwrap();
         let ctx = Ctx {
             layout,
             cli,

@@ -1,4 +1,4 @@
-//! `new`: start the next patch, with everything already in the sandbox.
+//! `patch new`: start the next patch, with everything already in the sandbox.
 //!
 //! The authoring loop is one command per step: `new` gives you a working tree with the
 //! applied set in place and an empty patch registered at its position in the series
@@ -27,6 +27,7 @@ use serde_json::json;
 use crate::cli::NewArgs;
 use crate::commands::{Ctx, Exit, authoring, emit_json};
 use crate::hints::Hints;
+use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
 use crate::series;
 use crate::state::State;
@@ -73,7 +74,7 @@ pub fn run(ctx: &Ctx, args: &NewArgs) -> Result<Exit> {
     Hints::new("next")
         .line(format!("edit in {}", ctx.layout.sandbox_dir().display()))
         .entry(
-            format!("skot refresh {}", created.name),
+            skot_args("refresh", &created.name),
             "re-export the patch from the sandbox",
         )
         .print();
@@ -94,14 +95,16 @@ fn create(layout: &Layout, name: &str, base: Option<&str>, at: Option<&str>) -> 
             .clone()
             .or_else(|| config.upstream.default_ref.clone())
             .ok_or_else(|| {
-                // `apply`'s version of this error says "run `skot apply <ref>`", which is the
+                // `apply`'s version of this error says "run `skot patch apply <ref>`", which is the
                 // wrong advice here: the user has not decided to apply anything, they have decided
                 // to start a patch. The flag is the way to say which upstream they mean.
                 anyhow::anyhow!(
                     "cannot tell which upstream to start the patch from.\n\
-                 Pass one (`skot new --base main`), set `upstream.default-ref` in {}, \
-                 or `skot apply <ref>` if the sandbox should be put in place first.",
-                    layout.config_file().display()
+                 Pass one (`{}`), set `upstream.default-ref` in {}, \
+                 or `{}` if the sandbox should be put in place first.",
+                    skot_args("new", "--base main"),
+                    layout.config_file().display(),
+                    skot_args("apply", "<ref>")
                 )
             })?,
     };
@@ -114,15 +117,16 @@ fn create(layout: &Layout, name: &str, base: Option<&str>, at: Option<&str>) -> 
     if layout.patches_dir().join(&patch_name).exists() {
         bail!(
             "{} already exists.\n\
-             Pick another name, or `skot clean` if you think it is stale.",
-            layout.patches_dir().join(&patch_name).display()
+             Pick another name, or `{}` if you think it is stale.",
+            layout.patches_dir().join(&patch_name).display(),
+            skot("clean")
         );
     }
 
     std::fs::create_dir_all(layout.patches_dir())?;
     // The tail moves first (this may be what frees the name), the series is saved to
     // match, and only then is the new file written: a failure anywhere before the write
-    // leaves at worst a listed patch with no file, which `skot list` calls out.
+    // leaves at worst a listed patch with no file, which `skot patch list` calls out.
     let (line, renames) = series.insert_renumbering(layout, &patch_name, index)?;
     series.save(layout)?;
     std::fs::write(layout.patches_dir().join(&patch_name), "")?;
@@ -194,7 +198,7 @@ fn prepare_sandbox(layout: &Layout, base: &str, name: &str) -> Result<()> {
 /// The name ends up in two places that both care: a path under `patches/`, and a line of the
 /// series. So `/`, `\`, and anything that could escape the directory are refused outright
 /// rather than sanitised — a name the tool quietly rewrites is a name the user will not
-/// recognise in `skot list`.
+/// recognise in `skot patch list`.
 pub(super) fn slug(name: &str) -> Result<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
@@ -215,7 +219,7 @@ pub(super) fn slug(name: &str) -> Result<String> {
         bail!("`{trimmed}` cannot be used as a patch name");
     }
 
-    // Whitespace becomes a dash. Patch names come from commit subjects and `skot new
+    // Whitespace becomes a dash. Patch names come from commit subjects and `skot patch new
     // <words>`, and people write those with spaces in them; a filename with a space has to be
     // quoted in every shell, every `series` line it is typed into, and every `cp` in a hook.
     // The dash form is what `git format-patch` would have produced anyway.
@@ -229,7 +233,7 @@ pub(super) fn slug(name: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{Cli, Command};
+    use crate::cli::{Cli, Command, PatchCommand};
     use crate::commands::testsupport;
     use clap::Parser as _;
 
@@ -396,7 +400,7 @@ mod tests {
 
     #[test]
     fn new_without_a_default_ref_says_how_to_choose_one() {
-        // `apply`'s advice for this situation — "run `skot apply <ref>`" — is the wrong
+        // `apply`'s advice for this situation ("run `skot patch apply <ref>`") is the wrong
         // advice here, because the user has not decided to apply anything.
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = testsupport::project_with_sandbox(tmp.path());
@@ -511,12 +515,12 @@ index 1111111..2222222 100644
 
     #[test]
     fn the_new_command_parses_with_a_name_and_an_optional_base() {
-        let cli = Cli::try_parse_from(["skot", "new", "trim-widgets"]).unwrap();
-        let Command::New(args) = cli.command else {
+        let cli = Cli::try_parse_from(["skot", "patch", "new", "trim-widgets"]).unwrap();
+        let Command::Patch(PatchCommand::New(args)) = cli.command else {
             panic!("expected new")
         };
         assert_eq!(args.name, "trim-widgets");
         assert!(args.base.is_none());
-        assert!(Cli::try_parse_from(["skot", "new", "x", "--base", "v2"]).is_ok());
+        assert!(Cli::try_parse_from(["skot", "patch", "new", "x", "--base", "v2"]).is_ok());
     }
 }

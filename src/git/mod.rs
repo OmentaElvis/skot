@@ -40,7 +40,8 @@ pub fn resolve_ref(repo: &git2::Repository, name: &str) -> Result<Sha> {
     }
     anyhow::bail!(
         "`{name}` is not in the mirror.\n\
-         Run `skot sync {name}` to fetch it, if it is new upstream."
+         Run `{} {name}` to fetch it, if it is new upstream.",
+        crate::invocation::skot("sync")
     )
 }
 

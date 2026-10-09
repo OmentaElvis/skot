@@ -1,4 +1,4 @@
-//! `pop`: take the patch on top back off the sandbox.
+//! `patch pop`: take the patch on top back off the sandbox.
 //!
 //! This is not `push` run backwards. Reverting one patch by hand is how a sandbox ends up
 //! with files that are half-reverted, and the mistake is invisible until a build produces
@@ -9,7 +9,7 @@
 //! That is also why `pop` takes a patch *name*, cut quilt-style: popping 0002 takes 0002
 //! and everything enabled after it, since those stand on it. Turning exactly one patch off
 //! while keeping the set above it whole is a different question, and the interactive
-//! `skot apply` picker asks it. See [`authoring::resolve_stack`].
+//! `skot patch apply` picker asks it. See [`authoring::resolve_stack`].
 
 use anyhow::{Context, Result};
 use log::{debug, info};
@@ -143,6 +143,7 @@ pub(super) fn pop(layout: &Layout, want: Option<&str>) -> Result<Popped> {
 mod tests {
     use super::*;
     use crate::commands::testsupport;
+    use crate::invocation::skot;
     use crate::layout::Layout;
     use clap::Parser as _;
 
@@ -315,7 +316,7 @@ mod tests {
         let err = pop(&layout, None).unwrap_err().to_string();
         assert!(err.contains("no sandbox"), "got {err}");
         assert!(
-            err.contains("skot apply"),
+            err.contains(&skot("apply")),
             "the remedy should be offered: {err}"
         );
     }
@@ -339,7 +340,7 @@ mod tests {
         // The verdict a script reads is the exit code: `Exit::Failure` with the ordinary
         // report — no `Error:`, no panic.
         let (_tmp, layout) = sandbox_on_main();
-        let cli = crate::cli::Cli::try_parse_from(["skot", "pop"]).unwrap();
+        let cli = crate::cli::Cli::try_parse_from(["skot", "patch", "pop"]).unwrap();
         let ctx = Ctx {
             layout,
             cli,

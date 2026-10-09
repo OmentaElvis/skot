@@ -35,6 +35,7 @@ use crate::cli::SyncArgs;
 use crate::commands::{Ctx, Exit, emit_json};
 use crate::git::mirror::{self, Mirror};
 use crate::hints::Hints;
+use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
 
 /// What a fetch learned, for whichever layer presents it.
@@ -148,8 +149,9 @@ fn sync(layout: &Layout, ref_name: Option<&str>, refresh: bool) -> Result<SyncOu
         let Some(url) = url.as_deref() else {
             bail!(
                 "no `upstream.url` in {}.\n\
-                 Add one, or re-run `skot init --url <repository>`.",
-                layout.config_file().display()
+                 Add one, or re-run `{}`.",
+                layout.config_file().display(),
+                skot_args("init", "--url <repository>")
             );
         };
         // Before the work, not after: a first fetch is minutes of network and the log is
@@ -239,9 +241,9 @@ pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<Exit> {
     }
 
     Hints::new("next")
-        .entry("skot build", "the whole run: fetch, apply, build")
+        .entry(skot("build"), "the whole run: fetch, apply, build")
         .entry(
-            "skot check <ref>",
+            skot_args("check", "<ref>"),
             "verify the series applies, without building",
         )
         .print();
@@ -365,7 +367,10 @@ mod tests {
 
         let err = fetch(&layout, None).unwrap_err().to_string();
         assert!(err.contains("upstream.url"), "got {err}");
-        assert!(err.contains("skot init --url"), "no remedy offered: {err}");
+        assert!(
+            err.contains(&skot_args("init", "--url")),
+            "no remedy offered: {err}"
+        );
     }
 
     #[test]
@@ -395,7 +400,10 @@ mod tests {
         };
 
         assert!(err.contains("upstream.url"), "got {err}");
-        assert!(err.contains("skot init --url"), "no remedy offered: {err}");
+        assert!(
+            err.contains(&skot_args("init", "--url")),
+            "no remedy offered: {err}"
+        );
     }
 
     #[test]

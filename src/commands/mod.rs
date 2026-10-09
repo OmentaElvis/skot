@@ -2,13 +2,14 @@
 //!
 //! These orchestrate and present. They do not do git work, they do not parse
 //! patches, and they do not read paths directly — all three live elsewhere, so that
-//! `check`, `apply` and `push` cannot drift apart.
+//! `check`, `patch apply` and `patch push` cannot drift apart.
 
 mod apply;
 mod authoring;
 mod build;
 mod check;
 mod clean;
+mod drop;
 mod hooks;
 mod import;
 mod init;
@@ -18,7 +19,6 @@ mod pop;
 mod push;
 mod rebase;
 mod refresh;
-mod remove;
 mod run;
 mod status;
 mod sync;
@@ -27,7 +27,7 @@ mod testsupport;
 
 use anyhow::Result;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, PatchCommand};
 use crate::layout::Layout;
 
 /// Everything a command needs, resolved once.
@@ -110,24 +110,26 @@ pub enum Exit {
 /// Dispatch.
 pub fn run(ctx: Ctx) -> Result<Exit> {
     match &ctx.cli.command {
-        Command::List(args) => list::run(&ctx, args),
+        Command::Init(args) => init::run(&ctx, args),
+        Command::Build(args) => build::run(&ctx, args),
         Command::Status(args) => status::run(&ctx, args),
+        Command::Patch(patch) => match patch {
+            PatchCommand::New(args) => new::run(&ctx, args),
+            PatchCommand::Import(args) => import::run(&ctx, args),
+            PatchCommand::Refresh(args) => refresh::run(&ctx, args),
+            PatchCommand::Apply(args) => apply::run(&ctx, args),
+            PatchCommand::Unapply => apply::unapply(&ctx),
+            PatchCommand::Push(args) => push::run(&ctx, args),
+            PatchCommand::Pop(args) => pop::run(&ctx, args),
+            PatchCommand::List(args) => list::run(&ctx, args),
+            PatchCommand::Drop(args) => drop::run(&ctx, args),
+        },
         Command::Check(args) => check::run(&ctx, args),
+        Command::Rebase(args) => rebase::run(&ctx, args),
+        Command::Sync(args) => sync::run(&ctx, args),
         Command::Clean(args) => clean::run(&ctx, args),
         Command::Hooks => hooks::run(&ctx),
         Command::Run(args) => run::run(&ctx, args),
-        Command::Init(args) => init::run(&ctx, args),
-        Command::Sync(args) => sync::run(&ctx, args),
-        Command::Apply(args) => apply::run(&ctx, args),
-        Command::Unapply => apply::unapply(&ctx),
-        Command::Import(args) => import::run(&ctx, args),
-        Command::New(args) => new::run(&ctx, args),
-        Command::Refresh(args) => refresh::run(&ctx, args),
-        Command::Remove(args) => remove::run(&ctx, args),
-        Command::Push(args) => push::run(&ctx, args),
-        Command::Pop(args) => pop::run(&ctx, args),
-        Command::Rebase(args) => rebase::run(&ctx, args),
-        Command::Build(args) => build::run(&ctx, args),
     }
 }
 

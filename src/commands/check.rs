@@ -5,6 +5,7 @@ use crate::cli::CheckArgs;
 use crate::commands::{Ctx, Exit, authoring, emit_json};
 use crate::git;
 use crate::hints::Hints;
+use crate::invocation::{skot, skot_args};
 use crate::report;
 use crate::state::State;
 
@@ -56,9 +57,11 @@ pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
                     "nothing to check against.\n\
                      No ref was given, `upstream.default-ref` is unset, and there is no \
                      sandbox yet.\n\
-                     Pass one (`skot check main`), set `upstream.default-ref` in {}, or \
-                     run `skot build` first.",
-                    ctx.layout.config_file().display()
+                     Pass one (`{}`), set `upstream.default-ref` in {}, or \
+                     run `{}` first.",
+                    skot_args("check", "main"),
+                    ctx.layout.config_file().display(),
+                    skot("build")
                 );
             }
             let repo = git::sandbox::open(&ctx.layout)?;
@@ -105,7 +108,7 @@ pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
             )));
         }
         Hints::new("next")
-            .entry("skot build", "the whole run: fetch, apply, build")
+            .entry(skot("build"), "the whole run: fetch, apply, build")
             .print();
         return Ok(Exit::Success);
     }
@@ -138,7 +141,10 @@ pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
             }
         ));
     }
-    report::note("Rebase it against this ref, then `skot refresh` to re-export it.");
+    report::note(&format!(
+        "Rebase it against this ref, then `{}` to re-export it.",
+        skot("refresh")
+    ));
     Ok(Exit::Failure)
 }
 

@@ -242,9 +242,7 @@ impl Mirror {
                     .context(format!("preparing a fetch from {url}"))?;
                 remote
                     .fetch(refspecs, Some(&mut options), None)
-                    .context(format!(
-                    "fetching from {url}. If this says 'not found' or 'no such remote', check the URL and that you can reach it."
-                ))?;
+                    .map_err(|err| Self::fetch_failure(url, err))?;
 
                 // A freshly initialised mirror has HEAD pointing at whatever git2's template chose
                 // (`refs/heads/master`, usually), which nothing points at after a fetch of a
@@ -292,6 +290,44 @@ impl Mirror {
         Ok(repo)
     }
 
+    /// What to say when the one network call fails.
+    ///
+    /// The sentence above the error, decided from libgit2's own error class rather than
+    /// guessed at from its wording; libgit2's message stays in the chain underneath, where
+    /// it is the detail rather than the thing the user has to interpret. Each arm is a
+    /// failure mode verified against a real fetch (see the tests), and anything
+    /// unrecognised falls back to naming the URL, which is always true.
+    fn fetch_failure(url: &str, err: git2::Error) -> anyhow::Error {
+        let diagnosis = match err.code() {
+            git2::ErrorCode::Auth => format!("authentication to {url} failed"),
+            _ => match err.class() {
+                git2::ErrorClass::Http => format!("the server at {url} answered with an error"),
+                git2::ErrorClass::Repository => format!("{url} is not a git repository"),
+                git2::ErrorClass::Os if err.message().starts_with("failed to connect") => {
+                    format!("cannot reach {url}")
+                }
+                git2::ErrorClass::Os if err.message().starts_with("failed to resolve path") => {
+                    format!("no repository at {url}: that path does not exist")
+                }
+                // libgit2 reports a scheme it does not speak and a bare path that is not
+                // there identically, so the path is checked to tell them apart.
+                git2::ErrorClass::Net if err.message().contains("unsupported URL protocol") => {
+                    match url.split_once("://") {
+                        Some((scheme, _)) => {
+                            format!("{url} uses {scheme}://, which skot cannot fetch from")
+                        }
+                        None if !Path::new(url).exists() => {
+                            format!("no repository at {url}: that path does not exist")
+                        }
+                        _ => format!("cannot fetch from {url}"),
+                    }
+                }
+                _ => format!("fetching from {url}"),
+            },
+        };
+        anyhow::Error::new(err).context(diagnosis)
+    }
+
     /// The URL the mirror was cloned from, or the `remote.origin.url` from its config.
     pub fn remote_url(&self) -> Result<String> {
         let url = self
@@ -302,8 +338,9 @@ impl Mirror {
         let Some(url) = url else {
             anyhow::bail!(
                 "the mirror at {} has no fetch URL for `origin`, so skot cannot tell where to fetch from.\n\
-                 Set one by hand, or delete the mirror and re-run `skot sync`.",
-                self.path.display()
+                 Set one by hand, or delete the mirror and re-run `{}`.",
+                self.path.display(),
+                crate::invocation::skot("sync")
             );
         };
         Ok(url)
@@ -473,6 +510,14 @@ mod tests {
         Layout::new(dir.to_path_buf())
     }
 
+    /// Opening a mirror that cannot be fetched, as the error it fails with.
+    fn open_err(layout: &Layout, url: &str) -> anyhow::Error {
+        match Mirror::open_or_clone(layout, url, None) {
+            Err(err) => err,
+            Ok(_) => panic!("fetching from {url} must fail"),
+        }
+    }
+
     #[test]
     fn the_first_sync_fetches_only_the_ref_it_was_asked_for() {
         // The mirror is a cache, fetched from on demand: a base a later command needs is
@@ -629,6 +674,44 @@ mod tests {
             err.contains("not-a-real-url"),
             "the error must name the URL that failed: {err}"
         );
+    }
+
+    #[test]
+    fn a_path_that_is_not_there_says_the_path_is_missing() {
+        // libgit2 reports a bare path that does not exist as "unsupported URL
+        // protocol", which reads like a URL-syntax problem. The diagnosis checks
+        // the path and says what is actually the case.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout_in(tmp.path());
+
+        let text = open_err(&layout, "/nonexistent/skot-probe").to_string();
+
+        assert!(text.contains("/nonexistent/skot-probe"), "{text}");
+        assert!(text.contains("does not exist"), "{text}");
+    }
+
+    #[test]
+    fn a_directory_that_is_not_a_repository_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout_in(tmp.path());
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+
+        let text = open_err(&layout, plain.to_str().unwrap()).to_string();
+
+        assert!(text.contains("is not a git repository"), "{text}");
+    }
+
+    #[test]
+    fn a_refused_connection_is_reported_as_unreachable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout_in(tmp.path());
+
+        // Port 9 on localhost: nothing listens there, so the connect fails at once
+        // and without leaving the machine.
+        let text = open_err(&layout, "http://127.0.0.1:9/skot-probe.git").to_string();
+
+        assert!(text.contains("cannot reach"), "{text}");
     }
 
     #[test]
