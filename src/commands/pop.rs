@@ -3,12 +3,13 @@
 //! This is not `push` run backwards. Reverting one patch by hand is how a sandbox ends up
 //! with files that are half-reverted, and the mistake is invisible until a build produces
 //! something odd. The base is already known — the sandbox is still detached at it — so the
-//! honest implementation of "undo the top patch" is "rebuild the tree the rest of the stack
+//! honest implementation of "undo the top patch" is "rebuild the tree the rest of the set
 //! produces", which libgit2 does in one call and cannot get wrong.
 //!
-//! That is also why `pop` takes a patch *name*. Popping from the middle of a stack is a real
-//! thing to want ("0002 is wrong, drop it and keep 0003 on top of 0001"), and supporting it is
-//! the same re-derivation, just aimed at a shorter prefix. See [`authoring::resolve_stack`].
+//! That is also why `pop` takes a patch *name*, cut quilt-style: popping 0002 takes 0002
+//! and everything enabled after it, since those stand on it. Turning exactly one patch off
+//! while keeping the set above it whole is a different question, and the interactive
+//! `skot apply` picker asks it. See [`authoring::resolve_stack`].
 
 use anyhow::{Context, Result};
 use log::{debug, info};
@@ -79,7 +80,7 @@ pub fn run(ctx: &Ctx, arg: &PatchArg) -> Result<Exit> {
     Ok(verdict)
 }
 
-/// Rebuild the sandbox as the prefix below the removed patch and check that out.
+/// Rebuild the sandbox as the set that stays and check that out.
 ///
 /// With nothing applied and nothing named there is no stack to rebuild: the ref, the
 /// sha and the tree the sandbox already holds are still resolved and reported, but
@@ -110,7 +111,7 @@ pub(super) fn pop(layout: &Layout, want: Option<&str>) -> Result<Popped> {
     let (_mirror, sha) = super::sync::resolve_in_mirror(layout, &ref_name)?;
 
     let Some(removed) = removed else {
-        // No stack to rebuild, so nothing is checked out: rebuilding an empty prefix
+        // No set to rebuild, so nothing is checked out: rebuilding an empty set
         // would reset the sandbox to the ref and take any local work with it. The
         // report is still the ordinary one, `removed` null among the rest.
         let tree =
@@ -191,6 +192,55 @@ mod tests {
             &series,
             &state_of(&["0001-a.patch", "0002-b.patch"]),
             None,
+        )
+        .unwrap();
+        assert_eq!(names, vec!["0001-a.patch"]);
+    }
+
+    #[test]
+    fn pop_with_no_name_takes_the_topmost_and_keeps_the_hole() {
+        let (_tmp, layout) = testsupport::project();
+        testsupport::write_series(
+            &layout,
+            &[
+                ("0001-a.patch", ""),
+                ("0002-b.patch", ""),
+                ("0003-c.patch", ""),
+            ],
+        );
+        let series = layout.project().unwrap().1;
+
+        let names = stack_names(
+            &layout,
+            &series,
+            &state_of(&["0001-a.patch", "0003-c.patch"]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(names, vec!["0001-a.patch"]);
+    }
+
+    #[test]
+    fn popping_a_named_patch_also_takes_what_was_enabled_after_it() {
+        // Quilt direction: 0002 and 0003 were enabled together after 0001, so turning
+        // 0002 off takes 0003 with it rather than leaving it standing on a patch that
+        // is no longer there.
+        let (_tmp, layout) = testsupport::project();
+        testsupport::write_series(
+            &layout,
+            &[
+                ("0001-a.patch", ""),
+                ("0002-b.patch", ""),
+                ("0003-c.patch", ""),
+            ],
+        );
+        let series = layout.project().unwrap().1;
+
+        let names = stack_names(
+            &layout,
+            &series,
+            &state_of(&["0001-a.patch", "0002-b.patch", "0003-c.patch"]),
+            Some("0002-b.patch"),
         )
         .unwrap();
         assert_eq!(names, vec!["0001-a.patch"]);

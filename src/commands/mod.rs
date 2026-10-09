@@ -18,6 +18,7 @@ mod pop;
 mod push;
 mod rebase;
 mod refresh;
+mod remove;
 mod run;
 mod status;
 mod sync;
@@ -122,6 +123,7 @@ pub fn run(ctx: Ctx) -> Result<Exit> {
         Command::Import(args) => import::run(&ctx, args),
         Command::New(args) => new::run(&ctx, args),
         Command::Refresh(args) => refresh::run(&ctx, args),
+        Command::Remove(args) => remove::run(&ctx, args),
         Command::Push(args) => push::run(&ctx, args),
         Command::Pop(args) => pop::run(&ctx, args),
         Command::Rebase(args) => rebase::run(&ctx, args),

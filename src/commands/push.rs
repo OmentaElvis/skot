@@ -1,13 +1,14 @@
 //! `push`: apply the next patch in the series, or a named one.
 //!
-//! A stack is built one patch at a time. The rule that shapes the whole command is that a
-//! stack is always a *prefix of the series*: patch 3 is only correct on top of 1 and 2, so
-//! `push` cannot apply the one file it was given. It replays the prefix that ends at that
-//! patch and checks that out, which is why pushing 0003 onto an empty sandbox works and lands
-//! on a tree the series genuinely produces.
+//! The applied set is an ordered *subset* of the series (any patch can be on or off), and
+//! `push` moves up it quilt-style: with a name it enables that patch and everything below
+//! it (patch 3 cannot stand alone), without one it takes the single patch above the
+//! current top, so a deliberate hole below is never silently filled. The set is replayed
+//! against the sandbox's ref and checked out, so what the sandbox holds is always a tree
+//! the series genuinely produces.
 //!
-//! [`pop`](super::pop) is the same operation pointed the other way, so the reasoning — which
-//! patch the stack ends at, and every case where the answer would be a guess — lives in
+//! [`pop`](super::pop) is the same operation pointed the other way, so the reasoning (which
+//! patch the set moves to, and every case where the answer would be a guess) lives in
 //! [`authoring::resolve_stack`] rather than here.
 
 use anyhow::{Context, Result};
@@ -95,7 +96,7 @@ pub fn run(ctx: &Ctx, arg: &PatchArg) -> Result<Exit> {
     Ok(verdict)
 }
 
-/// Replay the prefix up to the next (or named) patch and check it out.
+/// Replay the set up to the next (or named) patch and check it out.
 ///
 /// With the whole series already applied and nothing named there is no next patch: the
 /// ref, the sha and the tree the sandbox already holds are still resolved and reported,
@@ -117,8 +118,9 @@ fn push(layout: &Layout, want: Option<&str>) -> Result<Pushed> {
     let (_mirror, sha) = super::sync::resolve_in_mirror(layout, &ref_name)?;
 
     // The whole series already applied, and no patch named: the answer is negative, not
-    // broken. The recorded stack still has to be the series' own prefix — one that has
-    // drifted out of step falls through to `resolve_stack`, which says so and refuses.
+    // broken. Anything short of that (including a set with holes) falls through to
+    // `resolve_stack`, which validates membership and refuses a recorded name the series
+    // no longer lists.
     let all = series.entries_lenient(layout);
     let whole_series = want.is_none()
         && state.applied.len() == all.len()
@@ -145,7 +147,11 @@ fn push(layout: &Layout, want: Option<&str>) -> Result<Pushed> {
     drop(lock);
 
     Ok(Pushed {
-        added: stack.names.last().cloned(),
+        // The named patch is the one pushed, even when healing holes below it leaves
+        // other patches above in place; with no name the added patch is the new top.
+        added: want
+            .map(str::to_owned)
+            .or_else(|| stack.names.last().cloned()),
         ref_name,
         sha,
         names: stack.names,
@@ -195,6 +201,33 @@ mod tests {
     }
 
     #[test]
+    fn push_with_no_name_leaves_a_hole_below_it_alone() {
+        // A hole below the top is a decision, not a fault: no-name push climbs one step
+        // from the top and never heals what is underneath it.
+        let (_tmp, layout) = testsupport::project();
+        testsupport::write_series(
+            &layout,
+            &[
+                ("0001-a.patch", ""),
+                ("0002-b.patch", ""),
+                ("0003-c.patch", ""),
+                ("0004-d.patch", ""),
+            ],
+        );
+        let series = layout.project().unwrap().1;
+
+        let stack = authoring::resolve_stack(
+            &layout,
+            &series,
+            &state_of(&["0003-c.patch"]),
+            None,
+            Move::Deeper,
+        )
+        .unwrap();
+        assert_eq!(stack.names, vec!["0003-c.patch", "0004-d.patch"]);
+    }
+
+    #[test]
     fn push_from_empty_applies_only_the_one_named() {
         let (_tmp, layout) = testsupport::project();
         testsupport::write_series(&layout, &[("0001-a.patch", "")]);
@@ -208,7 +241,8 @@ mod tests {
 
     #[test]
     fn push_of_a_named_patch_replays_everything_below_it() {
-        // The reason `push` replays a prefix rather than one file: 0003 is meaningless alone.
+        // The reason `push` replays everything below it rather than one file: 0003 is
+        // meaningless alone.
         let (_tmp, layout) = testsupport::project();
         testsupport::write_series(
             &layout,
@@ -299,9 +333,36 @@ mod tests {
     }
 
     #[test]
-    fn a_stack_that_is_not_a_series_prefix_is_refused() {
-        // Any prefix we picked from a stack that does not match the series is a guess, and a
-        // guessed stack passes `check` while building the wrong tree.
+    fn push_named_fills_a_hole_below_without_silencing_one_above() {
+        // A set with holes is legitimate, so the refusal tests are about names, not shape.
+        // Pushing 0001 with 0003 on heals the hole under it (0003 already sits above
+        // everything) and leaves the hole at 0002 exactly where it was.
+        let (_tmp, layout) = testsupport::project();
+        testsupport::write_series(
+            &layout,
+            &[
+                ("0001-a.patch", ""),
+                ("0002-b.patch", ""),
+                ("0003-c.patch", ""),
+            ],
+        );
+        let series = layout.project().unwrap().1;
+
+        let stack = authoring::resolve_stack(
+            &layout,
+            &series,
+            &state_of(&["0003-c.patch"]),
+            Some("0001-a.patch"),
+            Move::Deeper,
+        )
+        .unwrap();
+        assert_eq!(stack.names, vec!["0001-a.patch", "0003-c.patch"]);
+    }
+
+    #[test]
+    fn a_recorded_name_the_series_no_longer_lists_is_refused() {
+        // Membership is the only shape rule: a name the series does not know means every
+        // command would be guessing, so it is refused with the command that repairs it.
         let (_tmp, layout) = testsupport::project();
         testsupport::write_series(&layout, &[("0001-a.patch", ""), ("0002-b.patch", "")]);
         let series = layout.project().unwrap().1;
@@ -309,15 +370,19 @@ mod tests {
         let err = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&["0002-b.patch"]),
+            &state_of(&["0001-a.patch", "0009-gone.patch"]),
             None,
             Move::Deeper,
         )
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("0002-b.patch"),
-            "the mismatch should name it: {err}"
+            err.contains("0009-gone.patch"),
+            "the stale name should be named: {err}"
+        );
+        assert!(
+            err.contains("does not list"),
+            "the drift should be stated: {err}"
         );
         assert!(
             err.contains("unapply"),
@@ -326,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn a_longer_recorded_stack_than_the_series_is_refused() {
+    fn a_recorded_set_longer_than_the_series_is_refused() {
         let (_tmp, layout) = testsupport::project();
         testsupport::write_series(&layout, &[("0001-a.patch", "")]);
         let series = layout.project().unwrap().1;
@@ -340,7 +405,8 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("lists only 1"), "got {err}");
+        assert!(err.contains("0002-gone.patch"), "got {err}");
+        assert!(err.contains("does not list"), "got {err}");
     }
 
     #[test]

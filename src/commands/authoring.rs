@@ -35,31 +35,33 @@ pub fn wanted_ref(
         ))
 }
 
-/// The tree that the patch at `index` sits on top of: the series prefix *before* it.
+/// The tree that the patch at `index` sits on top of: the applied patches *before* it.
 ///
 /// This is the base a patch has to be expressed against, and it is deliberately not the
-/// tree after the whole stack:
+/// tree after the whole set:
 ///
 /// ```text
-/// tree(ref + p0..=pn)      <- what `apply` puts in the sandbox, after the last patch
+/// tree(ref + applied set)  <- what `apply` puts in the sandbox, after the last patch
 /// sandbox                  = that, plus your edits
 /// ```
 ///
 /// Diffing the sandbox against *that* yields *only your edits*, so replacing the patch with
 /// the result silently throws away everything the patch originally did — the patch looks
-/// plausible and the series no longer applies. The patch's own base is the prefix below it:
+/// plausible and the series no longer applies. The patch's own base is what sits below it:
 ///
 /// ```text
-/// tree(ref + p0..p(n-1))                  <- what p(n-1) leaves behind
+/// tree(ref + applied below p(n))         <- what the applied patch below leaves behind
 /// sandbox - that = p(n)'s own change, plus your edits
 /// ```
 ///
 /// For a patch `new` has just created and `push` has applied, the two trees are equal, because
 /// an empty patch produces no change — so the same expression correctly yields just your edits.
 ///
-/// It is recomputed by replaying the prefix rather than read from recorded state, which is
+/// It is recomputed by replaying rather than read from recorded state, which is
 /// the point: a recorded tree is a claim about a sandbox that has since been edited, and a
-/// stale claim would silently produce a patch that drops earlier work.
+/// stale claim would silently produce a patch that drops earlier work. With holes allowed,
+/// only the patches the sandbox actually holds below `index` take part in the replay: the
+/// others were never in the tree the sandbox grew from.
 pub fn base_tree_for_patch<'r>(
     layout: &Layout,
     state: &State,
@@ -71,15 +73,19 @@ pub fn base_tree_for_patch<'r>(
     let ref_name = stack_ref(layout, state, config)?;
     let (_mirror, sha) = super::sync::resolve_in_mirror(layout, &ref_name)?;
 
-    let prefix = &entries[..index];
-    if prefix.is_empty() {
+    let below: Vec<Entry> = entries[..index]
+        .iter()
+        .filter(|e| state.applied.contains(&e.name))
+        .cloned()
+        .collect();
+    if below.is_empty() {
         let oid = git2::Oid::from_str(&sha)
             .context(format!("the resolved ref {ref_name} is not a commit id"))?;
         let commit = repo.find_commit(oid)?;
         return Ok(commit.tree()?);
     }
 
-    let applied = replay(repo, &sha, prefix)?;
+    let applied = replay(repo, &sha, &below)?;
     if !applied.report.ok {
         bail!(
             "cannot work out what `{}` sits on, because the patches below it do not apply \
@@ -181,7 +187,7 @@ pub enum Move {
     Shallower,
 }
 
-/// The stack a command should leave in the sandbox: a prefix of the series, in order.
+/// The set a command should leave applied in the sandbox: an ordered subset of the series.
 #[derive(Debug)]
 pub struct Stack {
     /// The entries to replay, which is also what the sandbox will hold.
@@ -190,41 +196,25 @@ pub struct Stack {
     pub names: Vec<String>,
 }
 
-/// Work out the stack that `push` or `pop` should produce.
-///
-/// The rule behind both commands is the same one: **a stack is always a prefix of the series.**
-/// So `push` cannot apply one file in isolation — patch 3 is only correct on top of 1 and 2 —
-/// and `pop` cannot revert one file in isolation either, since removing a patch from the middle
-/// of a stack means re-deriving everything below it. Both therefore end by replaying a prefix
-/// and checking that out, and the difference between them is only which prefix.
-///
-/// Every refusal here is a case where the answer would otherwise be a guess. A guessed stack is
-/// a corrupt one: it looks like a valid prefix, passes `check`, and builds the wrong thing.
-/// The recorded stack has to be a prefix of the series before any of this means anything.
-fn validate_prefix(
-    all: &[Entry],
-    applied: &[String],
-    series: &crate::series::Series,
-) -> Result<()> {
-    if applied.len() > all.len() {
-        bail!(
-            "the sandbox holds {} patch(es), but the series at {} lists only {}.\n\
-             `skot unapply` then `skot apply` puts the two back in step.",
-            applied.len(),
-            series.path().display(),
-            all.len()
-        );
-    }
-    for (recorded, entry) in applied.iter().zip(all.iter()) {
-        if recorded != &entry.name {
+/// The recorded set must at least be a set of names the series still knows: a name that
+/// has been deleted from the series (or a corrupt double-entry) makes every command
+/// guess, so it is refused here with the command that repairs it.
+fn validate_set(all: &[Entry], applied: &[String], series: &crate::series::Series) -> Result<()> {
+    for (i, recorded) in applied.iter().enumerate() {
+        if applied[..i].contains(recorded) {
             bail!(
-                "the sandbox holds `{}` where the series has `{}`.\n\
-                 The recorded stack is not a prefix of the series at {}, so no `push`, \
-                 `pop` or `build` can tell which tree you meant.\n\
+                "the sandbox records `{recorded}` twice.\n\
+                 The recorded set at .skot/state.json is corrupt.\n\
+                 `skot unapply` then `skot apply` rebuilds it.",
+            );
+        }
+        if !all.iter().any(|e| &e.name == recorded) {
+            bail!(
+                "the sandbox holds `{recorded}`, which the series at {} does not list.\n\
+                 The recorded set and the series have drifted apart, so no `push`, \
+                 `pop` or `build` can tell which patches you meant.\n\
                  `skot status` reports the same; `skot unapply` then `skot apply` \
-                 rebuilds the stack.",
-                recorded,
-                entry.name,
+                 rebuilds the set",
                 series.path().display()
             );
         }
@@ -232,23 +222,43 @@ fn validate_prefix(
     Ok(())
 }
 
-/// The stack exactly as recorded: no push, no pop, the prefix the sandbox already holds.
+/// The set exactly as recorded: no push, no pop, what the sandbox already holds.
 ///
 /// `build` replays this rather than the whole series, so a patch popped out for testing
-/// stays out through a build. Same prefix validation as [`resolve_stack`], because a
-/// recorded stack that is not a prefix of the series means nothing to any command.
+/// stays out through a build. Same membership validation as [`resolve_stack`], because a
+/// recorded name the series no longer lists means nothing to any command.
 pub fn recorded_stack(
     layout: &Layout,
     series: &crate::series::Series,
     state: &State,
 ) -> Result<Stack> {
     let all = series.entries_lenient(layout);
-    validate_prefix(&all, &state.applied, series)?;
-    let entries = all[..state.applied.len()].to_vec();
+    validate_set(&all, &state.applied, series)?;
+    let entries: Vec<Entry> = all
+        .into_iter()
+        .filter(|e| state.applied.contains(&e.name))
+        .collect();
     let names = entries.iter().map(|e| e.name.clone()).collect();
     Ok(Stack { entries, names })
 }
 
+/// Work out the set that `push` or `pop` should leave applied.
+///
+/// The rule behind both commands: **the applied set is an ordered subset of the series.**
+/// Any patch may be on or off (disabling 0002 while keeping 0003 on 0001 is legitimate),
+/// and the set always replays in series order. What the commands refuse to do is *guess*
+/// which patch the user meant to touch; both stay directional, quilt-style:
+///
+/// - `push <name>`: enable `name` and every patch below it (heal the set up to it),
+///   keeping whatever is applied above.
+/// - `pop <name>`: disable `name` and every patch above it (cut the set from it up).
+/// - `push` (no name): enable the first patch above the current top, leaving
+///   deliberate holes below untouched.
+/// - `pop` (no name): disable the topmost applied patch.
+///
+/// The outcome is replayed in series order and checked out, so a hole in the middle only
+/// ever fails when the patches genuinely do not apply without it. That is the lesson
+/// the failure teaches, not a reason to refuse the set.
 pub fn resolve_stack(
     layout: &Layout,
     series: &crate::series::Series,
@@ -257,12 +267,15 @@ pub fn resolve_stack(
     move_: Move,
 ) -> Result<Stack> {
     let all = series.entries_lenient(layout);
-    validate_prefix(&all, &state.applied, series)?;
+    validate_set(&all, &state.applied, series)?;
 
     let applied = &state.applied;
-    let growing = move_ == Move::Deeper;
+    let mut on: Vec<bool> = all.iter().map(|e| applied.contains(&e.name)).collect();
+    // Everything above the top is off by construction, so `push` with no name moves to
+    // exactly one patch: the next series entry after the topmost applied one.
+    let top = on.iter().rposition(|&b| b);
 
-    let end = match want {
+    match want {
         Some(name) => {
             let Some(position) = all.iter().position(|e| e.name == name) else {
                 let known: Vec<&str> = all.iter().map(|e| e.name.as_str()).collect();
@@ -275,43 +288,66 @@ pub fn resolve_stack(
                     }
                 );
             };
-            let is_on_the_stack = applied.len() > position;
 
-            match (growing, is_on_the_stack) {
-                (true, true) => bail!(
-                    "`{name}` is already applied — the stack stops there.\n\
-                     `skot pop` takes the patch on top back off.",
-                    name = all[position].name
-                ),
-                (false, false) => bail!(
-                    "`{}` is not applied, so there is nothing to pop.",
-                    all[position].name
-                ),
-                (true, false) => position + 1,
-                // Popping patch `position` leaves everything above it gone, so the stack ends
-                // where that patch began.
-                (false, true) => position,
+            match move_ {
+                Move::Deeper => {
+                    if on[position] {
+                        bail!(
+                            "`{}` is already applied.\n\
+                             `skot pop {}` takes it back off.",
+                            all[position].name,
+                            all[position].name
+                        );
+                    }
+                    // Enable it and everything below: 0003 cannot stand alone, so pushing a
+                    // named patch fills the holes under it (but never the ones above).
+                    for slot in on.iter_mut().take(position + 1) {
+                        *slot = true;
+                    }
+                }
+                Move::Shallower => {
+                    if !on[position] {
+                        bail!(
+                            "`{}` is not applied, so there is nothing to pop.",
+                            all[position].name
+                        );
+                    }
+                    // Cut from it up: the patches above were enabled after it and stand on it.
+                    for slot in on.iter_mut().skip(position) {
+                        *slot = false;
+                    }
+                }
             }
         }
-        None => {
-            if growing {
-                if applied.len() == all.len() {
+        None => match move_ {
+            Move::Deeper => {
+                let next = top.map_or(0, |t| t + 1);
+                if next >= all.len() {
                     bail!(
-                        "the whole series is applied, so there is no next patch.\n\
-                         `skot new <name>` starts another."
+                        "the applied set already reaches the end of the series, so there \
+                         is no next patch.\n\
+                         `skot apply` chooses which patches are on; `skot new <name>` \
+                         starts another."
                     );
                 }
-                applied.len() + 1
-            } else {
-                if applied.is_empty() {
-                    bail!("nothing is applied to the sandbox, so there is nothing to pop.");
-                }
-                applied.len() - 1
+                on[next] = true;
             }
-        }
-    };
+            Move::Shallower => {
+                let Some(t) = top else {
+                    bail!("nothing is applied to the sandbox, so there is nothing to pop.");
+                };
+                // No name means the topmost applied patch; holes below it stay.
+                on[t] = false;
+            }
+        },
+    }
 
-    let entries = all[..end].to_vec();
+    let entries: Vec<Entry> = all
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| on[*i])
+        .map(|(_, e)| e)
+        .collect();
     let names = entries.iter().map(|e| e.name.clone()).collect();
     Ok(Stack { entries, names })
 }
@@ -350,6 +386,29 @@ pub fn land(layout: &Layout, ref_name: &str, base: &Sha, stack: &Stack) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_stack_is_the_recorded_set_not_a_prefix() {
+        // With holes legal, the set is what was recorded, in series order: not the
+        // first n entries of the series.
+        let (_tmp, layout) = crate::commands::testsupport::project();
+        crate::commands::testsupport::write_series(
+            &layout,
+            &[
+                ("0001-a.patch", ""),
+                ("0002-b.patch", ""),
+                ("0003-c.patch", ""),
+            ],
+        );
+        let series = layout.project().unwrap().1;
+        let state = State {
+            applied: vec!["0001-a.patch".to_owned(), "0003-c.patch".to_owned()],
+            ..State::default()
+        };
+
+        let stack = recorded_stack(&layout, &series, &state).unwrap();
+        assert_eq!(stack.names, ["0001-a.patch", "0003-c.patch"]);
+    }
 
     #[test]
     fn a_subject_is_derived_from_a_patch_filename() {

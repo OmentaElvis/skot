@@ -7,7 +7,7 @@
 //! nothing about any of that; it is why a `skot.toml` for a Rust crate and one for a
 //! Node monorepo differ only in the hook commands.
 //!
-//! The apply phase replays the pushed stack: what `push` and `pop` recorded, so a patch
+//! The apply phase replays the applied set: what `push` and `pop` recorded, so a patch
 //! popped out for testing stays out through the build. A sandbox that has never held the
 //! series gets the whole series instead, so `import` followed by `build` applies
 //! everything on a first run.
@@ -211,7 +211,7 @@ fn sync_phase(layout: &Layout, config: &Config, ref_name: &str, json: bool) -> R
 ///
 /// What lands in the sandbox depends on where it already is: a fresh one (never landed)
 /// gets the whole series, so `import` followed by `build` just works, and one holding a
-/// pushed stack gets that stack back, so a patch popped out for testing stays out.
+/// pushed set gets that set back, so a patch popped out for testing stays out.
 fn apply_phase(
     layout: &Layout,
     config: &Config,
@@ -244,7 +244,7 @@ fn apply_phase(
     } else if pushed == 0 {
         info!(
             target: "build",
-            "apply: nothing pushed; the sandbox holds {against} alone"
+            "apply: nothing enabled; the sandbox holds {against} alone"
         );
     } else if pushed == total {
         info!(
@@ -255,7 +255,7 @@ fn apply_phase(
     } else {
         info!(
             target: "build",
-            "apply: applying the pushed stack, {pushed} of the {} against {against}",
+            "apply: applying {pushed} of the {} against {against}",
             apply::count(total, "patch", "patches")
         );
     }
@@ -302,7 +302,7 @@ fn apply_phase(
             };
             if let Err(e) = authoring::land(layout, ref_name, &base, &stack) {
                 bail!(
-                    "the pushed stack does not apply to {ref_name} ({sha}); \
+                    "the recorded set does not apply to {ref_name} ({sha}); \
                      the run stopped.\n{e}"
                 );
             }
@@ -617,6 +617,50 @@ mod tests {
             std::fs::read_to_string(layout.sandbox_dir().join("f.txt")).unwrap(),
             "base\n",
             "the bare upstream tree"
+        );
+    }
+
+    #[test]
+    fn build_lands_a_recorded_set_that_has_a_hole_in_it() {
+        // push/pop can leave a hole, and build must land exactly that set: the disabled
+        // patch's work stays out, the ones around it stay on.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, sha) = crate::commands::testsupport::project_with_sandbox(tmp.path());
+        crate::commands::testsupport::write_series(
+            &layout,
+            &[
+                ("0001-a.patch", crate::commands::testsupport::patch_one()),
+                ("0002-b.patch", crate::commands::testsupport::patch_two()),
+                ("0003-c.patch", crate::commands::testsupport::patch_three()),
+            ],
+        );
+        std::fs::write(
+            layout.config_file(),
+            "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
+        )
+        .unwrap();
+        let mut state = State::load(&layout).unwrap();
+        state.set_ref(&layout, "main", &sha).unwrap();
+        state
+            .set_applied(
+                &layout,
+                ["0001-a.patch", "0003-c.patch"].map(String::from).to_vec(),
+            )
+            .unwrap();
+        let (config, _) = layout.project().unwrap();
+
+        drive(&layout, &config, "main", &[Phase::Apply], false).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(layout.sandbox_dir().join("f.txt")).unwrap(),
+            "third\n",
+            "the tree must be the recorded set's, not the series' prefix"
+        );
+        let state = State::load(&layout).unwrap();
+        assert_eq!(
+            state.applied,
+            ["0001-a.patch", "0003-c.patch"],
+            "the hole must survive the build"
         );
     }
 

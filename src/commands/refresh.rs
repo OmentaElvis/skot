@@ -10,7 +10,7 @@
 //! - **The base is the tree *below* the patch, not the tree the patch produced.** `apply`
 //!   records the tree the whole stack produced, and that is the wrong thing to diff against:
 //!   the sandbox is that tree plus your edits, so the diff comes out as *only your edits* and
-//!   replaces the patch with a fragment of itself. The patch's own base is the series prefix
+//!   replaces the patch with a fragment of itself. The patch's own base is the applied set
 //!   beneath it, and the sandbox minus that is the patch's whole change plus your edits.
 //! - **Only the patch on top of the applied stack can be refreshed.** One with another above it
 //!   has its change interleaved with the ones above, and no single diff can separate them.
@@ -173,16 +173,16 @@ fn refresh(
     let mut series = series;
     let registered = if no_register {
         false
+    } else if series.names().contains(&target.name.as_str()) {
+        // Already in the series is the normal case for a second refresh, not a failure.
+        false
     } else {
-        match series.insert(&target.name, insert_at.unwrap_or(series.len())) {
-            Ok(_) => {
-                series.save(layout)?;
-                true
-            }
-            // Already in the series is the normal case for a second refresh, not a failure.
-            Err(series::SeriesError::Duplicate { .. }) => false,
-            Err(e) => return Err(anyhow::Error::from(e)),
-        }
+        let index = insert_at.unwrap_or(series.len());
+        let (_line, renames) = series.insert_renumbering(layout, &target.name, index)?;
+        series.save(layout)?;
+        let mut state = crate::state::State::load(layout)?;
+        state.follow_renames(layout, &renames)?;
+        true
     };
 
     drop(lock);
@@ -633,6 +633,33 @@ mod tests {
             std::fs::read_to_string(layout.patches_dir().join("0002-b.patch")).unwrap(),
             before,
             "nothing should change on disk"
+        );
+    }
+
+    #[test]
+    fn refreshing_the_top_of_a_holey_set_diffs_against_only_what_is_below_it() {
+        // 0002 is disabled, so 0003's base is 0001's output alone. A base computed from
+        // the series prefix instead would claim the tree holds `second`, and the diff of
+        // the untouched sandbox against that phantom context rewrites a patch that was
+        // never wrong.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::landed_set(
+            tmp.path(),
+            &[
+                ("0001-a.patch", testsupport::patch_one()),
+                ("0002-b.patch", testsupport::patch_two()),
+                ("0003-c.patch", testsupport::patch_three()),
+            ],
+            &["0001-a.patch", "0003-c.patch"],
+        );
+        let before = std::fs::read_to_string(layout.patches_dir().join("0003-c.patch")).unwrap();
+
+        refresh(&layout, Some("0003-c.patch"), None, false).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(layout.patches_dir().join("0003-c.patch")).unwrap(),
+            before,
+            "the disabled patch below must not leak into this one's base"
         );
     }
 

@@ -83,6 +83,24 @@ impl State {
         self.save(layout)
     }
 
+    /// Follow patches through a renumbering: the applied set keeps pointing at the same
+    /// files after [`crate::series::Series::insert_renumbering`] renames them.
+    pub fn follow_renames(&mut self, layout: &Layout, renames: &[(String, String)]) -> Result<()> {
+        let mut moved = false;
+        for (old, new) in renames {
+            for name in &mut self.applied {
+                if name == old {
+                    *name = new.clone();
+                    moved = true;
+                }
+            }
+        }
+        if moved {
+            self.save(layout)?;
+        }
+        Ok(())
+    }
+
     /// A one-line description of an interrupted run, if there was one.
     pub fn interrupted(&self) -> Option<String> {
         let phase = self.in_flight?;

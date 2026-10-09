@@ -29,6 +29,7 @@ pub fn run(ctx: &Ctx, _args: &StatusArgs) -> Result<Exit> {
             }),
             "ref": state.ref_name,
             "sha": state.sha,
+            "applied": state.applied,
             "in_flight": state.in_flight.map(|p| p.name().to_owned()),
         }))?;
         return Ok(Exit::Success);
@@ -43,9 +44,9 @@ pub fn run(ctx: &Ctx, _args: &StatusArgs) -> Result<Exit> {
 
     layout::print_inventory(layout);
     print_layout(layout);
-    print_series(layout, series.as_ref());
+    print_series(layout, series.as_ref(), &state.applied);
     print_mirror(layout);
-    print_sandbox(layout);
+    print_sandbox(layout, series.as_ref(), &state);
     print_config(config.as_ref(), layout);
 
     Ok(Exit::Success)
@@ -68,7 +69,7 @@ fn print_layout(layout: &Layout) {
     report::field("state", &layout.state_dir().display().to_string());
 }
 
-fn print_series(layout: &Layout, series: Option<&crate::series::Series>) {
+fn print_series(layout: &Layout, series: Option<&crate::series::Series>, applied: &[String]) {
     let Some(series) = series else {
         report::section("series");
         report::note(&format!(
@@ -80,14 +81,17 @@ fn print_series(layout: &Layout, series: Option<&crate::series::Series>) {
     let entries = series.entries_lenient(layout);
     report::section(&format!("series ({})", entries.len()));
     for (i, entry) in entries.iter().enumerate() {
-        // A patch listed but not on disk is the one thing here that needs acting on, so it
-        // is called out in colour rather than left as a stray `!` to be spotted.
-        let row = format!("{:>3}  {}", i + 1, entry.name);
-        if entry.path.is_file() {
-            report::item(&row);
+        // `!` (not on disk) outranks `[x]`: a patch cannot be on if its file is gone. The
+        // `[x]`/`[ ]` pair is what makes a hole visible: the count in the sandbox section
+        // says how many are on, this says which.
+        let mark = if !entry.path.is_file() {
+            report::bad("[!]").to_string()
+        } else if applied.contains(&entry.name) {
+            "[x]".to_string()
         } else {
-            report::item(&report::bad(&format!("!{row}")).to_string());
-        }
+            "[ ]".to_string()
+        };
+        report::item(&format!("{:>3}  {mark} {}", i + 1, entry.name));
     }
 }
 
@@ -126,7 +130,7 @@ fn print_mirror(layout: &Layout) {
     }
 }
 
-fn print_sandbox(layout: &Layout) {
+fn print_sandbox(layout: &Layout, series: Option<&crate::series::Series>, state: &State) {
     report::section("sandbox");
     let path = layout.sandbox_dir();
     if !path.exists() {
@@ -159,14 +163,31 @@ fn print_sandbox(layout: &Layout) {
         )),
     }
 
-    let applied = State::load(layout).map(|s| s.applied.len()).unwrap_or(0);
+    let count = state.applied.len();
+    let total = series.map_or(0, |s| s.len());
     report::field(
         "applied",
-        &match applied {
+        &match count {
             0 => report::absent("none"),
+            n if total > 0 => report::ok(&format!("{n} of {total} patches")),
             n => report::ok(&format!("{n} patch(es)")),
         },
     );
+    // A hole is a deliberate state, but it is invisible from the count alone, so the
+    // patches that are off are named right here rather than only in the series listing.
+    if count > 0
+        && let Some(series) = series
+    {
+        let entries = series.entries_lenient(layout);
+        let disabled: Vec<&str> = entries
+            .iter()
+            .filter(|e| !state.applied.contains(&e.name))
+            .map(|e| e.name.as_str())
+            .collect();
+        if !disabled.is_empty() {
+            report::note(&format!("disabled: {}", disabled.join(", ")));
+        }
+    }
 }
 
 fn print_config(config: Option<&crate::config::Config>, layout: &Layout) {

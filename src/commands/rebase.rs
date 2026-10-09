@@ -34,6 +34,7 @@ use crate::git::diff;
 use crate::hints::Hints;
 use crate::layout::Layout;
 use crate::series::{self, Series};
+use crate::state::State;
 
 /// What `rebase` did, presented by [`run`].
 #[derive(Debug)]
@@ -199,10 +200,18 @@ fn rebase(layout: &Layout, ref_name: Option<&str>) -> Result<Rebased> {
     }
     new_series.save(layout)?;
 
-    // The stack that now exists is the same series on the new base, so the sandbox follows it.
+    // The applied set follows the series onto the new base. Rewriting every patch file does
+    // not enable the ones the sandbox had disabled: they stay off, and only what was on is
+    // replayed and recorded.
+    let state = State::load(layout)?;
+    let enabled: Vec<series::Entry> = entries
+        .iter()
+        .filter(|e| state.applied.contains(&e.name))
+        .cloned()
+        .collect();
     let stack = Stack {
-        names: entries.iter().map(|e| e.name.clone()).collect(),
-        entries,
+        names: enabled.iter().map(|e| e.name.clone()).collect(),
+        entries: enabled,
     };
     let tree = authoring::land(layout, &new_base, &sha, &stack)?;
     drop(lock);
@@ -304,6 +313,40 @@ mod tests {
              -{from}\n\
              +{to}\n"
         )
+    }
+
+    #[test]
+    fn rebase_leaves_a_disabled_patch_disabled() {
+        // Every patch file is rewritten against the new base, but the applied set is what
+        // the sandbox holds: a patch the sandbox never had stays off, whatever rebase
+        // just wrote for it.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::landed_set(
+            tmp.path(),
+            &[
+                ("0001-a.patch", testsupport::patch_one()),
+                ("0002-b.patch", testsupport::patch_adds_g()),
+                ("0003-c.patch", testsupport::patch_three()),
+            ],
+            &["0001-a.patch", "0003-c.patch"],
+        );
+
+        rebase(&layout, None).unwrap();
+
+        let state = crate::state::State::load(&layout).unwrap();
+        assert_eq!(
+            state.applied,
+            ["0001-a.patch", "0003-c.patch"],
+            "the hole must survive the rewrite"
+        );
+        assert!(
+            !layout.sandbox_dir().join("g.txt").exists(),
+            "the disabled patch must stay out of the sandbox"
+        );
+        assert_eq!(
+            std::fs::read_to_string(layout.sandbox_dir().join("f.txt")).unwrap(),
+            "third\n"
+        );
     }
 
     #[test]

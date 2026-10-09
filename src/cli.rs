@@ -100,6 +100,9 @@ pub enum Command {
     /// Re-export your edits as a patch file and register it.
     Refresh(RefreshArgs),
 
+    /// Take a patch out of the series: its line and its file.
+    Remove(RemoveArgs),
+
     /// Replay the series onto a different ref.
     Rebase(RefArg),
 
@@ -122,6 +125,11 @@ pub struct CheckArgs {
     /// Ref to check against. Defaults to the ref the sandbox is on, then
     /// `upstream.default-ref`.
     pub ref_name: Option<String>,
+
+    /// Check the applied set instead of the whole series: exactly what `build` would
+    /// land. Same ref rules either way.
+    #[arg(long)]
+    pub applied: bool,
 
     /// Report every patch, not just the ones that failed.
     #[arg(long, short = 'q', conflicts_with = "first_only")]
@@ -272,6 +280,11 @@ pub struct ImportArgs {
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
 
+    /// Insert at this position: a 1-based index or an existing patch name. Patches after
+    /// it are renumbered so the numbers stay contiguous. Defaults to appending.
+    #[arg(long, value_name = "PATCH|N", conflicts_with = "no_register")]
+    pub at: Option<String>,
+
     /// Write the patch file without adding it to the series.
     #[arg(long)]
     pub no_register: bool,
@@ -285,6 +298,11 @@ pub struct NewArgs {
     /// Base the new patch on this ref instead of the default.
     #[arg(long, value_name = "REF")]
     pub base: Option<String>,
+
+    /// Insert at this position: a 1-based index or an existing patch name. Patches after
+    /// it are renumbered so the numbers stay contiguous. Defaults to appending.
+    #[arg(long, value_name = "PATCH|N")]
+    pub at: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -292,13 +310,22 @@ pub struct RefreshArgs {
     /// Patch to refresh. Defaults to the one currently being authored.
     pub name: Option<String>,
 
-    /// Where to insert it in the series.
+    /// Where to insert it in the series. Patches after it are renumbered so the numbers
+    /// stay contiguous.
     #[arg(long, value_name = "INDEX")]
     pub insert_at: Option<usize>,
 
     /// Do not add it to the series.
     #[arg(long)]
     pub no_register: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RemoveArgs {
+    /// Patch to remove: its name in the series, or its 1-based position. Refused while
+    /// it is applied; `skot pop` takes it off first.
+    #[arg(value_name = "PATCH")]
+    pub patch: String,
 }
 
 #[derive(Debug, Clone, Args)]

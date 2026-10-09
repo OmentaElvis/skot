@@ -28,6 +28,9 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
         .filter(|e| !e.path.is_file())
         .map(|e| e.name.as_str())
         .collect();
+    let applied = crate::state::State::load(&ctx.layout)
+        .map(|s| s.applied)
+        .unwrap_or_default();
 
     if ctx.cli.json {
         emit_json(&serde_json::json!({
@@ -40,9 +43,11 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
                     "line": e.line,
                     "path": e.path.display().to_string(),
                     "present": e.path.is_file(),
+                    "applied": applied.contains(&e.name),
                 }))
                 .collect::<Vec<_>>(),
             "missing": missing,
+            "applied": applied,
         }))?;
         return Ok(if missing.is_empty() {
             Exit::Success
@@ -53,8 +58,16 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
 
     report::section(&format!("series ({} patches)", entries.len()));
     for (i, entry) in entries.iter().enumerate() {
-        let mark = if entry.path.is_file() { "  " } else { "! " };
-        report::item(&format!("{mark}{:>3}  {}", i + 1, entry.name));
+        // `[!]` (not on disk) outranks `[x]`: the pair `[x]`/`[ ]` is what makes a hole in
+        // the applied set visible at a glance.
+        let mark = if !entry.path.is_file() {
+            report::bad("[!]").to_string()
+        } else if applied.contains(&entry.name) {
+            "[x]".to_string()
+        } else {
+            "[ ]".to_string()
+        };
+        report::item(&format!("{:>3}  {mark} {}", i + 1, entry.name));
         if args.paths && entry.path.is_file() {
             report::item(&format!(
                 "      {}",

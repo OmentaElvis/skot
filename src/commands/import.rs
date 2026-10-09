@@ -11,8 +11,9 @@
 //! every other command already looks for them, and `check` verifies the imported patch
 //! like any other.
 //!
-//! What import does *not* do is apply anything. The patch joins the series at the end and
-//! the sandbox is untouched, so the next step is the same as after `new`: verify with
+//! What import does *not* do is apply anything. The patch joins the series at the end (or
+//! at `--at`, with the tail renumbered so the numbers stay contiguous), and the sandbox is
+//! untouched, so the next step is the same as after `new`: verify with
 //! `skot check`, or take the whole run with `skot build`.
 //!
 //! Import is also repeatable. Re-running the same request is not a second copy: a patch
@@ -512,9 +513,11 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         });
     }
 
-    // Nothing has this change: a new patch at the next free prefix. Chosen here rather
-    // than earlier because a run that turns out to be a no-op never names a file.
-    let prefix = series.len() + 1;
+    // Nothing has this change: a new patch at the position asked for (the end, unless
+    // `--at` says otherwise). Chosen here rather than earlier because a run that turns
+    // out to be a no-op never names a file.
+    let index = series::position_at(&series, args.at.as_deref())?;
+    let prefix = index + 1;
     let patch_name = series::default_patch_name(&prefix.to_string(), &slug);
     let path = layout.patches_dir().join(&patch_name);
     if path.exists() {
@@ -525,12 +528,18 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         );
     }
     std::fs::create_dir_all(layout.patches_dir()).context("creating the patch directory")?;
-    std::fs::write(&path, &text).context(format!("writing {}", path.display()))?;
     let series_line = if args.no_register {
+        std::fs::write(&path, &text).context(format!("writing {}", path.display()))?;
         None
     } else {
-        let line = series.insert(&patch_name, series.len())?;
+        // The tail renumbers first (this may be what frees the name), the series is saved
+        // to match, and only then is the file written: a failure anywhere before the
+        // write leaves at worst a listed patch with no file, which `skot list` calls out.
+        let (line, renames) = series.insert_renumbering(layout, &patch_name, index)?;
         series.save(layout)?;
+        std::fs::write(&path, &text).context(format!("writing {}", path.display()))?;
+        let mut state = crate::state::State::load(layout)?;
+        state.follow_renames(layout, &renames)?;
         Some(line)
     };
     drop(lock);
@@ -1019,6 +1028,7 @@ mod tests {
 
     fn args(range: Option<&str>) -> ImportArgs {
         ImportArgs {
+            at: None,
             range: range.map(str::to_owned),
             from: None,
             pr: None,
@@ -1136,6 +1146,7 @@ mod tests {
         let first = import(
             &layout,
             &ImportArgs {
+                at: None,
                 no_register: true,
                 ..args(Some("feat"))
             },
@@ -1153,6 +1164,40 @@ mod tests {
         );
         let series = std::fs::read_to_string(layout.series_file()).unwrap();
         assert_eq!(series.trim(), first.patch);
+    }
+
+    #[test]
+    fn importing_at_a_position_inserts_and_renumbers_the_tail() {
+        let (_tmp, layout, _main) = fixture();
+        testsupport::write_series(&layout, &[("0001-a.patch", ""), ("0002-b.patch", "")]);
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                at: Some("2".to_owned()),
+                ..args(Some("main..feat"))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.series_line, Some(2), "it occupies the second slot");
+        assert!(
+            done.patch.starts_with("0002-"),
+            "its number is its position: {}",
+            done.patch
+        );
+        let series = std::fs::read_to_string(layout.series_file()).unwrap();
+        assert_eq!(
+            series.trim_end().lines().collect::<Vec<_>>(),
+            vec![
+                "0001-a.patch".to_owned(),
+                done.patch.clone(),
+                "0003-b.patch".to_owned()
+            ],
+            "the tail was renumbered, not left with a gap:\n{series}"
+        );
+        assert!(layout.patches_dir().join("0003-b.patch").is_file());
+        assert!(!layout.patches_dir().join("0002-b.patch").exists());
     }
 
     #[test]
@@ -1389,6 +1434,7 @@ mod tests {
         let err = import(
             &layout,
             &ImportArgs {
+                at: None,
                 from: Some("main".into()),
                 ..args(Some("main..feat"))
             },
@@ -1437,6 +1483,7 @@ mod tests {
         let done = import(
             &layout,
             &ImportArgs {
+                at: None,
                 no_register: true,
                 ..args(Some("feat"))
             },
@@ -1458,6 +1505,7 @@ mod tests {
         let done = import(
             &layout,
             &ImportArgs {
+                at: None,
                 name: Some("the second line".into()),
                 ..args(Some("feat"))
             },
@@ -1497,6 +1545,7 @@ mod tests {
         let done = import(
             &layout,
             &ImportArgs {
+                at: None,
                 repo: Some(fork.to_str().unwrap().to_owned()),
                 ..args(Some("main..feat"))
             },
@@ -1573,6 +1622,7 @@ mod tests {
         let done = import(
             &layout,
             &ImportArgs {
+                at: None,
                 pr: Some(7),
                 ..args(None)
             },
@@ -1601,6 +1651,7 @@ mod tests {
         let (source, _sha) = pull_request_source(tmp.path());
         let layout = synced_project(tmp.path(), &source);
         let request = ImportArgs {
+            at: None,
             pr: Some(7),
             ..args(None)
         };
@@ -1624,6 +1675,7 @@ mod tests {
         let (source, pr_sha) = pull_request_source(tmp.path());
         let layout = synced_project(tmp.path(), &source);
         let request = ImportArgs {
+            at: None,
             pr: Some(7),
             ..args(None)
         };
@@ -1690,6 +1742,7 @@ mod tests {
         let done = import(
             &layout,
             &ImportArgs {
+                at: None,
                 pr: Some(7),
                 ..args(None)
             },

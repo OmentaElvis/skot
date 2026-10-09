@@ -1,16 +1,17 @@
 //! `new`: start the next patch, with everything already in the sandbox.
 //!
 //! The authoring loop is one command per step: `new` gives you a working tree with the
-//! existing series applied and an empty patch registered at the end of the series, `refresh`
-//! turns what you changed into that patch's contents. Nothing is committed anywhere — the
-//! patch file *is* the record.
+//! applied set in place and an empty patch registered at its position in the series
+//! (`--at` picks the position, the end by default, and the tail is renumbered so the
+//! numbers stay contiguous), `refresh` turns what you changed into that patch's contents.
+//! Nothing is committed anywhere: the patch file *is* the record.
 //!
 //! Two things are worth stating, because both are easy to get wrong:
 //!
 //! - **The sandbox really is put in place.** A `new` that only wrote a file would leave the
 //!   user editing whatever tree happened to be there, and `refresh` would then export whatever
-//!   that tree contained. So `new` applies the series to the base it was given, which is also
-//!   what makes `--base` mean something.
+//!   that tree contained. So `new` applies the recorded set to the base it was given (the
+//!   whole series on a first run), which is also what makes `--base` mean something.
 //! - **It does not invent the patch's contents.** The file is written empty and registered, so
 //!   that `refresh` has something to fill in and the series is complete before editing starts.
 //!   An empty patch in the series is honest; a patch with a guessed subject and an empty diff
@@ -40,9 +41,14 @@ struct Created {
     subject: String,
 }
 
-/// Create an empty patch file, append it to the series, and put the sandbox on the base.
+/// Create an empty patch file, insert it into the series, and put the sandbox on the base.
 pub fn run(ctx: &Ctx, args: &NewArgs) -> Result<Exit> {
-    let created = create(&ctx.layout, &args.name, args.base.as_deref())?;
+    let created = create(
+        &ctx.layout,
+        &args.name,
+        args.base.as_deref(),
+        args.at.as_deref(),
+    )?;
 
     if ctx.cli.json {
         emit_json(&json!({
@@ -75,7 +81,7 @@ pub fn run(ctx: &Ctx, args: &NewArgs) -> Result<Exit> {
 }
 
 /// The plain work behind [`run`]: no clap, no stdout, no verdict.
-fn create(layout: &Layout, name: &str, base: Option<&str>) -> Result<Created> {
+fn create(layout: &Layout, name: &str, base: Option<&str>, at: Option<&str>) -> Result<Created> {
     let (config, mut series) = layout.project()?;
     let slug = slug(name)?;
 
@@ -102,7 +108,8 @@ fn create(layout: &Layout, name: &str, base: Option<&str>) -> Result<Created> {
 
     prepare_sandbox(layout, &base, &slug)?;
 
-    let prefix = series.len() + 1;
+    let index = series::position_at(&series, at)?;
+    let prefix = index + 1;
     let patch_name = series::default_patch_name(&prefix.to_string(), &slug);
     if layout.patches_dir().join(&patch_name).exists() {
         bail!(
@@ -113,17 +120,27 @@ fn create(layout: &Layout, name: &str, base: Option<&str>) -> Result<Created> {
     }
 
     std::fs::create_dir_all(layout.patches_dir())?;
-    std::fs::write(layout.patches_dir().join(&patch_name), "")?;
-    let line = series.insert(&patch_name, series.len())?;
+    // The tail moves first (this may be what frees the name), the series is saved to
+    // match, and only then is the new file written: a failure anywhere before the write
+    // leaves at worst a listed patch with no file, which `skot list` calls out.
+    let (line, renames) = series.insert_renumbering(layout, &patch_name, index)?;
     series.save(layout)?;
+    std::fs::write(layout.patches_dir().join(&patch_name), "")?;
 
     // Record the new patch as applied. It is empty, so the tree did not change, but "applied"
-    // is what tells `refresh` which patch is being authored, and `push`/`pop` that the stack
-    // is a prefix of the series. Without this the very next command refuses with "nothing is
-    // applied", which is the opposite of useful: the user *did* just start a patch.
+    // is what tells `refresh` which patch is being authored, and `push`/`pop` which patches
+    // are on. Without this the very next command refuses with "nothing is
+    // applied", which is the opposite of useful: the user *did* just start a patch. The set
+    // is written in series order, so a patch inserted mid-series sits in its own place
+    // rather than at the end of the list, which `pop` would read as the top.
     let mut state = State::load(layout)?;
-    let mut applied = state.applied.clone();
-    applied.push(patch_name.clone());
+    state.follow_renames(layout, &renames)?;
+    let applied: Vec<String> = series
+        .names()
+        .into_iter()
+        .filter(|name| state.applied.iter().any(|a| a.as_str() == *name) || *name == patch_name)
+        .map(str::to_owned)
+        .collect();
     state.set_applied(layout, applied)?;
     drop(lock);
 
@@ -137,14 +154,24 @@ fn create(layout: &Layout, name: &str, base: Option<&str>) -> Result<Created> {
     })
 }
 
-/// Put the sandbox on `base` with the series applied to it, recording what it did.
+/// Put the sandbox on `base` with the recorded set applied to it, recording what it did.
 ///
 /// This is `apply` without the narration, and there is deliberately no second path: the
-/// first patch in a project is created against a bare upstream with nothing to replay,
-/// and `apply_locked` handles that by resetting the sandbox to `base` and applying zero
-/// patches. One path means `new` cannot put the sandbox somewhere `apply` would not.
+/// first patch in a project is created against a bare upstream with nothing to replay, and
+/// `apply_locked` handles that by resetting the sandbox to `base` and applying zero
+/// patches. One path means `new` cannot put the sandbox somewhere `apply` would not. A
+/// sandbox that already holds a set (with holes) lands exactly that set, the same way
+/// `build` does, so a patch popped out for testing stays out while the next one is
+/// written.
 fn prepare_sandbox(layout: &Layout, base: &str, name: &str) -> Result<()> {
-    let applied = crate::commands::apply::apply_locked(layout, Some(base))?;
+    let state = State::load(layout)?;
+    let applied = if state.ref_name.is_none() {
+        crate::commands::apply::apply_locked(layout, Some(base))?
+    } else {
+        let (_config, series) = layout.project()?;
+        let stack = authoring::recorded_stack(layout, &series, &state)?;
+        crate::commands::apply::apply_locked_subset(layout, Some(base), &stack.names)?
+    };
     if !applied.ok {
         // Checked, not `?`'d: `apply_locked` reports a failed replay by *returning* a
         // verdict rather than by erroring, because the caller decides whether that
@@ -223,7 +250,7 @@ mod tests {
     #[test]
     fn new_creates_the_file_and_registers_it() {
         let (_tmp, layout) = project();
-        create(&layout, "trim-widgets", None).unwrap();
+        create(&layout, "trim-widgets", None, None).unwrap();
         assert!(
             layout
                 .patches_dir()
@@ -237,12 +264,46 @@ mod tests {
     }
 
     #[test]
+    fn new_at_inserts_the_patch_renumbers_the_tail_and_keeps_the_set_in_order() {
+        // `--at` occupies that slot: the tail is renamed up one number each, the files
+        // move with their names, and the applied set is rewritten in series order so
+        // `pop` still knows which patch is on top.
+        let (_tmp, layout) = project();
+        create(&layout, "first", None, None).unwrap();
+        create(&layout, "second", None, None).unwrap();
+        create(&layout, "third", None, None).unwrap();
+
+        let created = create(&layout, "middle", None, Some("2")).unwrap();
+
+        assert_eq!(created.name, "0002-middle.patch");
+        assert_eq!(created.line, 2);
+        assert_eq!(
+            std::fs::read_to_string(layout.series_file()).unwrap(),
+            "0001-first.patch\n0002-middle.patch\n0003-second.patch\n0004-third.patch\n"
+        );
+        assert!(layout.patches_dir().join("0003-second.patch").is_file());
+        assert!(layout.patches_dir().join("0004-third.patch").is_file());
+        assert!(!layout.patches_dir().join("0002-second.patch").exists());
+        let state = State::load(&layout).unwrap();
+        assert_eq!(
+            state.applied,
+            [
+                "0001-first.patch",
+                "0002-middle.patch",
+                "0003-second.patch",
+                "0004-third.patch"
+            ],
+            "series order, not insertion order: the top is the last entry"
+        );
+    }
+
+    #[test]
     fn new_numbers_its_patches_by_series_position() {
         // The number is what makes lexical order match application order, so a second patch
         // must not be called 0001 again.
         let (_tmp, layout) = project();
-        create(&layout, "first", None).unwrap();
-        create(&layout, "second", None).unwrap();
+        create(&layout, "first", None, None).unwrap();
+        create(&layout, "second", None, None).unwrap();
 
         let series = std::fs::read_to_string(layout.series_file()).unwrap();
         assert_eq!(series, "0001-first.patch\n0002-second.patch\n");
@@ -252,7 +313,7 @@ mod tests {
     fn new_appends_after_patches_that_are_already_there() {
         let (_tmp, layout) = project();
         testsupport::write_series(&layout, &[("0001-existing.patch", "")]);
-        create(&layout, "next", None).unwrap();
+        create(&layout, "next", None, None).unwrap();
         assert_eq!(
             std::fs::read_to_string(layout.series_file()).unwrap(),
             "0001-existing.patch\n0002-next.patch\n"
@@ -270,7 +331,7 @@ mod tests {
             &[("0001-existing.patch", testsupport::patch_one())],
         );
 
-        create(&layout, "next", None).unwrap();
+        create(&layout, "next", None, None).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(layout.sandbox_dir().join("f.txt")).unwrap(),
@@ -314,7 +375,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = create(&layout, "next", Some("nope"))
+        let err = create(&layout, "next", Some("nope"), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("nope"), "the error should name the ref: {err}");
@@ -340,7 +401,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = testsupport::project_with_sandbox(tmp.path());
 
-        let err = create(&layout, "next", None).unwrap_err().to_string();
+        let err = create(&layout, "next", None, None).unwrap_err().to_string();
         assert!(err.contains("--base"), "should point at the flag: {err}");
         assert!(
             err.contains("default-ref"),
@@ -354,7 +415,7 @@ mod tests {
         // filename with a space has to be quoted in every shell and in every `series` line
         // anyone types, and `0001-add greeting.patch` is not something to hand a user.
         let (_tmp, layout) = project();
-        create(&layout, "add greeting", None).unwrap();
+        create(&layout, "add greeting", None, None).unwrap();
         assert!(
             layout
                 .patches_dir()
@@ -373,7 +434,7 @@ mod tests {
         let (_tmp, layout) = project();
         std::fs::write(layout.patches_dir().join("0001-trim-widgets.patch"), "mine").unwrap();
 
-        let err = create(&layout, "trim-widgets", None)
+        let err = create(&layout, "trim-widgets", None, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("already exists"), "got {err}");
@@ -390,7 +451,7 @@ mod tests {
         // be rejected rather than producing a file outside patches/.
         for bad in ["../escape", "a/b", "..", "with\nnewline", ""] {
             let (_tmp, layout) = project();
-            let err = create(&layout, bad, None).unwrap_err().to_string();
+            let err = create(&layout, bad, None, None).unwrap_err().to_string();
             assert!(!err.is_empty(), "{bad:?} was accepted");
         }
     }
@@ -400,7 +461,8 @@ mod tests {
         // `new` puts the existing series in the sandbox so the new patch sits on top of it.
         // If that replay fails, carrying on would create the patch on a sandbox that does not
         // hold the series — and the first `refresh` would then fold the *missing* work into
-        // the new patch, because the base it diffs against is the series prefix, not what is
+        // the new patch, because the base it diffs against is what the applied set below it
+        // produced, not what is
         // actually there. Failing here is much cheaper than debugging that later.
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = testsupport::project_with_sandbox(tmp.path());
@@ -426,7 +488,7 @@ index 1111111..2222222 100644
             )],
         );
 
-        let err = create(&layout, "after", None).unwrap_err();
+        let err = create(&layout, "after", None, None).unwrap_err();
         let text = format!("{err:#}");
         assert!(
             text.contains("0001-a.patch"),
