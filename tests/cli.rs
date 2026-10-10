@@ -158,6 +158,37 @@ fn move_json_is_a_single_document_and_the_series_follows() {
     );
 }
 
+/// Deleting a file is the one thing `skot patch` cannot take back, so a caller has to
+/// say `--yes`.
+#[test]
+fn drop_deletes_only_when_asked_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = bare_project(tmp.path());
+    write_series(&layout, "0001-a.patch", patch_one());
+
+    // No terminal here, so without --yes there is nobody to ask. The refusal goes to
+    // stderr; under --json the logger is off by contract, and only the exit code shows.
+    let out = skot(tmp.path(), &["patch", "drop", "0001-a.patch"]);
+    assert_ne!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(stderr(&out).contains("--yes"), "stderr: {}", stderr(&out));
+    assert!(
+        layout.patches_dir().join("0001-a.patch").is_file(),
+        "nothing was deleted"
+    );
+
+    let out = skot(
+        tmp.path(),
+        &["patch", "drop", "0001-a.patch", "--yes", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("stdout is not one JSON document: {e}\n---\n{text}\n---"));
+    assert_eq!(parsed["ok"], true, "{text}");
+    assert_eq!(parsed["file_removed"], true, "{text}");
+    assert!(!layout.patches_dir().join("0001-a.patch").exists());
+}
+
 /// A failing patch must exit non-zero and explain itself on stderr, because that is what a CI
 /// job reads. A silent non-zero exit is worse than an error message.
 #[test]

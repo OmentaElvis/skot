@@ -7,11 +7,16 @@
 //!
 //! It refuses a patch that is applied rather than leaving the sandbox holding something
 //! the series no longer lists: `skot patch pop` puts it down, `drop` takes it out, and
-//! `skot patch apply` picks the set up again (interactively, it opens the picker). The refusal
-//! is the whole safety story; nothing here ever guesses, and the file the guard will not
-//! delete is reported rather than silently kept.
+//! `skot patch apply` picks the set up again (interactively, it opens the picker). Beyond
+//! that, deleting a file is the one thing `skot patch` cannot take back, so an
+//! interactive session is asked first (No being the default) and everything else has to
+//! say `--yes`: the refusal and the question together are the whole safety story, and
+//! nothing here ever guesses. The file the guard will not delete is reported rather than
+//! silently kept.
 
-use anyhow::{Result, bail};
+use std::io::IsTerminal as _;
+
+use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
 use serde_json::json;
 
@@ -42,11 +47,45 @@ struct Removed {
 ///
 /// Success is always [`Exit::Success`]: even with the file already gone, the line's
 /// removal is the thing that was asked for. Every refusal (unknown patch, applied
-/// patch, an out-of-series file squatting on a tail rename) is an error rather than a
-/// negative verdict, because the series is untouched and the remedy is a different
-/// command, not a different exit code.
+/// patch, an out-of-series file squatting on a tail rename, nobody to ask and no
+/// `--yes`) is an error rather than a negative verdict, because the series is untouched
+/// and the remedy is a different command, not a different exit code. Declining the
+/// question is the one negative verdict: it is [`Exit::Failure`], the same as `move`'s
+/// no-op, because the patch stays where it was.
 pub fn run(ctx: &Ctx, args: &DropArgs) -> Result<Exit> {
-    let removed = remove(&ctx.layout, &args.patch)?;
+    // Resolved before the question, the way `move` resolves before its prompts: the
+    // question has to name the patch, and a doomed drop (unknown, or applied) should be
+    // refused before anyone is asked to confirm it.
+    let (_config, series) = ctx.layout.project()?;
+    let names = series.names();
+    let name = names[position_of(&names, &args.patch)?].to_owned();
+    let state = State::load(&ctx.layout).unwrap_or_default();
+    if state.applied.contains(&name) {
+        return Err(refuse_applied(&name));
+    }
+
+    if !ctx.yes {
+        if ctx.cli.json || !std::io::stdin().is_terminal() {
+            bail!(
+                "cannot ask before deleting a patch here.\n`{}` means it.",
+                skot_args("drop", "<patch> --yes")
+            );
+        }
+        let question = format!("Drop {name} and delete its file?");
+        let confirmed = inquire::Confirm::new(&question)
+            .with_default(false)
+            .with_help_message(
+                "Its line leaves the series and the tail renumbers down. Esc keeps it.",
+            )
+            .prompt()
+            .context("confirming the drop")?;
+        if !confirmed {
+            info!(target: "drop", "kept {name}; nothing was removed");
+            return Ok(Exit::Failure);
+        }
+    }
+
+    let removed = remove(&ctx.layout, &name)?;
 
     if ctx.cli.json {
         emit_json(&json!({
@@ -108,42 +147,11 @@ fn remove(layout: &Layout, want: &str) -> Result<Removed> {
     let mut state = State::load(layout)?;
 
     let names = series.names();
-    let index = if let Some(i) = names.iter().position(|n| *n == want) {
-        // An exact name always wins: a patch may be called `3`.
-        i
-    } else if let Ok(position) = want.parse::<usize>() {
-        if position == 0 {
-            bail!(
-                "positions are 1-based: `{}` is the front of the series",
-                skot_args("drop", "1")
-            );
-        }
-        if position > names.len() {
-            bail!(
-                "the series holds {} patches, so position {position} does not exist. \
-                 Patches in it: {}",
-                names.len(),
-                listed(&names)
-            );
-        }
-        position - 1
-    } else {
-        bail!(
-            "`{want}` is not in the series. Patches in it: {}",
-            listed(&names)
-        );
-    };
+    let index = position_of(&names, want)?;
     let name = names[index].to_owned();
 
     if state.applied.contains(&name) {
-        bail!(
-            "`{name}` is applied, so dropping it would leave the sandbox holding a patch the \
-             series no longer lists.\n\
-             `{}` takes it off (and the patches above it); `{}` picks the \
-             set up again afterwards.",
-            skot_args("pop", &name),
-            skot("apply")
-        );
+        return Err(refuse_applied(&name));
     }
 
     let removal = series.remove_renumbering(layout, &name)?;
@@ -158,6 +166,48 @@ fn remove(layout: &Layout, want: &str) -> Result<Removed> {
         file: removal.file,
         left: series.len(),
     })
+}
+
+/// Resolve a patch name or a 1-based position to a 0-based index. An exact name always
+/// wins: a patch may be called `3`.
+fn position_of(names: &[&str], want: &str) -> Result<usize> {
+    if let Some(i) = names.iter().position(|n| *n == want) {
+        return Ok(i);
+    }
+    if let Ok(position) = want.parse::<usize>() {
+        if position == 0 {
+            bail!(
+                "positions are 1-based: `{}` is the front of the series",
+                skot_args("drop", "1")
+            );
+        }
+        if position > names.len() {
+            bail!(
+                "the series holds {} patches, so position {position} does not exist. \
+                 Patches in it: {}",
+                names.len(),
+                listed(names)
+            );
+        }
+        return Ok(position - 1);
+    }
+    bail!(
+        "`{want}` is not in the series. Patches in it: {}",
+        listed(names)
+    )
+}
+
+/// The refusal shared by the prompt path and the work itself: a patch the sandbox is
+/// holding never goes, whatever asked.
+fn refuse_applied(name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "`{name}` is applied, so dropping it would leave the sandbox holding a patch the \
+         series no longer lists.\n\
+         `{}` takes it off (and the patches above it); `{}` picks the \
+         set up again afterwards.",
+        skot_args("pop", name),
+        skot("apply")
+    )
 }
 
 /// Every patch in the series, as one line of an error message.
@@ -392,7 +442,7 @@ mod tests {
         let ctx = Ctx {
             layout,
             cli,
-            yes: false,
+            yes: true,
         };
 
         let exit = run(
@@ -404,6 +454,61 @@ mod tests {
         .unwrap();
 
         assert_eq!(exit, Exit::Success);
+        drop(tmp);
+    }
+
+    #[test]
+    fn a_script_that_does_not_say_yes_is_told_how() {
+        let (tmp, layout) = three_patches();
+        let cli = Cli::try_parse_from(["skot", "patch", "drop", "0003-c.patch"]).unwrap();
+        let ctx = Ctx {
+            layout,
+            cli,
+            yes: false,
+        };
+
+        // No terminal under the test harness, which is the case the message exists for.
+        let err = run(
+            &ctx,
+            &DropArgs {
+                patch: "0003-c.patch".to_owned(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("cannot ask"), "{err}");
+        assert!(err.contains("--yes"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            "0001-a.patch\n0002-b.patch\n0003-c.patch\n",
+            "nothing was removed"
+        );
+        assert!(tmp.path().join("patches").join("0003-c.patch").is_file());
+        drop(tmp);
+    }
+
+    #[test]
+    fn json_does_not_delete_anything_without_yes_either() {
+        let (tmp, layout) = three_patches();
+        let cli = Cli::try_parse_from(["skot", "patch", "drop", "0003-c.patch", "--json"]).unwrap();
+        let ctx = Ctx {
+            layout,
+            cli,
+            yes: false,
+        };
+
+        let err = run(
+            &ctx,
+            &DropArgs {
+                patch: "0003-c.patch".to_owned(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("cannot ask"), "{err}");
+        assert!(tmp.path().join("patches").join("0003-c.patch").is_file());
         drop(tmp);
     }
 }

@@ -124,6 +124,9 @@ pub enum PatchCommand {
     Move(MoveArgs),
 
     /// Take a patch out of the series: its line and its file.
+    ///
+    /// Asks before deleting; `--yes` says so in advance.
+    #[command(visible_alias = "rm")]
     Drop(DropArgs),
 }
 
