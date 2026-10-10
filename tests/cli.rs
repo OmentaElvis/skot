@@ -120,6 +120,44 @@ fn apply_json_is_a_single_document() {
     assert_eq!(sandbox_text(&layout), "first\n");
 }
 
+/// `patch move` reorders and renumbers, and under `--json` it still owes the caller exactly
+/// one document, with the positions it moved between.
+#[test]
+fn move_json_is_a_single_document_and_the_series_follows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = bare_project(tmp.path());
+    std::fs::write(layout.patches_dir().join("0001-a.patch"), "a\n").unwrap();
+    std::fs::write(layout.patches_dir().join("0002-b.patch"), "b\n").unwrap();
+    std::fs::write(layout.series_file(), "0001-a.patch\n0002-b.patch\n").unwrap();
+
+    let out = skot(
+        tmp.path(),
+        &["patch", "move", "0002-b.patch", "--to", "1", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+
+    let text = stdout(&out);
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("stdout is not one JSON document: {e}\n---\n{text}\n---"));
+    assert_eq!(parsed["ok"], true, "{text}");
+    assert_eq!(parsed["patch"], "0002-b.patch", "{text}");
+    assert_eq!(parsed["from"], 2, "{text}");
+    assert_eq!(parsed["to"], 1, "{text}");
+    assert_eq!(
+        std::fs::read_to_string(layout.series_file()).unwrap(),
+        "0001-b.patch\n0002-a.patch\n",
+        "the series file followed the move"
+    );
+    assert_eq!(
+        std::fs::read_to_string(layout.patches_dir().join("0001-b.patch")).unwrap(),
+        "b\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(layout.patches_dir().join("0002-a.patch")).unwrap(),
+        "a\n"
+    );
+}
+
 /// A failing patch must exit non-zero and explain itself on stderr, because that is what a CI
 /// job reads. A silent non-zero exit is worse than an error message.
 #[test]

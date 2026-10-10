@@ -117,6 +117,12 @@ pub enum PatchCommand {
     #[command(visible_alias = "ls")]
     List(ListArgs),
 
+    /// Move a patch to a different position in the series.
+    ///
+    /// With no arguments, the patch and its destination are picked from a list.
+    #[command(visible_alias = "mv")]
+    Move(MoveArgs),
+
     /// Take a patch out of the series: its line and its file.
     Drop(DropArgs),
 }
@@ -149,7 +155,7 @@ const ROOT_GROUPS: &[(&str, &[&str])] = &[
 const PATCH_GROUPS: &[(&str, &[&str])] = &[
     ("Author", &["new", "import", "refresh"]),
     ("Apply", &["apply", "unapply", "push", "pop"]),
-    ("Inspect and edit", &["list", "drop"]),
+    ("Inspect and edit", &["list", "move", "drop"]),
 ];
 
 /// clap's own description of its `help` subcommand, appended after the groups. The test
@@ -489,6 +495,19 @@ pub struct DropArgs {
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct MoveArgs {
+    /// Patch to move: its name in the series, or its 1-based position. Left out, it is
+    /// picked from a list; a patch that is applied cannot move.
+    #[arg(value_name = "PATCH")]
+    pub patch: Option<String>,
+
+    /// Where the patch should end up: a 1-based position, or an existing patch name to
+    /// land before. Left out, the new position is asked for.
+    #[arg(long, value_name = "PATCH|N")]
+    pub to: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct BuildArgs {
     /// Ref to build. Defaults to the configured default ref.
     #[arg(value_name = "REF")]
@@ -811,6 +830,8 @@ mod tests {
         assert!(matches!(cli.command, Command::Patch(PatchCommand::List(_))));
         let cli = Cli::try_parse_from(["skot", "patch", "drop", "1"]).unwrap();
         assert!(matches!(cli.command, Command::Patch(PatchCommand::Drop(_))));
+        let cli = Cli::try_parse_from(["skot", "patch", "move", "2", "--to", "1"]).unwrap();
+        assert!(matches!(cli.command, Command::Patch(PatchCommand::Move(_))));
     }
 
     /// Every name in the tables exists in the tree, appears once across the tables,

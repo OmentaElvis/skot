@@ -382,6 +382,170 @@ impl Series {
         })
     }
 
+    /// Move `name` so that it becomes the `to`th entry, 0-based, renumbering the entries
+    /// it passes so the numbers stay contiguous: lexical order *is* application order,
+    /// and a move is a rotation of the entries between the two positions.
+    ///
+    /// Returns the 0-based positions and the renames, already applied to the series and
+    /// to the files on disk. The count does not change, so every name in the rotated
+    /// range is taken: the moved patch's file steps through a temporary name beside
+    /// itself first, which is the one free slot the rotation needs. A leftover temporary
+    /// is refused rather than overwritten, since it means an earlier move was
+    /// interrupted. Refuses any rename target an out-of-series file occupies before
+    /// anything is renamed.
+    pub fn move_renumbering(
+        &mut self,
+        layout: &Layout,
+        name: &str,
+        to: usize,
+    ) -> anyhow::Result<Moved> {
+        let old: Vec<String> = self.names().into_iter().map(String::from).collect();
+        let Some(from) = old.iter().position(|o| o == name) else {
+            anyhow::bail!(
+                "`{name}` is not in the series. Patches in it: {}",
+                if old.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    old.join(", ")
+                }
+            );
+        };
+        if to >= old.len() {
+            anyhow::bail!(
+                "the series holds {} patches, so position {} does not exist (1 to {})",
+                old.len(),
+                to + 1,
+                old.len()
+            );
+        }
+        if from == to {
+            return Ok(Moved {
+                from,
+                to,
+                renames: Vec::new(),
+                window: Vec::new(),
+            });
+        }
+
+        // The order after the move, and the range the rotation touches: entries outside
+        // it keep their names, so a hand-numbered series is only renumbered where the
+        // move actually reaches.
+        let mut final_names = old.clone();
+        final_names.remove(from);
+        final_names.insert(to, name.to_owned());
+        let (lo, hi) = (from.min(to), from.max(to));
+
+        let mut renames = Vec::new();
+        let mut window = Vec::new();
+        for (i, entry_name) in final_names.iter().enumerate().take(hi + 1).skip(lo) {
+            let new_name = renumbered(entry_name, i + 1);
+            if new_name != *entry_name {
+                renames.push((entry_name.clone(), new_name.clone()));
+            }
+            window.push((i + 1, new_name));
+        }
+
+        // Checked before anything moves: a rename target an out-of-series file occupies
+        // is refused rather than overwritten. Every source in the range is in the series
+        // (the rotation's own members), so those targets are free the moment their
+        // holder is renamed.
+        let source_names: Vec<&str> = old[lo..=hi].iter().map(String::as_str).collect();
+        for (_, new_name) in &renames {
+            let path = resolve(layout, new_name);
+            if path.exists() && !source_names.contains(&new_name.as_str()) {
+                return Err(SeriesError::OccupiedTarget {
+                    path,
+                    name: new_name.clone(),
+                }
+                .into());
+            }
+        }
+
+        // The moved patch steps aside first: the rotation's cycle needs one free name,
+        // and this is it.
+        let moved_path = resolve(layout, name);
+        let tmp_path = moved_path.with_file_name(format!(
+            ".skot-move-{}",
+            moved_path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| name.to_owned())
+        ));
+        if tmp_path.exists() {
+            anyhow::bail!(
+                "{} already exists, which means an earlier move was interrupted.\n\
+                 Delete it and run the move again.",
+                tmp_path.display()
+            );
+        }
+        std::fs::rename(&moved_path, &tmp_path).context(format!(
+            "renaming {} to {}",
+            moved_path.display(),
+            tmp_path.display()
+        ))?;
+
+        // The hole the moved patch left propagates through the range, one step at a
+        // time: downward for a move up, upward for a move down. Each rename lands in the
+        // slot the previous one freed.
+        if to > from {
+            for i in from..to {
+                let src = &old[i + 1];
+                let dst = renumbered(src, i + 1);
+                if &dst != src {
+                    let (from_path, to_path) = (resolve(layout, src), resolve(layout, &dst));
+                    std::fs::rename(&from_path, &to_path).context(format!(
+                        "renaming {} to {}",
+                        from_path.display(),
+                        to_path.display()
+                    ))?;
+                }
+            }
+        } else {
+            for i in (to..from).rev() {
+                let src = &old[i];
+                let dst = renumbered(src, i + 2);
+                if &dst != src {
+                    let (from_path, to_path) = (resolve(layout, src), resolve(layout, &dst));
+                    std::fs::rename(&from_path, &to_path).context(format!(
+                        "renaming {} to {}",
+                        from_path.display(),
+                        to_path.display()
+                    ))?;
+                }
+            }
+        }
+
+        let final_moved = renumbered(name, to + 1);
+        std::fs::rename(&tmp_path, resolve(layout, &final_moved)).context(format!(
+            "renaming {} to {}",
+            tmp_path.display(),
+            resolve(layout, &final_moved).display()
+        ))?;
+
+        // The count never changed, so the entry lines sit where they did; only their
+        // names move within the range.
+        let entry_lines: Vec<usize> = self
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.entry.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        for i in lo..=hi {
+            let new_name = renumbered(&final_names[i], i + 1);
+            let l = &mut self.lines[entry_lines[i]];
+            l.entry = Some(new_name.clone());
+            l.raw = new_name.clone();
+        }
+
+        Ok(Moved {
+            from,
+            to,
+            renames,
+            window,
+        })
+    }
+
     /// Insert `name` so that it becomes the `index`th entry, 0-based.
     ///
     /// Appends when `index` is past the end. Refuses a duplicate rather than
@@ -494,6 +658,21 @@ pub struct Removal {
     pub renames: Vec<(String, String)>,
     /// What became of the removed patch's own file.
     pub file: FileGone,
+}
+
+/// What [`Series::move_renumbering`] did, in one value.
+#[derive(Debug)]
+pub struct Moved {
+    /// The entry's 0-based position before the move.
+    pub from: usize,
+    /// The entry's 0-based position after the move.
+    pub to: usize,
+    /// The renames the rotation caused, applied to the series and to the files on disk.
+    pub renames: Vec<(String, String)>,
+    /// The range the rotation touched, each entry's name after the move paired with its
+    /// 1-based position: what a person needs in order to see the result without reading
+    /// the whole series.
+    pub window: Vec<(usize, String)>,
 }
 
 /// The same patch file under a new 1-based series number.
@@ -626,6 +805,50 @@ mod tests {
             series.render(),
             "# a comment\n\n0001-a.patch\n   \n0002-b.patch  # trailing\n"
         );
+    }
+
+    #[test]
+    fn a_move_keeps_comments_and_blanks_where_they_were() {
+        let (tmp, layout) = layout();
+        std::fs::write(layout.patches_dir().join("0001-a.patch"), "a\n").unwrap();
+        std::fs::write(layout.patches_dir().join("0002-b.patch"), "b\n").unwrap();
+        let mut series = Series::parse(
+            &layout.series_file(),
+            "# lead\n0001-a.patch\n# between\n0002-b.patch\n",
+        );
+
+        series.move_renumbering(&layout, "0002-b.patch", 0).unwrap();
+
+        assert_eq!(
+            series.render(),
+            "# lead\n0001-b.patch\n# between\n0002-a.patch\n",
+            "the entries swapped numbers; the commentary did not move"
+        );
+        drop(tmp);
+    }
+
+    #[test]
+    fn a_move_leaves_a_hand_made_gap_outside_the_range_alone() {
+        let (tmp, layout) = layout();
+        for name in ["0001-a.patch", "0002-b.patch", "0005-f.patch"] {
+            std::fs::write(layout.patches_dir().join(name), "x\n").unwrap();
+        }
+        let mut series = Series::parse(
+            &layout.series_file(),
+            "0001-a.patch\n0002-b.patch\n0005-f.patch\n",
+        );
+
+        series.move_renumbering(&layout, "0002-b.patch", 0).unwrap();
+
+        assert_eq!(
+            series.render(),
+            "0001-b.patch\n0002-a.patch\n0005-f.patch\n",
+            "the rotation renumbers where it reaches; the gap at 3-4 is the \
+             person's own numbering and stays theirs"
+        );
+        assert!(layout.patches_dir().join("0005-f.patch").exists());
+        assert!(!layout.patches_dir().join("0003-b.patch").exists());
+        drop(tmp);
     }
 
     #[test]

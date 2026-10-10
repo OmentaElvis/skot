@@ -14,6 +14,7 @@ mod hooks;
 mod import;
 mod init;
 mod list;
+mod r#move;
 mod new;
 mod pop;
 mod push;
@@ -122,6 +123,7 @@ pub fn run(ctx: Ctx) -> Result<Exit> {
             PatchCommand::Push(args) => push::run(&ctx, args),
             PatchCommand::Pop(args) => pop::run(&ctx, args),
             PatchCommand::List(args) => list::run(&ctx, args),
+            PatchCommand::Move(args) => r#move::run(&ctx, args),
             PatchCommand::Drop(args) => drop::run(&ctx, args),
         },
         Command::Check(args) => check::run(&ctx, args),
