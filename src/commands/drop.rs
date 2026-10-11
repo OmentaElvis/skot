@@ -21,6 +21,7 @@ use log::{debug, info, warn};
 use serde_json::json;
 
 use crate::cli::DropArgs;
+use crate::commands::authoring;
 use crate::commands::{Ctx, Exit, emit_json};
 use crate::hints::Hints;
 use crate::invocation::{skot, skot_args};
@@ -33,9 +34,10 @@ use crate::state::State;
 struct Removed {
     /// The patch's name as it was in the series.
     name: String,
-    /// The 1-based position it occupied.
-    position: usize,
-    /// The renames the tail's renumbering caused.
+    /// The 1-based position it occupied. `None` for a disabled patch, which never held
+    /// a number.
+    position: Option<usize>,
+    /// The renames the tail's renumbering caused. Empty for a disabled patch.
     renames: Vec<(String, String)>,
     /// What became of the patch's own file.
     file: FileGone,
@@ -58,34 +60,24 @@ pub fn run(ctx: &Ctx, args: &DropArgs) -> Result<Exit> {
     // refused before anyone is asked to confirm it.
     let (_config, series) = ctx.layout.project()?;
     let names = series.names();
-    let name = names[position_of(&names, &args.patch)?].to_owned();
+    let disabled = series.disabled(&ctx.layout);
+    let mut universe: Vec<&str> = names.to_vec();
+    universe.extend(disabled.iter().map(String::as_str));
+    let name = authoring::resolve_patch(&universe, &names, &args.patch)?.name(&names);
     let state = State::load(&ctx.layout).unwrap_or_default();
     if state.applied.contains(&name) {
         return Err(refuse_applied(&name));
     }
-
-    if !ctx.yes {
-        if ctx.cli.json || !std::io::stdin().is_terminal() {
-            bail!(
-                "cannot ask before deleting a patch here.\n`{}` means it.",
-                skot_args("drop", "<patch> --yes")
-            );
-        }
-        let question = format!("Drop {name} and delete its file?");
-        let confirmed = inquire::Confirm::new(&question)
-            .with_default(false)
-            .with_help_message(
-                "Its line leaves the series and the tail renumbers down. Esc keeps it.",
-            )
-            .prompt()
-            .context("confirming the drop")?;
-        if !confirmed {
-            info!(target: "drop", "kept {name}; nothing was removed");
-            return Ok(Exit::Failure);
-        }
+    if !confirmed(ctx, &name)? {
+        info!(target: "drop", "kept {name}; nothing was removed");
+        return Ok(Exit::Failure);
     }
 
-    let removed = remove(&ctx.layout, &name)?;
+    let removed = if disabled.contains(&name) {
+        remove_disabled(&ctx.layout, &name)?
+    } else {
+        remove(&ctx.layout, &name)?
+    };
 
     if ctx.cli.json {
         emit_json(&json!({
@@ -161,11 +153,51 @@ fn remove(layout: &Layout, want: &str) -> Result<Removed> {
 
     Ok(Removed {
         name,
-        position: removal.position,
+        position: Some(removal.position),
         renames: removal.renames,
         file: removal.file,
         left: series.len(),
     })
+}
+
+/// Remove a disabled patch: its commented line and its file, with no renumbering,
+/// since a disabled line never held a number.
+fn remove_disabled(layout: &Layout, name: &str) -> Result<Removed> {
+    let lock = layout.lock()?;
+    let (_config, mut series) = layout.project()?;
+    let Some(file) = series.drop_disabled(layout, name) else {
+        bail!("`{name}` is no longer a disabled line in the series.");
+    };
+    series.save(layout)?;
+    let left = series.len();
+    drop(lock);
+
+    Ok(Removed {
+        name: name.to_owned(),
+        position: None,
+        renames: Vec::new(),
+        file,
+        left,
+    })
+}
+
+/// The question, before anything is deleted: a `--yes` caller has already answered.
+fn confirmed(ctx: &Ctx, name: &str) -> Result<bool> {
+    if ctx.yes {
+        return Ok(true);
+    }
+    if ctx.cli.json || !std::io::stdin().is_terminal() {
+        bail!(
+            "cannot ask before deleting a patch here.\n`{}` means it.",
+            skot_args("drop", "<patch> --yes")
+        );
+    }
+    let question = format!("Drop {name} and delete its file?");
+    inquire::Confirm::new(&question)
+        .with_default(false)
+        .with_help_message("Its line leaves the series and the tail renumbers down. Esc keeps it.")
+        .prompt()
+        .context("confirming the drop")
 }
 
 /// Resolve a patch name or a 1-based position to a 0-based index. An exact name always
@@ -246,7 +278,7 @@ mod tests {
         let removed = remove(&layout, "0002-b.patch").unwrap();
 
         assert_eq!(removed.name, "0002-b.patch");
-        assert_eq!(removed.position, 2);
+        assert_eq!(removed.position, Some(2));
         assert_eq!(
             removed.renames,
             vec![("0003-c.patch".to_owned(), "0002-c.patch".to_owned())]
@@ -510,5 +542,35 @@ mod tests {
         assert!(err.contains("cannot ask"), "{err}");
         assert!(tmp.path().join("patches").join("0003-c.patch").is_file());
         drop(tmp);
+    }
+
+    #[test]
+    fn a_serial_prefix_drops_that_patch() {
+        // The shared `[PATCH]` reading: `0002` names the patch whose file starts with
+        // it, without the full name typed out.
+        let (tmp, layout) = three_patches();
+        let cli = Cli::try_parse_from(["skot", "patch", "drop", "0002", "--yes"]).unwrap();
+        let ctx = Ctx {
+            layout,
+            cli,
+            yes: true,
+        };
+
+        let exit = run(
+            &ctx,
+            &DropArgs {
+                patch: "0002".to_owned(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(exit, Exit::Success);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            "0001-a.patch\n0002-c.patch\n",
+            "0002-b.patch is gone and the tail renumbered down"
+        );
+        assert!(!tmp.path().join("patches").join("0002-b.patch").exists());
+        assert!(tmp.path().join("patches").join("0002-c.patch").is_file());
     }
 }

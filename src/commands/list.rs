@@ -5,13 +5,16 @@ use crate::cli::ListArgs;
 use crate::commands::{Ctx, Exit, emit_json};
 use crate::invocation::skot_args;
 use crate::report;
+use crate::series::Entry;
 
 pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
     let (_config, series) = ctx.project()?;
+    let entries = series.entries_lenient(&ctx.layout);
+    let disabled = series.disabled_lines(&ctx.layout);
 
-    if series.is_empty() {
+    if entries.is_empty() && disabled.is_empty() {
         if crate::ui::is_json() {
-            emit_json(&serde_json::json!({ "patches": [] }))?;
+            emit_json(&serde_json::json!({ "patches": [], "disabled": [] }))?;
             return Ok(Exit::Success);
         }
         warn!(
@@ -23,7 +26,6 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
         return Ok(Exit::Success);
     }
 
-    let entries = series.entries_lenient(&ctx.layout);
     let missing: Vec<&str> = entries
         .iter()
         .filter(|e| !e.path.is_file())
@@ -47,6 +49,10 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
                     "applied": applied.contains(&e.name),
                 }))
                 .collect::<Vec<_>>(),
+            "disabled": disabled
+                .iter()
+                .map(|(line, name)| serde_json::json!({ "name": name, "line": line }))
+                .collect::<Vec<_>>(),
             "missing": missing,
             "applied": applied,
         }))?;
@@ -57,28 +63,63 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
         });
     }
 
-    report::section(&format!("series ({} patches)", entries.len()));
-    for (i, entry) in entries.iter().enumerate() {
-        // `[!]` (not on disk) outranks `[x]`: the pair `[x]`/`[ ]` is what makes a hole in
-        // the applied set visible at a glance.
-        let mark = if !entry.path.is_file() {
-            report::bad("[!]").to_string()
-        } else if applied.contains(&entry.name) {
-            "[x]".to_string()
-        } else {
-            "[ ]".to_string()
-        };
-        report::item(&format!("{:>3}  {mark} {}", i + 1, entry.name));
-        if args.paths && entry.path.is_file() {
-            report::item(&format!(
-                "      {}",
-                report::muted(&entry.path.display().to_string())
-            ));
+    let heading = if disabled.is_empty() {
+        format!("series ({} patches)", entries.len())
+    } else {
+        format!(
+            "series ({} patches, {} disabled)",
+            entries.len(),
+            disabled.len()
+        )
+    };
+    report::section(&heading);
+
+    // Enabled and disabled rows in one walk, in file order: the disabled line sits
+    // where the file puts it, so the listing is the series file made readable.
+    type Disabled<'a> = (usize, String);
+    let mut rows: Vec<(usize, Option<&Entry>, Option<&Disabled<'_>>)> =
+        entries.iter().map(|e| (e.line, Some(e), None)).collect();
+    rows.extend(disabled.iter().map(|d| (d.0, None, Some(d))));
+    rows.sort_by_key(|(line, _, _)| *line);
+
+    let mut position = 0usize;
+    for (_, entry, off) in rows {
+        if let Some(entry) = entry {
+            position += 1;
+            // `[!]` (not on disk) outranks `[x]`: the pair `[x]`/`[ ]` is what makes a hole
+            // in the applied set visible at a glance. Only a patch the sandbox is holding
+            // gets the green name; the rest are plain.
+            let applied_now = entry.path.is_file() && applied.contains(&entry.name);
+            let mark = if !entry.path.is_file() {
+                report::bad("[!]").to_string()
+            } else if applied_now {
+                "[x]".to_string()
+            } else {
+                "[ ]".to_string()
+            };
+            let name = if applied_now {
+                report::ok(&entry.name).to_string()
+            } else {
+                entry.name.clone()
+            };
+            report::item(&format!("{position:>3}  {mark} {name}"));
+            if args.paths && entry.path.is_file() {
+                report::item(&format!(
+                    "      {}",
+                    report::muted(&entry.path.display().to_string())
+                ));
+            }
+        } else if let Some((_, name)) = off {
+            report::item(&report::muted(&format!("       # {name}")));
         }
     }
 
     if !missing.is_empty() {
-        warn!(target: "list", "{} patch file(s) listed but not on disk:", missing.len());
+        warn!(
+            target: "list",
+            "{} patch file(s) listed but not on disk:",
+            missing.len()
+        );
         for name in &missing {
             report::line(&report::bad(name));
         }

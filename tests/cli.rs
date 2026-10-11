@@ -120,6 +120,45 @@ fn apply_json_is_a_single_document() {
     assert_eq!(sandbox_text(&layout), "first\n");
 }
 
+/// The enabled set lives in the series file, so `disable`/`enable` steer what `apply`
+/// lands, and the whole flow is scriptable: named patches, `--json`, no picker.
+#[test]
+fn enable_and_disable_steer_what_apply_lands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = bare_project(tmp.path());
+    write_series(&layout, "0001-a.patch", patch_one());
+    std::fs::write(
+        layout.patches_dir().join("0002-b.patch"),
+        "diff --git a/f.txt b/f.txt\nindex 3333333..4444444 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,1 @@\n-first\n+second\n",
+    )
+    .unwrap();
+    std::fs::write(layout.series_file(), "0001-a.patch\n0002-b.patch\n").unwrap();
+
+    // Disable the second patch: its line is commented out, and apply leaves it out.
+    let out = skot(tmp.path(), &["patch", "disable", "0002-b.patch", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(
+        std::fs::read_to_string(layout.series_file()).unwrap(),
+        "0001-a.patch\n# 0002-b.patch\n"
+    );
+
+    let out = skot(tmp.path(), &["patch", "apply", "main", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(sandbox_text(&layout), "first\n");
+
+    // Enable puts the line back; apply realizes the enabled set again.
+    let out = skot(tmp.path(), &["patch", "enable", "0002-b.patch", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(
+        std::fs::read_to_string(layout.series_file()).unwrap(),
+        "0001-a.patch\n0002-b.patch\n"
+    );
+
+    let out = skot(tmp.path(), &["patch", "apply", "main", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(sandbox_text(&layout), "second\n");
+}
+
 /// `patch move` reorders and renumbers, and under `--json` it still owes the caller exactly
 /// one document, with the positions it moved between.
 #[test]

@@ -10,6 +10,10 @@
 //! [`pop`](super::pop) is the same operation pointed the other way, so the reasoning (which
 //! patch the set moves to, and every case where the answer would be a guess) lives in
 //! [`authoring::resolve_stack`] rather than here.
+//!
+//! With no sandbox yet and nothing recorded as applied, `push` starts the sandbox the way
+//! `apply` does and lands the first patch: a directional apply can begin at the beginning.
+//! A recorded set with no sandbox under it is drift, and still points at `apply`.
 
 use anyhow::{Context, Result};
 use log::{debug, info};
@@ -106,17 +110,25 @@ pub fn run(ctx: &Ctx, arg: &PatchArg) -> Result<Exit> {
 /// Everything below [`run`] is this: no clap, no stdout, no verdict — a `&Layout` and a
 /// scalar in, a description of the outcome out.
 fn push(layout: &Layout, want: Option<&str>) -> Result<Pushed> {
-    // The sandbox first, then the ref, then the mirror. A stack operation on a sandbox that is
-    // not there has one clear remedy, and answering "which ref?" first would send the user
-    // looking in the wrong place.
-    drop(authoring::require_sandbox(layout)?);
-
+    // The sandbox first, then the ref, then the mirror. But "first" has two readings:
+    // a sandbox that should be there and is not (a recorded set with nothing under it)
+    // is drift with one remedy, `apply`, while no sandbox and nothing recorded is just
+    // a project that has not applied yet, and `push` is a directional apply, so it
+    // starts the sandbox the same way `apply` does rather than sending the user around
+    // the loop.
     let (config, series) = layout.project()?;
     let state = State::load(layout)?;
+    if !state.applied.is_empty() {
+        drop(authoring::require_sandbox(layout)?);
+    }
+
     let ref_name = authoring::stack_ref(layout, &state, &config)?;
 
     let lock = layout.lock()?;
-    let (_mirror, sha) = super::sync::resolve_in_mirror(layout, &ref_name)?;
+    let (mirror, sha) = super::sync::resolve_in_mirror(layout, &ref_name)?;
+    if !sandbox::is_repository(layout) {
+        sandbox::create(layout, &mirror)?;
+    }
 
     // The whole series already applied, and no patch named: the answer is negative, not
     // broken. Anything short of that (including a set with holes) falls through to
@@ -124,6 +136,7 @@ fn push(layout: &Layout, want: Option<&str>) -> Result<Pushed> {
     // no longer lists.
     let all = series.entries_lenient(layout);
     let whole_series = want.is_none()
+        && !state.applied.is_empty()
         && state.applied.len() == all.len()
         && state
             .applied
@@ -175,6 +188,35 @@ mod tests {
             applied: names.iter().map(|n| (*n).to_owned()).collect(),
             ..State::default()
         }
+    }
+
+    #[test]
+    fn a_serial_prefix_pushes_that_patch_and_everything_below() {
+        // The shared `[PATCH]` reading reaches `push` too: `0003` names the patch
+        // whose file starts with it, and the set below it comes with it.
+        let (_tmp, layout) = testsupport::project();
+        testsupport::write_series(
+            &layout,
+            &[
+                ("0001-a.patch", ""),
+                ("0002-b.patch", ""),
+                ("0003-c.patch", ""),
+            ],
+        );
+        let series = layout.project().unwrap().1;
+
+        let stack = authoring::resolve_stack(
+            &layout,
+            &series,
+            &State::default(),
+            Some("0003"),
+            Move::Deeper,
+        )
+        .unwrap();
+        assert_eq!(
+            stack.names,
+            vec!["0001-a.patch", "0002-b.patch", "0003-c.patch"]
+        );
     }
 
     #[test]
@@ -408,6 +450,34 @@ mod tests {
         .to_string();
         assert!(err.contains("0002-gone.patch"), "got {err}");
         assert!(err.contains("does not list"), "got {err}");
+    }
+
+    #[test]
+    fn push_from_nothing_starts_the_sandbox_and_lands_the_first_patch() {
+        // `push` is a directional apply, so a project that has not applied yet starts
+        // here: the sandbox is created the way `apply` creates it, and the first patch
+        // lands. The old behaviour was an error telling the user to run `apply`.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::mirror_with_one_commit(tmp.path());
+        testsupport::write_series(
+            &layout,
+            &[
+                ("0001-a.patch", testsupport::patch_one()),
+                ("0002-b.patch", testsupport::patch_two()),
+            ],
+        );
+        std::fs::write(
+            layout.config_file(),
+            "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
+        )
+        .unwrap();
+        assert!(!sandbox::is_repository(&layout), "starts without a sandbox");
+
+        let pushed = push(&layout, None).unwrap();
+
+        assert_eq!(pushed.added, Some("0001-a.patch".to_owned()));
+        assert_eq!(pushed.names, ["0001-a.patch"]);
+        assert!(sandbox::is_repository(&layout));
     }
 
     #[test]

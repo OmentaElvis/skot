@@ -8,8 +8,12 @@
 //!
 //! That is also why `pop` takes a patch *name*, cut quilt-style: popping 0002 takes 0002
 //! and everything enabled after it, since those stand on it. Turning exactly one patch off
-//! while keeping the set above it whole is a different question, and the interactive
-//! `skot patch apply` picker asks it. See [`authoring::resolve_stack`].
+//! while keeping the set above it whole is a different question; it is a matter of the
+//! enabled set, and [`super::disable`] answers it. See [`authoring::resolve_stack`].
+//!
+//! With no sandbox yet and nothing recorded as applied, `pop` reports the ordinary
+//! negative answer: there is nothing to pop. A recorded set with no sandbox under it is
+//! drift, and still points at `apply`.
 
 use anyhow::{Context, Result};
 use log::{debug, info};
@@ -89,14 +93,14 @@ pub fn run(ctx: &Ctx, arg: &PatchArg) -> Result<Exit> {
 /// Everything below [`run`] is this: no clap, no stdout, no verdict — a `&Layout` and a
 /// scalar in, a description of the outcome out.
 pub(super) fn pop(layout: &Layout, want: Option<&str>) -> Result<Popped> {
-    // The sandbox first, then the ref, then the mirror. A stack operation on a sandbox that is
-    // not there has one clear remedy, and answering "which ref?" first would send the user
-    // looking in the wrong place.
-    let repo = authoring::require_sandbox(layout)?;
-    drop(repo);
-
+    // Same as `push`: a recorded set with no sandbox under it is drift with one remedy,
+    // `apply`; no sandbox and nothing recorded is a project that has not applied yet,
+    // and with nothing applied `pop` owes the ordinary negative answer, not an error.
     let (config, series) = layout.project()?;
     let state = State::load(layout)?;
+    if !state.applied.is_empty() {
+        drop(authoring::require_sandbox(layout)?);
+    }
 
     // Which patch comes off: the named one, or the top of the stack — `None` when there
     // is no top to name.
@@ -108,14 +112,20 @@ pub(super) fn pop(layout: &Layout, want: Option<&str>) -> Result<Popped> {
     let ref_name = authoring::stack_ref(layout, &state, &config)?;
 
     let lock = layout.lock()?;
-    let (_mirror, sha) = super::sync::resolve_in_mirror(layout, &ref_name)?;
+    let (mirror, sha) = super::sync::resolve_in_mirror(layout, &ref_name)?;
 
     let Some(removed) = removed else {
         // No set to rebuild, so nothing is checked out: rebuilding an empty set
         // would reset the sandbox to the ref and take any local work with it. The
-        // report is still the ordinary one, `removed` null among the rest.
-        let tree =
-            sandbox::head_tree_oid(layout)?.context("the sandbox holds no tree to report")?;
+        // report is still the ordinary one, `removed` null among the rest. Without a
+        // sandbox to read a tree from, the base tree in the mirror is what an absent
+        // sandbox would be holding anyway.
+        let tree = if sandbox::is_repository(layout) {
+            sandbox::head_tree_oid(layout)?.context("the sandbox holds no tree to report")?
+        } else {
+            let oid = git2::Oid::from_str(sha.as_str())?;
+            mirror.repo().find_commit(oid)?.tree()?.id()
+        };
         drop(lock);
         return Ok(Popped {
             removed: None,
@@ -309,16 +319,45 @@ mod tests {
     }
 
     #[test]
-    fn pop_needs_a_sandbox() {
-        // Checked before the mirror: a missing sandbox has one clear remedy, and answering
-        // "no such ref" first would send the user looking in the wrong place.
+    fn pop_needs_a_sandbox_when_a_set_is_recorded() {
+        // A recorded set with no sandbox under it is drift, not a fresh project, and the
+        // remedy is still `apply`. Checked before the mirror: answering "no such ref"
+        // first would send the user looking in the wrong place.
         let (_tmp, layout) = testsupport::project();
+        let state = State {
+            ref_name: Some("main".to_owned()),
+            sha: None,
+            applied: vec!["0001-a.patch".to_owned()],
+            in_flight: None,
+            in_flight_command: None,
+        };
+        state.save(&layout).unwrap();
         let err = pop(&layout, None).unwrap_err().to_string();
         assert!(err.contains("no sandbox"), "got {err}");
         assert!(
             err.contains(&skot("apply")),
             "the remedy should be offered: {err}"
         );
+    }
+
+    #[test]
+    fn pop_with_no_sandbox_and_nothing_applied_is_the_ordinary_negative() {
+        // Nothing recorded and no sandbox is a project that has not applied yet, so
+        // `pop` owes the same answer it gives an empty stack: a report, no error.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, sha) = testsupport::mirror_with_one_commit(tmp.path());
+        std::fs::write(
+            layout.config_file(),
+            "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
+        )
+        .unwrap();
+
+        let popped = pop(&layout, None).unwrap();
+
+        assert_eq!(popped.removed, None);
+        assert!(popped.names.is_empty());
+        assert_eq!(popped.ref_name, "main");
+        assert_eq!(popped.sha.as_str(), sha);
     }
 
     #[test]

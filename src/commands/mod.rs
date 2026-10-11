@@ -9,7 +9,9 @@ mod authoring;
 mod build;
 mod check;
 mod clean;
+mod disable;
 mod drop;
+mod enable;
 mod hooks;
 mod import;
 mod init;
@@ -123,6 +125,8 @@ pub fn run(ctx: Ctx) -> Result<Exit> {
             PatchCommand::Push(args) => push::run(&ctx, args),
             PatchCommand::Pop(args) => pop::run(&ctx, args),
             PatchCommand::List(args) => list::run(&ctx, args),
+            PatchCommand::Enable(args) => enable::run(&ctx, args),
+            PatchCommand::Disable(args) => disable::run(&ctx, args),
             PatchCommand::Move(args) => r#move::run(&ctx, args),
             PatchCommand::Drop(args) => drop::run(&ctx, args),
         },

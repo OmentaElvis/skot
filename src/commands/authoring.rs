@@ -269,6 +269,77 @@ pub fn recorded_stack(
 /// The outcome is replayed in series order and checked out, so a hole in the middle only
 /// ever fails when the patches genuinely do not apply without it. That is the lesson
 /// the failure teaches, not a reason to refuse the set.
+/// How a `[PATCH]` argument resolved: to a patch's name, or to a 1-based position
+/// among the enabled patches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatchRef {
+    /// An exact name, or a unique prefix of one, such as the serial `0003`.
+    Name(String),
+    /// A 1-based position among the enabled patches. Disabled lines hold no number.
+    Position(usize),
+}
+
+impl PatchRef {
+    /// The patch's name: itself, or the enabled entry the position points at.
+    pub fn name(self, enabled: &[&str]) -> String {
+        match self {
+            PatchRef::Name(name) => name,
+            PatchRef::Position(position) => enabled[position - 1].to_owned(),
+        }
+    }
+}
+
+/// Resolve a patch reference the way every `[PATCH]` argument reads one.
+///
+/// An exact name wins, then a unique name prefix such as the serial `0003` (the digits
+/// `ls` shows), then a 1-based position among the enabled patches. `all` is every name
+/// in the series, enabled or not, so a disabled patch can still be named; `enabled` is
+/// the position space, since a disabled line holds no number.
+pub fn resolve_patch(all: &[&str], enabled: &[&str], want: &str) -> Result<PatchRef> {
+    if all.contains(&want) {
+        return Ok(PatchRef::Name(want.to_owned()));
+    }
+    let matches: Vec<&str> = all
+        .iter()
+        .copied()
+        .filter(|n| n.starts_with(want))
+        .collect();
+    match matches.as_slice() {
+        [one] => return Ok(PatchRef::Name((*one).to_owned())),
+        [] => {}
+        many => bail!(
+            "`{want}` matches more than one patch: {}.\nName one in full.",
+            many.join(", ")
+        ),
+    }
+    if let Ok(position) = want.parse::<usize>() {
+        if position == 0 {
+            bail!("positions are 1-based: 1 is the front of the series");
+        }
+        if position > enabled.len() {
+            bail!(
+                "the series holds {} patches, so position {position} does not exist. \
+                 Patches in it: {}",
+                enabled.len(),
+                if enabled.is_empty() {
+                    "(none)".to_owned()
+                } else {
+                    enabled.join(", ")
+                }
+            );
+        }
+        return Ok(PatchRef::Position(position));
+    }
+    bail!(
+        "`{want}` is not in the series. Patches in it: {}",
+        if all.is_empty() {
+            "(none)".to_owned()
+        } else {
+            all.join(", ")
+        }
+    )
+}
+
 pub fn resolve_stack(
     layout: &Layout,
     series: &crate::series::Series,
@@ -286,8 +357,24 @@ pub fn resolve_stack(
     let top = on.iter().rposition(|&b| b);
 
     match want {
-        Some(name) => {
+        Some(want) => {
+            // The reference can be a name, a prefix or a position; a disabled patch
+            // resolves too, and lands in the refusal below rather than in a series
+            // the sandbox would disagree with.
+            let names: Vec<&str> = all.iter().map(|e| e.name.as_str()).collect();
+            let disabled: Vec<String> = series.disabled(layout);
+            let mut universe: Vec<&str> = names.clone();
+            universe.extend(disabled.iter().map(String::as_str));
+            let name = resolve_patch(&universe, &names, want)?.name(&names);
+
             let Some(position) = all.iter().position(|e| e.name == name) else {
+                if disabled.iter().any(|d| d == &name) {
+                    bail!(
+                        "`{name}` is disabled, so it is not part of what applies.\n`{}` \
+                         puts it back in.",
+                        skot_args("enable", &name)
+                    );
+                }
                 let known: Vec<&str> = all.iter().map(|e| e.name.as_str()).collect();
                 bail!(
                     "`{name}` is not in the series. Patches in it: {}",
@@ -398,6 +485,74 @@ pub fn land(layout: &Layout, ref_name: &str, base: &Sha, stack: &Stack) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const THREE: [&str; 3] = ["0001-a.patch", "0002-b.patch", "0003-c.patch"];
+
+    #[test]
+    fn an_exact_name_resolves_to_itself() {
+        let got = resolve_patch(&THREE, &THREE, "0002-b.patch").unwrap();
+        assert_eq!(got, PatchRef::Name("0002-b.patch".to_owned()));
+    }
+
+    #[test]
+    fn a_serial_prefix_resolves_to_its_patch() {
+        // The digits `ls` show, without the full name: `0003` is the patch, not
+        // position 3. They usually agree; after a reorder they do not.
+        let got = resolve_patch(&THREE, &THREE, "0003").unwrap();
+        assert_eq!(got, PatchRef::Name("0003-c.patch".to_owned()));
+    }
+
+    #[test]
+    fn a_bare_number_is_a_position_among_the_enabled() {
+        let got = resolve_patch(&THREE, &THREE, "2").unwrap();
+        assert_eq!(got, PatchRef::Position(2));
+        assert_eq!(got.name(&THREE), "0002-b.patch");
+    }
+
+    #[test]
+    fn a_prefix_matching_more_than_one_patch_is_refused_with_the_candidates() {
+        let err = resolve_patch(&THREE, &THREE, "000")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than one"), "{err}");
+        assert!(err.contains("0001-a.patch"), "{err}");
+        assert!(err.contains("0003-c.patch"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_position_is_refused_as_not_one_based() {
+        // With serial-shaped names `0` would be a prefix of everything and refused as
+        // ambiguous; a series without them still has to refuse the zero position.
+        let plain = ["a.patch", "b.patch"];
+        let err = resolve_patch(&plain, &plain, "0").unwrap_err().to_string();
+        assert!(err.contains("1-based"), "{err}");
+    }
+
+    #[test]
+    fn a_position_past_the_enabled_set_lists_what_is_there() {
+        let err = resolve_patch(&THREE, &THREE, "4").unwrap_err().to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        assert!(err.contains("0003-c.patch"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_reference_lists_every_name_including_the_disabled() {
+        let all = ["0001-a.patch", "0002-b.patch", "0003-c.patch"];
+        let enabled = ["0001-a.patch", "0003-c.patch"];
+        let err = resolve_patch(&all, &enabled, "nope.patch")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not in the series"), "{err}");
+        assert!(err.contains("0002-b.patch"), "{err}");
+    }
+
+    #[test]
+    fn a_disabled_patch_can_still_be_named() {
+        let all = ["0001-a.patch", "0002-b.patch", "0003-c.patch"];
+        let enabled = ["0001-a.patch", "0003-c.patch"];
+        let got = resolve_patch(&all, &enabled, "0002").unwrap();
+        assert_eq!(got, PatchRef::Name("0002-b.patch".to_owned()));
+    }
 
     #[test]
     fn recorded_stack_is_the_recorded_set_not_a_prefix() {

@@ -1,13 +1,12 @@
-//! `patch apply`: put patches into the sandbox, in order.
+//! `patch apply`: realize the enabled series in the sandbox.
 //!
 //! The sandbox is a linked worktree of the mirror, so applying is three libgit2 calls:
-//! reset the worktree to the base commit, replay the chosen patches into a tree, check that
-//! tree out. An interactive session chooses which patches first (Enter on the default is the
-//! whole series); every non-interactive run is asked no question and gets the whole series.
+//! reset the worktree to the base commit, replay the enabled patches into a tree, check
+//! that tree out. Every run is asked no question and gets the same answer: the enabled
+//! set, in series order. Choosing the set is `skot patch enable` and `skot patch
+//! disable`, whose line-commented record in the series file is what this command reads.
 //! Nothing about the patch format is handled here; that is `check`'s job, shared with
 //! this command so the two can never disagree about whether the series applies.
-
-use std::io::IsTerminal as _;
 
 use anyhow::{Context, Result, bail};
 use log::{debug, error, info};
@@ -43,30 +42,11 @@ pub struct Applied {
     pub sha: String,
 }
 
-/// Reset the sandbox to `ref` and replay the chosen patches into it.
+/// Reset the sandbox to `ref` and replay the enabled series into it.
 pub fn run(ctx: &Ctx, args: &RefArg) -> Result<Exit> {
-    // The question "which patches?" is asked before the lock is taken and before anything
-    // is reset: a prompt sitting on the sandbox lock is one the user can walk away from
-    // mid-answer. `--json` and any non-interactive stdin are asked no question and get the
-    // whole series, exactly as they always have.
-    let picked: Option<Vec<String>> = if ctx.cli.json || !std::io::stdin().is_terminal() {
-        None
-    } else {
-        match pick_set(ctx)? {
-            Pick::Whole => None,
-            Pick::Set(names) => Some(names),
-        }
-    };
-    let chosen = picked.is_some();
-
     // The sandbox is mutated, so concurrent runs must not both be resetting it.
     let lock = ctx.lock()?;
-    let outcome = apply_inner(
-        &ctx.layout,
-        args.ref_name.as_deref(),
-        false,
-        picked.as_deref(),
-    );
+    let outcome = apply_inner(&ctx.layout, args.ref_name.as_deref(), false, None);
     drop(lock);
     let applied = outcome?;
 
@@ -76,19 +56,11 @@ pub fn run(ctx: &Ctx, args: &RefArg) -> Result<Exit> {
         if applied.report.patch_count == 0 {
             // The sandbox was still reset to the ref: the honest answer is what the head
             // holds, the way `pop` reports an empty stack, rather than "applied 0".
-            if chosen {
-                info!(
-                    target: "apply",
-                    "nothing selected; the sandbox is on {} ({}), holding upstream only.",
-                    applied.ref_name, applied.sha
-                );
-            } else {
-                info!(
-                    target: "apply",
-                    "the series is empty; the sandbox is on {} ({}), holding upstream only.",
-                    applied.ref_name, applied.sha
-                );
-            }
+            info!(
+                target: "apply",
+                "the enabled set is empty; the sandbox is on {} ({}), holding upstream only.",
+                applied.ref_name, applied.sha
+            );
         } else {
             info!(
                 target: "apply",
@@ -101,11 +73,7 @@ pub fn run(ctx: &Ctx, args: &RefArg) -> Result<Exit> {
             for name in &applied.report.patches {
                 debug!(target: "apply", "  {}", name.name);
             }
-            if chosen {
-                info!(target: "apply", "The sandbox now holds what you selected.");
-            } else {
-                info!(target: "apply", "The sandbox now holds your series.");
-            }
+            info!(target: "apply", "The sandbox now holds your enabled set.");
         }
         Hints::new("next")
             .entry(skot("build"), "run your hooks from here")
@@ -119,54 +87,6 @@ pub fn run(ctx: &Ctx, args: &RefArg) -> Result<Exit> {
     } else {
         Exit::Failure
     })
-}
-
-/// What an interactive session answered about *which* patches.
-#[derive(Debug)]
-enum Pick {
-    /// The default untouched (or an empty series): the whole series, as a script gets.
-    Whole,
-    /// A selection; empty means "reset to the ref with nothing on it".
-    Set(Vec<String>),
-}
-
-/// Ask an interactive session which patches to apply.
-///
-/// The boxes start as what the sandbox already holds, or as everything when it holds
-/// nothing, so Enter twice means "apply" and not "apply some clever subset". Selecting
-/// every patch is indistinguishable from that default and takes the ordinary path, and
-/// declining the prompt (Esc, Ctrl-C) propagates the same way every other prompt in the
-/// tool does.
-fn pick_set(ctx: &Ctx) -> Result<Pick> {
-    let (_config, series) = ctx.layout.project()?;
-    let entries = series.entries_lenient(&ctx.layout);
-    if entries.is_empty() {
-        return Ok(Pick::Whole);
-    }
-    let state = crate::state::State::load(&ctx.layout).unwrap_or_default();
-    let options: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
-    let checked: Vec<usize> = if state.applied.is_empty() {
-        (0..options.len()).collect()
-    } else {
-        options
-            .iter()
-            .enumerate()
-            .filter(|(_, name)| state.applied.contains(name))
-            .map(|(i, _)| i)
-            .collect()
-    };
-
-    let chosen = inquire::MultiSelect::new("Which patches to apply", options.clone())
-        .with_default(&checked)
-        .with_help_message("Space toggles; Enter applies the selection.")
-        .prompt()
-        .context("asking which patches to apply")?;
-
-    if chosen.len() == options.len() {
-        Ok(Pick::Whole)
-    } else {
-        Ok(Pick::Set(chosen))
-    }
 }
 
 /// Apply the series as plain work: no lock, no narration, no JSON, no verdict.

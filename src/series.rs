@@ -164,6 +164,101 @@ impl Series {
         self.len() == 0
     }
 
+    /// The disabled patches: comment lines of the exact form `# <name>` whose file
+    /// still exists in `patches/`.
+    ///
+    /// The file-existence check is what keeps prose out: a comment that merely mentions
+    /// a patch ("# fix this one someday") is not the bare name of a file that is there,
+    /// so it can never be enabled by accident.
+    pub fn disabled(&self, layout: &Layout) -> Vec<String> {
+        self.disabled_lines(layout)
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect()
+    }
+
+    /// The disabled patches with their 1-based line numbers, so a listing can put them
+    /// back where they sit in the file.
+    pub fn disabled_lines(&self, layout: &Layout) -> Vec<(usize, String)> {
+        self.lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| {
+                if l.entry.is_some() {
+                    return None;
+                }
+                let rest = l.raw.trim_start().strip_prefix('#')?.trim();
+                resolve(layout, rest)
+                    .is_file()
+                    .then(|| (i + 1, rest.to_owned()))
+            })
+            .collect()
+    }
+
+    /// Comment an entry's line out: enabled to disabled, in place. Returns false when
+    /// the name is not an entry (already disabled, or never listed).
+    pub fn disable(&mut self, name: &str) -> bool {
+        let Some(line) = self
+            .lines
+            .iter_mut()
+            .find(|l| l.entry.as_deref() == Some(name))
+        else {
+            return false;
+        };
+        line.entry = None;
+        line.raw = format!("# {name}");
+        true
+    }
+
+    /// Uncomment a disabled line: disabled to enabled, in place. Returns false when the
+    /// name is not a disabled line or its file is gone.
+    pub fn enable(&mut self, layout: &Layout, name: &str) -> bool {
+        if !resolve(layout, name).is_file() {
+            return false;
+        }
+        let Some(line) = self.lines.iter_mut().find(|l| {
+            l.entry.is_none() && l.raw.trim_start().strip_prefix('#').map(str::trim) == Some(name)
+        }) else {
+            return false;
+        };
+        line.entry = Some(name.to_owned());
+        line.raw = name.to_owned();
+        true
+    }
+
+    /// Remove a disabled line entirely. No renumbering: a disabled patch never held a
+    /// number. Returns false when the name is not a disabled line.
+    pub fn remove_disabled(&mut self, name: &str) -> bool {
+        let Some(index) = self.lines.iter().position(|l| {
+            l.entry.is_none() && l.raw.trim_start().strip_prefix('#').map(str::trim) == Some(name)
+        }) else {
+            return false;
+        };
+        self.lines.remove(index);
+        true
+    }
+
+    /// Remove a disabled patch: its commented line and its file. The caller saves.
+    pub fn drop_disabled(&mut self, layout: &Layout, name: &str) -> Option<FileGone> {
+        if !self.remove_disabled(name) {
+            return None;
+        }
+        let path = resolve(layout, name);
+        Some(match layout.guarded_remove(&path) {
+            Ok(true) => FileGone::Deleted,
+            Ok(false) => FileGone::Missing,
+            Err(_) => FileGone::Kept(path),
+        })
+    }
+
+    /// True when the name is a comment line of the disabled-patch form, file or not:
+    /// [`Series::disable`]'s write, recognisable even after a delete takes the file away.
+    pub fn has_disabled_line(&self, name: &str) -> bool {
+        self.lines.iter().any(|l| {
+            l.entry.is_none() && l.raw.trim_start().strip_prefix('#').map(str::trim) == Some(name)
+        })
+    }
+
     /// Insert `name` at `index`, 0-based, and renumber everything after it so the numbers
     /// stay contiguous: lexical order *is* application order, and an insertion renames the
     /// tail rather than leaving a gap where the numbers from `index` onwards used to sit
@@ -848,6 +943,80 @@ mod tests {
         );
         assert!(layout.patches_dir().join("0005-f.patch").exists());
         assert!(!layout.patches_dir().join("0003-b.patch").exists());
+        drop(tmp);
+    }
+
+    #[test]
+    fn disabling_comments_the_line_out_and_enabling_puts_it_back() {
+        let (tmp, layout) = layout();
+        for name in ["0001-a.patch", "0002-b.patch", "0003-c.patch"] {
+            std::fs::write(layout.patches_dir().join(name), "x\n").unwrap();
+        }
+        let mut series = Series::parse(
+            &layout.series_file(),
+            "0001-a.patch\n0002-b.patch\n0003-c.patch\n",
+        );
+
+        assert!(series.disable("0002-b.patch"));
+        assert_eq!(
+            series.render(),
+            "0001-a.patch\n# 0002-b.patch\n0003-c.patch\n"
+        );
+        assert_eq!(series.names(), vec!["0001-a.patch", "0003-c.patch"]);
+        assert_eq!(series.disabled(&layout), ["0002-b.patch"]);
+
+        assert!(series.enable(&layout, "0002-b.patch"));
+        assert_eq!(
+            series.render(),
+            "0001-a.patch\n0002-b.patch\n0003-c.patch\n",
+            "the line comes back exactly as it was"
+        );
+        assert!(series.disabled(&layout).is_empty());
+        drop(tmp);
+    }
+
+    #[test]
+    fn a_prose_comment_is_not_a_disabled_patch() {
+        let (tmp, layout) = layout();
+        std::fs::write(layout.patches_dir().join("0001-a.patch"), "x\n").unwrap();
+        let mut series = Series::parse(
+            &layout.series_file(),
+            "# someday, fix 0001-a.patch properly\n0001-a.patch\n#0001-a.patch\n",
+        );
+
+        // The prose comment names a real file but is not the bare name, so it is not
+        // offered and not touched; the exact `#0001-a.patch` line below is.
+        assert_eq!(series.disabled(&layout), ["0001-a.patch"]);
+        assert!(series.disable("0001-a.patch"));
+        assert_eq!(
+            series.render(),
+            "# someday, fix 0001-a.patch properly\n# 0001-a.patch\n#0001-a.patch\n"
+        );
+        drop(tmp);
+    }
+
+    #[test]
+    fn enabling_a_patch_whose_file_is_gone_is_refused() {
+        let (tmp, layout) = layout();
+        let mut series = Series::parse(&layout.series_file(), "# 0009-ghost.patch\n");
+
+        assert!(!series.enable(&layout, "0009-ghost.patch"));
+        assert!(series.disabled(&layout).is_empty(), "nothing to offer");
+        drop(tmp);
+    }
+
+    #[test]
+    fn removing_a_disabled_line_takes_the_line_and_nothing_else() {
+        let (tmp, layout) = layout();
+        std::fs::write(layout.patches_dir().join("0001-a.patch"), "x\n").unwrap();
+        let mut series = Series::parse(
+            &layout.series_file(),
+            "# a note kept verbatim\n0001-a.patch\n# 0002-b.patch\n",
+        );
+
+        assert!(series.remove_disabled("0002-b.patch"));
+        assert_eq!(series.render(), "# a note kept verbatim\n0001-a.patch\n");
+        assert!(!series.remove_disabled("nope.patch"));
         drop(tmp);
     }
 

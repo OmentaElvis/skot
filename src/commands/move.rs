@@ -19,6 +19,7 @@ use log::{debug, info};
 use serde_json::json;
 
 use crate::cli::MoveArgs;
+use crate::commands::authoring;
 use crate::commands::{Ctx, Exit, emit_json};
 use crate::hints::Hints;
 use crate::invocation::{skot, skot_args};
@@ -67,7 +68,10 @@ pub fn run(ctx: &Ctx, args: &MoveArgs) -> Result<Exit> {
             skot_args("move", "<patch> --to <patch|N>")
         ),
     };
-    let from = resolve_position(&names, &want)?;
+    let disabled = series.disabled(&ctx.layout);
+    let mut universe: Vec<&str> = names.iter().map(String::as_str).collect();
+    universe.extend(disabled.iter().map(String::as_str));
+    let from = resolve_position(&names, &universe, &want)?;
     let name = names[from].clone();
 
     let to = match &args.to {
@@ -156,34 +160,22 @@ fn relocate(layout: &Layout, name: &str, to: usize) -> Result<Moved> {
     })
 }
 
-/// Resolve a patch name or a 1-based position to a 0-based index.
-fn resolve_position(names: &[String], want: &str) -> Result<usize> {
-    if let Some(index) = names.iter().position(|n| n == want) {
-        return Ok(index);
-    }
-    if let Ok(position) = want.parse::<usize>() {
-        if position == 0 {
-            bail!(
-                "positions are 1-based: `{}` is the front of the series",
-                skot_args("move", "1")
-            );
-        }
-        if position > names.len() {
-            bail!(
-                "the series holds {}, so position {position} does not exist. Patches in it: {}",
-                super::push::count(names.len(), "patch", "patches"),
-                names.join(", ")
-            );
-        }
-        return Ok(position - 1);
-    }
-    bail!(
-        "`{want}` is not in the series. Patches in it: {}",
-        names.join(", ")
-    )
+/// Resolve a patch reference to a 0-based index among the enabled patches: the same
+/// name, prefix or position reading every `[PATCH]` argument shares. A disabled patch
+/// can still be named, and is refused with the command that puts it back.
+fn resolve_position(names: &[String], all: &[&str], want: &str) -> Result<usize> {
+    let enabled: Vec<&str> = names.iter().map(String::as_str).collect();
+    let name = authoring::resolve_patch(all, &enabled, want)?.name(&enabled);
+    names.iter().position(|n| *n == name).with_context(|| {
+        format!(
+            "`{name}` is disabled, so it has no position to move.\n`{}` puts it back in.",
+            skot_args("enable", &name)
+        )
+    })
 }
 
-/// Resolve `--to`: a 1-based final position, or the name of a patch to land before.
+/// Resolve `--to`: a 1-based final position, or the name (or prefix) of an enabled
+/// patch to land before.
 fn resolve_destination(names: &[String], at: &str, moving: &str) -> Result<usize> {
     if let Ok(position) = at.parse::<usize>() {
         if position == 0 {
@@ -205,13 +197,12 @@ fn resolve_destination(names: &[String], at: &str, moving: &str) -> Result<usize
             skot("list")
         );
     }
-    if let Some(index) = names.iter().position(|n| n == at) {
-        return Ok(index);
-    }
-    bail!(
-        "`{at}` is not in the series. Patches in it: {}",
-        names.join(", ")
-    )
+    let enabled: Vec<&str> = names.iter().map(String::as_str).collect();
+    let name = authoring::resolve_patch(&enabled, &enabled, at)?.name(&enabled);
+    Ok(names
+        .iter()
+        .position(|n| *n == name)
+        .expect("resolved name is enabled"))
 }
 
 /// Ask an interactive session which patch to move. Only unapplied patches are offered:

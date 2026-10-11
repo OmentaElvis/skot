@@ -101,7 +101,7 @@ pub enum PatchCommand {
     /// Re-export your edits to the patch file.
     Refresh(RefreshArgs),
 
-    /// Apply the whole series to the sandbox, or pick patches interactively.
+    /// Apply the enabled set to the sandbox; choose it with enable and disable.
     Apply(RefArg),
 
     /// Remove the whole series from the sandbox.
@@ -117,13 +117,19 @@ pub enum PatchCommand {
     #[command(visible_alias = "ls")]
     List(ListArgs),
 
-    /// Move a patch to a different position in the series.
+    /// Include a patch when applying (picker if none named).
+    Enable(EnableArgs),
+
+    /// Skip a patch when applying (picker if none named).
+    Disable(DisableArgs),
+
+    /// Move a patch to a different position in the series (alias: mv).
     ///
     /// With no arguments, the patch and its destination are picked from a list.
     #[command(visible_alias = "mv")]
     Move(MoveArgs),
 
-    /// Take a patch out of the series: its line and its file.
+    /// Take a patch out of the series: its line and its file (alias: rm).
     ///
     /// Asks before deleting; `--yes` says so in advance.
     #[command(visible_alias = "rm")]
@@ -157,8 +163,9 @@ const ROOT_GROUPS: &[(&str, &[&str])] = &[
 /// `skot patch --help`'s groups, same shape as [`ROOT_GROUPS`].
 const PATCH_GROUPS: &[(&str, &[&str])] = &[
     ("Author", &["new", "import", "refresh"]),
+    ("Arrange", &["enable", "disable", "move", "drop"]),
     ("Apply", &["apply", "unapply", "push", "pop"]),
-    ("Inspect and edit", &["list", "move", "drop"]),
+    ("Inspect", &["list"]),
 ];
 
 /// clap's own description of its `help` subcommand, appended after the groups. The test
@@ -231,6 +238,9 @@ fn grouped_list(cmd: &clap::Command, groups: &[(&str, &[&str])]) -> StyledStr {
             row(&mut out, cmd, name, width);
         }
     }
+    // A gap, so `help` does not read as the last row of the last group: it is clap's
+    // escape hatch, not a command of ours.
+    out.push_str("\n");
     push_row(&mut out, "help", HELP_ABOUT, width);
     out
 }
@@ -419,7 +429,8 @@ pub struct SyncArgs {
 /// what anyone typing that meant.
 #[derive(Debug, Clone, Default, Args)]
 pub struct PatchArg {
-    /// Patch in the series. Defaults to the one on top of the stack.
+    /// Patch in the series: its name, a unique prefix such as the serial `0003`, or its
+    /// 1-based position. Defaults to the one on top of the stack.
     #[arg(value_name = "PATCH")]
     pub patch: Option<String>,
 }
@@ -491,21 +502,47 @@ pub struct RefreshArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct DropArgs {
-    /// Patch to drop: its name in the series, or its 1-based position. Refused while
-    /// it is applied; `skot patch pop` takes it off first.
+    /// Patch to drop: its name, a unique prefix such as the serial `0003`, or its
+    /// 1-based position. Refused while it is applied; `skot patch pop` takes it off first.
     #[arg(value_name = "PATCH")]
     pub patch: String,
 }
 
 #[derive(Debug, Clone, Args)]
+pub struct EnableArgs {
+    /// Patches to put back in the applying set: names, unique prefixes such as the
+    /// serial `0003`, or 1-based positions among the enabled. Left out, picked from a
+    /// list of the disabled ones; `--all` takes every disabled patch.
+    #[arg(value_name = "PATCH")]
+    pub patches: Vec<String>,
+    /// Every disabled patch.
+    #[arg(long, conflicts_with = "patches")]
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DisableArgs {
+    /// Patches to skip from now on: names, unique prefixes such as the serial `0003`,
+    /// or 1-based positions among the enabled. Left out, picked from a list of the
+    /// enabled, not-yet-applied ones; `--all` takes every one that can go. The line is
+    /// commented out in the series, so the choice is trackable and lasts.
+    #[arg(value_name = "PATCH")]
+    pub patches: Vec<String>,
+    /// Every enabled patch the sandbox is not holding.
+    #[arg(long, conflicts_with = "patches")]
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct MoveArgs {
-    /// Patch to move: its name in the series, or its 1-based position. Left out, it is
-    /// picked from a list; a patch that is applied cannot move.
+    /// Patch to move: its name, a unique prefix such as the serial `0003`, or its
+    /// 1-based position. Left out, it is picked from a list; a patch that is applied
+    /// cannot move.
     #[arg(value_name = "PATCH")]
     pub patch: Option<String>,
 
-    /// Where the patch should end up: a 1-based position, or an existing patch name to
-    /// land before. Left out, the new position is asked for.
+    /// Where the patch should end up: a 1-based position, or an existing patch to land
+    /// before (by name or prefix). Left out, the new position is asked for.
     #[arg(long, value_name = "PATCH|N")]
     pub to: Option<String>,
 }
@@ -800,7 +837,7 @@ mod tests {
 
         let patch = cmd.find_subcommand_mut("patch").unwrap();
         let patch_help = patch.render_help().ansi().to_string();
-        for heading in ["Author:", "Apply:", "Inspect and edit:", "Options:"] {
+        for heading in ["Author:", "Arrange:", "Apply:", "Inspect:", "Options:"] {
             assert!(
                 patch_help.contains(&format!(
                     "{}{heading}{}",
@@ -835,6 +872,36 @@ mod tests {
         assert!(matches!(cli.command, Command::Patch(PatchCommand::Drop(_))));
         let cli = Cli::try_parse_from(["skot", "patch", "move", "2", "--to", "1"]).unwrap();
         assert!(matches!(cli.command, Command::Patch(PatchCommand::Move(_))));
+        let cli = Cli::try_parse_from(["skot", "patch", "mv", "2", "--to", "1"]).unwrap();
+        assert!(matches!(cli.command, Command::Patch(PatchCommand::Move(_))));
+        let cli = Cli::try_parse_from(["skot", "patch", "rm", "1"]).unwrap();
+        assert!(matches!(cli.command, Command::Patch(PatchCommand::Drop(_))));
+        let cli = Cli::try_parse_from(["skot", "patch", "enable", "1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Patch(PatchCommand::Enable(_))
+        ));
+        let cli = Cli::try_parse_from(["skot", "patch", "disable", "1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Patch(PatchCommand::Disable(_))
+        ));
+        // Both ends of the batch interface: several patches in one run, or `--all`.
+        let cli = Cli::try_parse_from(["skot", "patch", "enable", "0003", "0005"]).unwrap();
+        let Command::Patch(PatchCommand::Enable(args)) = cli.command else {
+            panic!("expected enable");
+        };
+        assert_eq!(args.patches, ["0003", "0005"]);
+        let cli = Cli::try_parse_from(["skot", "patch", "disable", "--all"]).unwrap();
+        let Command::Patch(PatchCommand::Disable(args)) = cli.command else {
+            panic!("expected disable");
+        };
+        assert!(args.all);
+        assert!(args.patches.is_empty());
+        assert!(
+            Cli::try_parse_from(["skot", "patch", "enable", "0003", "--all"]).is_err(),
+            "--all and names are two different questions"
+        );
     }
 
     /// Every name in the tables exists in the tree, appears once across the tables,
