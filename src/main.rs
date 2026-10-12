@@ -14,7 +14,7 @@ fn main() -> ExitCode {
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     ui::set_json(cli.json);
     hints::set_enabled(!cli.no_hints);
-    ui::install_logger(cli.json);
+    ui::install_logger(cli.json, cli.verbose);
 
     // The one place a command's verdict becomes a process status. `Err` is a
     // malfunction and says so on stderr; `Exit` is a command that ran and answered.

@@ -44,7 +44,7 @@ pub struct Cli {
     #[arg(long, short = 'y', global = true)]
     pub yes: bool,
 
-    /// More detail. Repeat for more.
+    /// More detail: `-v` debug, `-vv` trace. Repeat for more.
     #[arg(long, short = 'v', global = true, action = ArgAction::Count)]
     pub verbose: u8,
 

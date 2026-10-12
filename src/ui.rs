@@ -46,12 +46,22 @@ pub fn stderr_is_terminal() -> bool {
 
 /// Install the process logger.
 ///
-/// Under `--json` the filter is `off` rather than merely quieter, because stdout is carrying
-/// a document and any diagnostic line beside it would corrupt a parser.
-pub fn install_logger(json: bool) {
+/// `RUST_LOG` still wins when set. Otherwise `-v` picks the default: `-v` is `debug`, `-vv`
+/// and beyond is `trace`, and without it a run is `info` -- or `off` under `--json`, because
+/// stdout is carrying a document and any diagnostic line beside it would corrupt a parser
+/// (an explicit `-v` is a person asking for detail, so it overrides that silence).
+pub fn install_logger(json: bool, verbose: u8) {
     use std::io::Write as _;
 
-    let default = if json { "off" } else { "info" };
+    let default = if json && verbose == 0 {
+        "off"
+    } else {
+        match verbose {
+            0 => "info",
+            1 => "debug",
+            _ => "trace",
+        }
+    };
     let mut builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default));
 
