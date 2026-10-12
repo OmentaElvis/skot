@@ -29,7 +29,7 @@ pub fn skot(name: &str) -> String {
     format!("skot {}", path.join(" "))
 }
 
-/// The full command line with arguments: `skot patch refresh 0001-a.patch`.
+/// The full command line with arguments: `skot patch edit-save 0001-a.patch`.
 pub fn skot_args(name: &str, args: &str) -> String {
     format!("{} {}", skot(name), args)
 }
@@ -81,8 +81,8 @@ mod tests {
         assert_eq!(skot("new"), "skot patch new");
         assert_eq!(skot("drop"), "skot patch drop");
         assert_eq!(
-            skot_args("refresh", "0001-a.patch"),
-            "skot patch refresh 0001-a.patch"
+            skot_args("edit-save", "0001-a.patch"),
+            "skot patch edit-save 0001-a.patch"
         );
     }
 

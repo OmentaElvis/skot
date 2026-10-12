@@ -12,8 +12,6 @@
 //! while names renumber under the rotation. A script gets told to name both rather than
 //! a default it did not ask for.
 
-use std::io::IsTerminal as _;
-
 use anyhow::{Context, Result, bail};
 use log::{debug, info};
 use serde_json::json;
@@ -57,7 +55,7 @@ pub fn run(ctx: &Ctx, args: &MoveArgs) -> Result<Exit> {
         );
     }
     let state = State::load(&ctx.layout).unwrap_or_default();
-    let interactive = !ctx.cli.json && std::io::stdin().is_terminal();
+    let interactive = !ctx.cli.json && crate::ui::stdin_is_terminal();
 
     let want = match &args.patch {
         Some(want) => want.clone(),
@@ -149,6 +147,11 @@ fn relocate(layout: &Layout, name: &str, to: usize) -> Result<Moved> {
     let moved = series.move_renumbering(layout, name, to)?;
     series.save(layout)?;
     state.follow_renames(layout, &moved.renames)?;
+    // A patch with a work area keeps its worktree; only the name it answers to in the
+    // series moves, and the session record follows that name.
+    let mut sessions = crate::session::Manifest::load(layout)?;
+    sessions.follow_renames(&moved.renames);
+    sessions.save(layout)?;
     drop(lock);
 
     Ok(Moved {

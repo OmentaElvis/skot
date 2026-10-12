@@ -23,6 +23,7 @@ pub mod layout;
 pub mod phase;
 pub mod report;
 pub mod series;
+pub mod session;
 pub mod state;
 pub mod ui;
 

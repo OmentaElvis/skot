@@ -1,26 +1,29 @@
-//! `patch new`: start the next patch, with everything already in the sandbox.
+//! `patch new`: start the next patch, with a work area open on it.
 //!
-//! The authoring loop is one command per step: `new` gives you a working tree with the
-//! applied set in place and an empty patch registered at its position in the series
-//! (`--at` picks the position, the end by default, and the tail is renumbered so the
-//! numbers stay contiguous), `refresh` turns what you changed into that patch's contents.
-//! Nothing is committed anywhere: the patch file *is* the record.
+//! The authoring loop is one command per step: `new` gives you an empty patch registered at
+//! its position in the series (`--at` picks the position, the end by default, and the tail is
+//! renumbered so the numbers stay contiguous) and a worktree of its own under `.skot/work/`
+//! holding everything below it, ready to edit. `edit-save` turns what you changed in there
+//! into that patch's contents. Nothing is committed anywhere: the patch file *is* the record.
 //!
 //! Two things are worth stating, because both are easy to get wrong:
 //!
-//! - **The sandbox really is put in place.** A `new` that only wrote a file would leave the
-//!   user editing whatever tree happened to be there, and `refresh` would then export whatever
-//!   that tree contained. So `new` applies the recorded set to the base it was given (the
-//!   whole series on a first run), which is also what makes `--base` mean something.
+//! - **The series is replayed before anything is written.** Resolving the base and checking
+//!   that the patches below still apply to it happens first, so a failure leaves the series,
+//!   the patches, and the work area exactly as they were: there is no half-created patch for
+//!   someone to discover later. It also means the work area opens on a tree the series
+//!   actually produces, not on whatever happened to be checked out.
 //! - **It does not invent the patch's contents.** The file is written empty and registered, so
-//!   that `refresh` has something to fill in and the series is complete before editing starts.
-//!   An empty patch in the series is honest; a patch with a guessed subject and an empty diff
-//!   is not.
+//!   that `edit-save` has something to fill in and the series is complete before editing
+//!   starts. An empty patch in the series is honest; a patch with a guessed subject and an
+//!   empty diff is not.
 //!
-//! An empty series is fine here: the first patch in a project is created against a bare
-//! upstream, and `skot check` has nothing to complain about until the patch has content.
+//! The shared run state stays out of it: `new` does not touch the sandbox or the applied set,
+//! because those describe what has been *applied*, and starting a patch applies nothing. An
+//! empty series is fine here: the first patch in a project is created against a bare upstream,
+//! and `skot check` has nothing to complain about until the patch has content.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use log::{debug, info};
 use serde_json::json;
 
@@ -30,6 +33,7 @@ use crate::hints::Hints;
 use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
 use crate::series;
+use crate::session;
 use crate::state::State;
 
 /// What `new` created, presented by [`run`].
@@ -37,12 +41,14 @@ use crate::state::State;
 struct Created {
     name: String,
     path: std::path::PathBuf,
+    /// The worktree the edits happen in.
+    work_area: std::path::PathBuf,
     base: String,
     line: usize,
     subject: String,
 }
 
-/// Create an empty patch file, insert it into the series, and put the sandbox on the base.
+/// Create an empty patch file, insert it into the series, and open a work area on it.
 pub fn run(ctx: &Ctx, args: &NewArgs) -> Result<Exit> {
     let created = create(
         &ctx.layout,
@@ -55,6 +61,7 @@ pub fn run(ctx: &Ctx, args: &NewArgs) -> Result<Exit> {
         emit_json(&json!({
             "patch": created.name,
             "path": created.path.display().to_string(),
+            "work_area": created.work_area.display().to_string(),
             "base": created.base,
             "series_line": created.line,
             "subject": created.subject,
@@ -64,18 +71,19 @@ pub fn run(ctx: &Ctx, args: &NewArgs) -> Result<Exit> {
 
     info!(target: "new", "created {}", created.name);
     debug!(target: "new", "{}", created.path.display());
+    debug!(target: "new", "work area {}", created.work_area.display());
     debug!(
         target: "new",
         "registered at line {} of the series",
         created.line
     );
 
-    // The sandbox is on the base by now, so there is only one place to edit and one next step.
+    // The work area holds the base by now, so there is only one place to edit and one next step.
     Hints::new("next")
-        .line(format!("edit in {}", ctx.layout.sandbox_dir().display()))
+        .line(format!("edit in {}", created.work_area.display()))
         .entry(
-            skot_args("refresh", &created.name),
-            "re-export the patch from the sandbox",
+            skot_args("edit-save", &created.name),
+            "save your changes to the patch",
         )
         .print();
     Ok(Exit::Success)
@@ -86,8 +94,11 @@ fn create(layout: &Layout, name: &str, base: Option<&str>, at: Option<&str>) -> 
     let (config, mut series) = layout.project()?;
     let slug = slug(name)?;
 
-    let lock = layout.lock()?;
-    let state = State::load(layout)?;
+    // Held for the whole run: the series, the state record, and the session manifest are
+    // exactly the things two concurrent runs must not interleave, and `session::materialise`
+    // assumes the caller already holds it rather than taking a second one.
+    let _lock = layout.lock()?;
+    let mut state = State::load(layout)?;
     let base = match base {
         Some(base) => base.to_owned(),
         None => state
@@ -109,8 +120,6 @@ fn create(layout: &Layout, name: &str, base: Option<&str>, at: Option<&str>) -> 
             })?,
     };
 
-    prepare_sandbox(layout, &base, &slug)?;
-
     let index = series::position_at(&series, at)?;
     let prefix = index + 1;
     let patch_name = series::default_patch_name(&prefix.to_string(), &slug);
@@ -123,6 +132,14 @@ fn create(layout: &Layout, name: &str, base: Option<&str>, at: Option<&str>) -> 
         );
     }
 
+    // The last thing that can fail for a reason the series is responsible for, and the last
+    // such failure that costs nothing: resolve the base and replay the patches that will sit
+    // under the new one. Doing it before the first write is what makes a bad base free, and
+    // it is the same replay `session::plan` performs for every opener, so `new` cannot put a
+    // session somewhere the series does not reach.
+    let entries = series.entries(layout)?;
+    let plan = session::plan(layout, &base, &entries[..index], None)?;
+
     std::fs::create_dir_all(layout.patches_dir())?;
     // The tail moves first (this may be what frees the name), the series is saved to
     // match, and only then is the new file written: a failure anywhere before the write
@@ -130,67 +147,39 @@ fn create(layout: &Layout, name: &str, base: Option<&str>, at: Option<&str>) -> 
     let (line, renames) = series.insert_renumbering(layout, &patch_name, index)?;
     series.save(layout)?;
     std::fs::write(layout.patches_dir().join(&patch_name), "")?;
-
-    // Record the new patch as applied. It is empty, so the tree did not change, but "applied"
-    // is what tells `refresh` which patch is being authored, and `push`/`pop` which patches
-    // are on. Without this the very next command refuses with "nothing is
-    // applied", which is the opposite of useful: the user *did* just start a patch. The set
-    // is written in series order, so a patch inserted mid-series sits in its own place
-    // rather than at the end of the list, which `pop` would read as the top.
-    let mut state = State::load(layout)?;
+    // A tail rename moves patches that are recorded as applied and patches that have a work
+    // area open, so both records follow the files rather than pointing at names that
+    // no longer exist. This is the only write `new` makes to either: the applied set
+    // itself is left alone, because starting a patch applies nothing, and a patch counted
+    // as applied before anything replayed it would put the next `pop` and the next
+    // `edit-save` in charge of work that was never done.
     state.follow_renames(layout, &renames)?;
-    let applied: Vec<String> = series
-        .names()
-        .into_iter()
-        .filter(|name| state.applied.iter().any(|a| a.as_str() == *name) || *name == patch_name)
-        .map(str::to_owned)
-        .collect();
-    state.set_applied(layout, applied)?;
-    drop(lock);
+    let mut sessions = session::Manifest::load(layout)?;
+    sessions.follow_renames(&renames);
+    sessions.save(layout)?;
+
+    // Last of all the work area: a worktree with no manifest entry is recognised as a husk
+    // and replaced by the next attempt, while an entry with no worktree would strand the
+    // user in a dead directory, so nothing may be recorded that cannot be opened.
+    let work_area = session::materialise(layout, &patch_name, &plan).with_context(|| {
+        // Only failure left with the patch already written and registered, so the remedy has
+        // to be about the orphan rather than about undoing anything.
+        format!(
+            "{} was created but its work area could not be opened; `{}` opens it.",
+            patch_name,
+            skot_args("edit", &patch_name)
+        )
+    })?;
 
     let subject = authoring::subject_from_name(&patch_name);
     Ok(Created {
         path: layout.patches_dir().join(&patch_name),
+        work_area: layout.work_patch_dir(work_area.dir_name())?,
         name: patch_name,
         base,
         line,
         subject,
     })
-}
-
-/// Put the sandbox on `base` with the recorded set applied to it, recording what it did.
-///
-/// This is `apply` without the narration, and there is deliberately no second path: the
-/// first patch in a project is created against a bare upstream with nothing to replay, and
-/// `apply_locked` handles that by resetting the sandbox to `base` and applying zero
-/// patches. One path means `new` cannot put the sandbox somewhere `apply` would not. A
-/// sandbox that already holds a set (with holes) lands exactly that set, the same way
-/// `build` does, so a patch popped out for testing stays out while the next one is
-/// written.
-fn prepare_sandbox(layout: &Layout, base: &str, name: &str) -> Result<()> {
-    let state = State::load(layout)?;
-    let applied = if state.ref_name.is_none() {
-        crate::commands::apply::apply_locked(layout, Some(base))?
-    } else {
-        let (_config, series) = layout.project()?;
-        let stack = authoring::recorded_stack(layout, &series, &state)?;
-        crate::commands::apply::apply_locked_subset(layout, Some(base), &stack.names)?
-    };
-    if !applied.ok {
-        // Checked, not `?`'d: `apply_locked` reports a failed replay by *returning* a
-        // verdict rather than by erroring, because the caller decides whether that
-        // is fatal. Ignoring it here means `new` puts the new patch on a sandbox that
-        // does not hold the series, and the first `refresh` then folds the missing work
-        // into that new patch instead of failing.
-        anyhow::bail!(
-            "the existing series does not apply to {base}, so there is nowhere sensible to \
-             start `{name}`.\n\
-             {failure}\n\
-             Fix or rebase that patch first. Nothing was written.",
-            failure = applied.failure
-        );
-    }
-    Ok(())
 }
 
 /// Turn a human name into something safe to put in a filename.
@@ -269,13 +258,22 @@ mod tests {
 
     #[test]
     fn new_at_inserts_the_patch_renumbers_the_tail_and_keeps_the_set_in_order() {
-        // `--at` occupies that slot: the tail is renamed up one number each, the files
-        // move with their names, and the applied set is rewritten in series order so
-        // `pop` still knows which patch is on top.
+        // `--at` occupies that slot: the tail is renamed up one number each and the files
+        // move with their names. An applied set that named the tail follows the renames, so
+        // the record keeps pointing at patches that still exist. The new patch is *not*
+        // added to the set: `new` applies nothing.
         let (_tmp, layout) = project();
         create(&layout, "first", None, None).unwrap();
         create(&layout, "second", None, None).unwrap();
         create(&layout, "third", None, None).unwrap();
+
+        let mut state = State::load(&layout).unwrap();
+        state.applied = vec![
+            "0001-first.patch".to_owned(),
+            "0002-second.patch".to_owned(),
+            "0003-third.patch".to_owned(),
+        ];
+        state.save(&layout).unwrap();
 
         let created = create(&layout, "middle", None, Some("2")).unwrap();
 
@@ -291,13 +289,8 @@ mod tests {
         let state = State::load(&layout).unwrap();
         assert_eq!(
             state.applied,
-            [
-                "0001-first.patch",
-                "0002-middle.patch",
-                "0003-second.patch",
-                "0004-third.patch"
-            ],
-            "series order, not insertion order: the top is the last entry"
+            ["0001-first.patch", "0003-second.patch", "0004-third.patch"],
+            "the applied set follows the renumbered tail, and gains no new patch"
         );
     }
 
@@ -325,33 +318,38 @@ mod tests {
     }
 
     #[test]
-    fn new_leaves_the_sandbox_holding_the_series() {
-        // The loop is `new` → edit → `refresh`, and `refresh` diffs the sandbox against the
-        // series below the patch. If `new` did not put the series in place, the user's first
-        // edit would be exported as a patch against the wrong tree.
+    fn new_opens_a_work_area_holding_the_series_and_leaves_shared_state_alone() {
+        // The loop is `new` → edit → `edit-save`, and the save diffs the work area against
+        // the series below the patch. If `new` did not put the series in place, the user's
+        // first edit would be exported as a patch against the wrong tree. What it must not do
+        // is touch the shared run state: applying the series is not what starting a patch is,
+        // and a patch counted as applied before anything replayed it would put the next
+        // `pop` in charge of work that was never done.
         let (_tmp, layout) = project();
         testsupport::write_series(
             &layout,
             &[("0001-existing.patch", testsupport::patch_one())],
         );
 
-        create(&layout, "next", None, None).unwrap();
+        let created = create(&layout, "next", None, None).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(layout.sandbox_dir().join("f.txt")).unwrap(),
+            std::fs::read_to_string(created.work_area.join("f.txt")).unwrap(),
             "first\n",
-            "the sandbox should hold the series"
+            "the work area should hold the series below the new patch"
         );
-        let state = crate::state::State::load(&layout).unwrap();
-        assert_eq!(state.ref_name.as_deref(), Some("main"));
+        assert!(
+            created.work_area.join(".git").is_file(),
+            "a linked worktree of the mirror, not a copy"
+        );
         assert_eq!(
-            state.applied,
-            vec![
-                "0001-existing.patch".to_owned(),
-                // The new patch counts as applied even though it is empty: it is the one being
-                // authored, and this is what lets `refresh` know where to export to.
-                "0002-next.patch".to_owned()
-            ]
+            std::fs::read_to_string(layout.sandbox_dir().join("f.txt")).unwrap(),
+            "base\n",
+            "the sandbox belongs to applying, not to authoring"
+        );
+        assert!(
+            !layout.state_file().exists(),
+            "new applies nothing, so it must not write the applied set"
         );
     }
 
@@ -462,12 +460,11 @@ mod tests {
 
     #[test]
     fn a_series_that_will_not_apply_stops_new_before_it_writes_anything() {
-        // `new` puts the existing series in the sandbox so the new patch sits on top of it.
-        // If that replay fails, carrying on would create the patch on a sandbox that does not
-        // hold the series — and the first `refresh` would then fold the *missing* work into
-        // the new patch, because the base it diffs against is what the applied set below it
-        // produced, not what is
-        // actually there. Failing here is much cheaper than debugging that later.
+        // `new` replays the series against the base before it writes anything. If that
+        // replay fails, carrying on would create the patch on a base the series does not
+        // hold, and the first `edit-save` would then fold the *missing* work into the new
+        // patch, because the base it diffs against is what the patches below produced, not
+        // what is actually there. Failing here is much cheaper than debugging that later.
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = testsupport::project_with_sandbox(tmp.path());
         std::fs::write(

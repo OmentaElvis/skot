@@ -116,7 +116,7 @@ pub fn run(ctx: &Ctx, arg: &RefArg) -> Result<Exit> {
             "Resolve it by hand: `{}` puts the series in the sandbox, \
              and `{}` re-exports it against the new base.",
             skot_args("apply", &rebased.ref_name),
-            skot_args("refresh", "<patch>")
+            skot_args("edit-save", "<patch>")
         );
         return Ok(Exit::Failure);
     }

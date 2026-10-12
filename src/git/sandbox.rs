@@ -14,6 +14,11 @@
 //! libgit2 creates and opens linked worktrees directly (`Repository::worktree`,
 //! `Repository::open_from_worktree`), so none of this is hand-written plumbing.
 //!
+//! The same shape hosts one more thing: a patch's work area. A work area is a linked
+//! worktree of the same mirror, registered under the patch's own name rather than under
+//! `sandbox`, and it shares the add, reset and prune helpers here so the two cannot drift
+//! apart. What differs is only what each is called and what it is cleaned with.
+//!
 //! The consequence worth stating plainly: a linked worktree holds the object store open, so
 //! the mirror must never be pruned or replaced while a sandbox exists. `skot clean` knows
 //! this and removes the sandbox first.
@@ -40,13 +45,27 @@ pub fn is_repository(layout: &Layout) -> bool {
 /// build. That matters because `persistent` is the default sandbox policy, and the
 /// expensive part of a build is dependency state we must not throw away by accident.
 pub fn create(layout: &Layout, mirror: &Mirror) -> Result<()> {
-    let dir = layout.sandbox_dir();
     if is_repository(layout) {
         return Ok(());
     }
+    add(
+        mirror,
+        WORKTREE_NAME,
+        &layout.sandbox_dir(),
+        &crate::invocation::skot_args("clean", "sandbox"),
+    )
+}
+
+/// Register a linked worktree of `mirror` at `dir` under `name`.
+///
+/// The shared entry point for the sandbox and for per-patch sessions: both are detached
+/// checkouts of the mirror that store no objects of their own. `remedy` is the command the
+/// leftover-directory message points at, and it differs by caller because the thing that
+/// removes it differs.
+pub fn add(mirror: &Mirror, name: &str, dir: &Path, remedy: &str) -> Result<()> {
     if !mirror.is_initialised() {
         bail!(
-            "no mirror at {}, so there is nothing for the sandbox to check out.\n\
+            "no mirror at {}, so there is nothing for `{name}` to check out.\n\
              Run `{}` first.",
             mirror.path().display(),
             crate::invocation::skot("sync")
@@ -55,11 +74,11 @@ pub fn create(layout: &Layout, mirror: &Mirror) -> Result<()> {
 
     // libgit2 creates the worktree directory itself and refuses if it is already there, so
     // an empty leftover is cleared first. A *non-empty* leftover is a different situation and
-    // gets its own message rather than a bare "directory exists": the sandbox directory
-    // holding files with no worktree registered means a previous run was interrupted between
-    // creating the directory and registering the worktree.
+    // gets its own message rather than a bare "directory exists": the directory holding files
+    // with no worktree registered means a previous run was interrupted between creating the
+    // directory and registering the worktree.
     if dir.exists() {
-        let leftover = std::fs::read_dir(&dir)
+        let leftover = std::fs::read_dir(dir)
             .context(format!("reading {}", dir.display()))?
             .next()
             .is_some();
@@ -67,12 +86,11 @@ pub fn create(layout: &Layout, mirror: &Mirror) -> Result<()> {
             bail!(
                 "{} has files in it but is not a skot worktree.\n\
                  This usually means an earlier run was interrupted. \
-                 `{}` removes it.",
+                 `{remedy}` removes it.",
                 dir.display(),
-                crate::invocation::skot_args("clean", "sandbox")
             );
         }
-        std::fs::remove_dir(&dir)
+        std::fs::remove_dir(dir)
             .context(format!("clearing the empty directory {}", dir.display()))?;
     }
     if let Some(parent) = dir.parent() {
@@ -80,19 +98,19 @@ pub fn create(layout: &Layout, mirror: &Mirror) -> Result<()> {
     }
 
     // `checkout_existing` populates the new worktree from its HEAD. Without it libgit2 adds
-    // the worktree and leaves it empty, and the sandbox would have to be reset separately.
+    // the worktree and leaves it empty, and the worktree would have to be reset separately.
     let mut options = git2::WorktreeAddOptions::new();
     options.checkout_existing(true);
 
     mirror
         .repo()
-        .worktree(WORKTREE_NAME, &dir, Some(&options))
+        .worktree(name, dir, Some(&options))
         .context(format!(
-            "adding a linked worktree for the sandbox at {}",
+            "adding a linked worktree for `{name}` at {}",
             dir.display()
         ))?;
 
-    detach_and_drop_stub_branch(mirror, &dir)?;
+    detach_and_drop_stub_branch(mirror, dir, name)?;
     Ok(())
 }
 
@@ -108,32 +126,30 @@ pub fn create(layout: &Layout, mirror: &Mirror) -> Result<()> {
 /// A sandbox has no work of its own to commit, so it never needs a branch. Detaching is what
 /// `reset_to` wants anyway; doing it here means the branch is removed the moment it exists
 /// rather than lingering.
-fn detach_and_drop_stub_branch(mirror: &Mirror, dir: &Path) -> Result<()> {
-    let worktree = mirror.repo().find_worktree(WORKTREE_NAME).context(format!(
-        "looking up the {WORKTREE_NAME} worktree just added"
-    ))?;
+fn detach_and_drop_stub_branch(mirror: &Mirror, dir: &Path, name: &str) -> Result<()> {
+    let worktree = mirror
+        .repo()
+        .find_worktree(name)
+        .context(format!("looking up the `{name}` worktree just added"))?;
     let repo = git2::Repository::open_from_worktree(&worktree)
-        .context(format!("opening the sandbox at {}", dir.display()))?;
+        .context(format!("opening `{name}` at {}", dir.display()))?;
 
     if let Ok(head) = repo.head()
-        && head.name() == Ok(format!("refs/heads/{WORKTREE_NAME}").as_str())
+        && head.name() == Ok(format!("refs/heads/{name}").as_str())
     {
         let target = head
             .target()
-            .context("the sandbox's own branch does not point at a commit")?;
+            .context("the worktree's own branch does not point at a commit")?;
         repo.set_head_detached(target)
-            .context("detaching the sandbox, which should not be on a branch")?;
+            .context("detaching the worktree, which should not be on a branch")?;
     }
 
     // `if let`: an earlier version of skot, or git itself, may have left no branch here,
     // and that is fine. This is tidying, not a correctness requirement.
-    if let Ok(mut branch) = mirror
-        .repo()
-        .find_reference(&format!("refs/heads/{WORKTREE_NAME}"))
-    {
+    if let Ok(mut branch) = mirror.repo().find_reference(&format!("refs/heads/{name}")) {
         branch
             .delete()
-            .context("removing the placeholder branch the sandbox worktree made")?;
+            .context("removing the placeholder branch the worktree made")?;
     }
     Ok(())
 }
@@ -144,16 +160,31 @@ fn detach_and_drop_stub_branch(mirror: &Mirror, dir: &Path) -> Result<()> {
 /// mirror's worktree directory, so opening it means asking the mirror for that worktree and
 /// opening through it.
 pub fn open(layout: &Layout) -> Result<git2::Repository> {
-    let dir = layout.sandbox_dir();
     let mirror = Mirror::open(layout)?;
-    let worktree = mirror.repo().find_worktree(WORKTREE_NAME).context(format!(
-        "the mirror at {} has no `{WORKTREE_NAME}` worktree, so there is no sandbox.\n\
-             Run `{}` to create one.",
-        mirror.path().display(),
-        crate::invocation::skot("apply")
+    open_named(
+        &mirror,
+        WORKTREE_NAME,
+        &layout.sandbox_dir(),
+        &format!("Run `{}` to create one.", crate::invocation::skot("apply")),
+    )
+}
+
+/// Open a registered worktree as a repository, by its registration name.
+///
+/// `remedy` says how to get one when the registration is missing, because the caller knows
+/// what will bring it back and this does not.
+pub fn open_named(
+    mirror: &Mirror,
+    name: &str,
+    dir: &Path,
+    remedy: &str,
+) -> Result<git2::Repository> {
+    let worktree = mirror.repo().find_worktree(name).context(format!(
+        "the mirror at {} has no `{name}` worktree registered.\n{remedy}",
+        mirror.path().display()
     ))?;
     git2::Repository::open_from_worktree(&worktree)
-        .context(format!("opening the sandbox at {}", dir.display()))
+        .context(format!("opening `{name}` at {}", dir.display()))
 }
 
 /// The commit the sandbox is checked out at.
@@ -253,28 +284,44 @@ pub fn restore_kept(
 /// what makes a reset a reset rather than a merge: the sandbox holds no work of its own that
 /// a branch name could imply it should keep.
 pub fn reset_to(layout: &Layout, sha: &Sha, keep: &[String]) -> Result<()> {
-    // An empty glob would match every path, which would turn `keep` into "keep everything"
-    // from a typo in a config file. Refuse rather than silently doing the wrong thing.
-    if keep.iter().any(|g| g.trim().is_empty()) {
-        bail!("sandbox.keep entries must not be empty: an empty glob would match everything");
-    }
-
     let dir = layout.sandbox_dir();
     if !is_repository(layout) {
         bail!("the sandbox at {} does not exist yet.", dir.display());
     }
 
     let repo = open(layout)?;
+    reset_at(&repo, WORKTREE_NAME, &dir, sha, keep)
+}
+
+/// Check out `sha` into a worktree, leaving the working tree clean.
+///
+/// The shared half of [`reset_to`]: the sandbox and every patch session reset the same way,
+/// detached at the target and forced there, which is what makes a reset a reset rather than
+/// a merge. `name` and `dir` say which worktree and which registration, so a session can
+/// refuse to move a branch in the mirror just as the sandbox does.
+pub fn reset_at(
+    repo: &git2::Repository,
+    name: &str,
+    dir: &Path,
+    sha: &Sha,
+    keep: &[String],
+) -> Result<()> {
+    // An empty glob would match every path, which would turn `keep` into "keep everything"
+    // from a typo in a config file. Refuse rather than silently doing the wrong thing.
+    if keep.iter().any(|g| g.trim().is_empty()) {
+        bail!("sandbox.keep entries must not be empty: an empty glob would match everything");
+    }
+
     let oid =
         git2::Oid::from_str(sha).map_err(|e| anyhow::anyhow!("{sha} is not a commit id: {e}"))?;
     let commit = repo
         .find_commit(oid)
-        .context(format!("the sandbox cannot see commit {sha}"))?;
+        .context(format!("the {name} worktree cannot see commit {sha}"))?;
     let tree = commit
         .tree()
         .context(format!("reading the tree of {sha}"))?;
 
-    // What the sandbox holds right now, so the paths a `keep` glob covers can be put back
+    // What the worktree holds right now, so the paths a `keep` glob covers can be put back
     // afterwards. A force checkout removes tracked files the target tree does not have, and a
     // keep path is by definition one where that is wrong.
     let previous_tree = repo
@@ -289,24 +336,24 @@ pub fn reset_to(layout: &Layout, sha: &Sha, keep: &[String]) -> Result<()> {
         .unwrap_or_default();
 
     // Detach first, then force-checkout. Without the detach the worktree would try to update
-    // the branch it is on, and a sandbox reset is not allowed to move a branch in the mirror.
+    // the branch it is on, and a reset is not allowed to move a branch in the mirror.
     repo.set_head_detached(oid)
-        .context(format!("detaching the sandbox at {sha}"))?;
+        .context(format!("detaching `{name}` at {sha}"))?;
 
-    // A worktree added by git rather than by `create` carries a branch named `sandbox`, and
-    // detaching HEAD above would leave it behind, pointing at a commit the sandbox no longer
+    // A worktree added by git rather than by `add` carries a branch named after itself, and
+    // detaching HEAD above would leave it behind, pointing at a commit the worktree no longer
     // has. Remove it so the mirror lists only what upstream actually published.
-    if let Ok(mut branch) = repo.find_reference(&format!("refs/heads/{WORKTREE_NAME}")) {
+    if let Ok(mut branch) = repo.find_reference(&format!("refs/heads/{name}")) {
         branch.delete().context(format!(
-            "removing the stale `{WORKTREE_NAME}` branch from the mirror"
+            "removing the stale `{name}` branch from the mirror"
         ))?;
     }
 
     // `force` is what makes this a reset rather than a checkout: without it libgit2 refuses to
-    // overwrite files it believes were modified, and a sandbox full of build output would never
-    // converge. `remove_untracked` is left off deliberately — a keep path like `node_modules` is
-    // untracked, and removing it would throw away the dependency cache that makes a persistent
-    // sandbox worth having.
+    // overwrite files it believes were modified, and a worktree full of build output would never
+    // converge. `remove_untracked` is left off deliberately, because a keep path like
+    // `node_modules` is untracked and removing it would throw away the dependency cache that
+    // makes a persistent sandbox worth having.
     let mut options = git2::build::CheckoutBuilder::new();
     options.force();
 
@@ -321,7 +368,7 @@ pub fn reset_to(layout: &Layout, sha: &Sha, keep: &[String]) -> Result<()> {
     if let Some(old) = previous_tree.as_ref()
         && !survivors.is_empty()
     {
-        super::diff::restore_paths(&repo, old, &survivors)
+        super::diff::restore_paths(repo, old, &survivors)
             .context(format!("restoring keep paths after the reset to {sha}"))?;
     }
 
@@ -415,22 +462,35 @@ pub fn remove(layout: &Layout) -> Result<()> {
     if !dir.exists() {
         return Ok(());
     }
-    let worktree = Mirror::open(layout)
-        .ok()
-        .and_then(|mirror| mirror.repo().find_worktree(WORKTREE_NAME).ok());
-    if let Some(worktree) = worktree {
-        // `valid` and `working_tree` because the sandbox is skot's to discard, and a dirty
-        // sandbox is the normal case rather than a reason to refuse.
+    // A mirror that will not open cannot hold a registration, and the directory is still
+    // skot's to clear: `clean sandbox` must work on the wreckage it is meant to repair.
+    if let Ok(mirror) = Mirror::open(layout) {
+        return prune(&mirror, WORKTREE_NAME, &dir);
+    }
+    std::fs::remove_dir_all(&dir).context(format!("removing the sandbox at {}", dir.display()))?;
+    Ok(())
+}
+
+/// Unregister a worktree from the mirror and remove its directory.
+///
+/// The registration has to go, not just the directory: a stale registration is what makes a
+/// later [`add`] fail with a confusing "worktree already exists". A missing registration is
+/// fine rather than an error, because this is the tidy-up path and it must work when the
+/// directory is all that is left.
+pub fn prune(mirror: &Mirror, name: &str, dir: &Path) -> Result<()> {
+    if let Ok(worktree) = mirror.repo().find_worktree(name) {
+        // `valid` and `working_tree` because the worktree is skot's to discard, and a dirty
+        // one is the normal case rather than a reason to refuse.
         let mut options = git2::WorktreePruneOptions::new();
         options.valid(true).working_tree(true);
         worktree.prune(Some(&mut options)).context(format!(
-            "unregistering the sandbox worktree for {}",
+            "unregistering the `{name}` worktree for {}",
             dir.display()
         ))?;
     }
     if dir.exists() {
-        std::fs::remove_dir_all(&dir)
-            .context(format!("removing the sandbox at {}", dir.display()))?;
+        std::fs::remove_dir_all(dir)
+            .context(format!("removing the worktree directory {}", dir.display()))?;
     }
     Ok(())
 }
@@ -829,5 +889,77 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = mirror_with_one_commit(tmp.path());
         remove(&layout).expect("removing nothing must not error");
+    }
+
+    #[test]
+    fn a_second_worktree_can_be_added_reset_and_pruned_under_its_own_name() {
+        // The session shape: another linked worktree of the same mirror, named after a
+        // patch instead of `sandbox`, obeying the same rules (no branch, detached reset,
+        // registration gone when it goes).
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, sha) = mirror_with_one_commit(tmp.path());
+        let mirror = Mirror::open(&layout).unwrap();
+        let dir = layout.work_patch_dir("0001-a.patch").unwrap();
+
+        add(
+            &mirror,
+            "0001-a.patch",
+            &dir,
+            &crate::invocation::skot_args("clean", "--sessions"),
+        )
+        .unwrap();
+
+        assert!(dir.join(".git").is_file(), "a linked worktree, not a clone");
+        let refs = mirror.refs().unwrap();
+        let branches: Vec<&str> = refs.branches.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            !branches.contains(&"0001-a.patch"),
+            "a named worktree must not leave a branch behind either"
+        );
+
+        let repo = open_named(
+            &mirror,
+            "0001-a.patch",
+            &dir,
+            &crate::invocation::skot_args("clean", "--sessions"),
+        )
+        .unwrap();
+        reset_at(&repo, "0001-a.patch", &dir, &sha, &[]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "one\n",
+            "the reset should check the target tree out"
+        );
+        assert!(
+            repo.head_detached().unwrap(),
+            "a session is detached, never on a branch"
+        );
+
+        prune(&mirror, "0001-a.patch", &dir).unwrap();
+        assert!(!dir.exists());
+        // And the registration went with it: re-adding works rather than refusing.
+        add(&mirror, "0001-a.patch", &dir, "remedy").unwrap();
+    }
+
+    #[test]
+    fn a_non_empty_leftover_is_refused_with_the_remedy_it_was_given() {
+        // The message differs by worktree (the sandbox is cleaned one way, a session
+        // another), which is the whole reason `remedy` is a parameter.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = mirror_with_one_commit(tmp.path());
+        let mirror = Mirror::open(&layout).unwrap();
+        let dir = layout.work_patch_dir("0001-a.patch").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("leftover"), b"interrupted").unwrap();
+
+        let remedy = crate::invocation::skot_args("clean", "--sessions");
+        let err = add(&mirror, "0001-a.patch", &dir, &remedy)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a skot worktree"), "got {err}");
+        assert!(
+            err.contains(&remedy),
+            "the caller's remedy must appear: {err}"
+        );
     }
 }

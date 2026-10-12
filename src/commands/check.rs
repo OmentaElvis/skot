@@ -143,7 +143,7 @@ pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
     }
     report::note(&format!(
         "Rebase it against this ref, then `{}` to re-export it.",
-        skot("refresh")
+        skot("edit-save")
     ));
     Ok(Exit::Failure)
 }

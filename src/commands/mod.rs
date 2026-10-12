@@ -5,12 +5,14 @@
 //! `check`, `patch apply` and `patch push` cannot drift apart.
 
 mod apply;
-mod authoring;
+pub(crate) mod authoring;
 mod build;
 mod check;
 mod clean;
 mod disable;
 mod drop;
+mod edit;
+mod edit_save;
 mod enable;
 mod hooks;
 mod import;
@@ -21,12 +23,11 @@ mod new;
 mod pop;
 mod push;
 mod rebase;
-mod refresh;
 mod run;
 mod status;
-mod sync;
+pub(crate) mod sync;
 #[cfg(test)]
-mod testsupport;
+pub(crate) mod testsupport;
 
 use anyhow::Result;
 
@@ -119,7 +120,8 @@ pub fn run(ctx: Ctx) -> Result<Exit> {
         Command::Patch(patch) => match patch {
             PatchCommand::New(args) => new::run(&ctx, args),
             PatchCommand::Import(args) => import::run(&ctx, args),
-            PatchCommand::Refresh(args) => refresh::run(&ctx, args),
+            PatchCommand::EditSave(args) => edit_save::run(&ctx, args),
+            PatchCommand::Edit(args) => edit::run(&ctx, args),
             PatchCommand::Apply(args) => apply::run(&ctx, args),
             PatchCommand::Unapply => apply::unapply(&ctx),
             PatchCommand::Push(args) => push::run(&ctx, args),

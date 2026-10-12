@@ -4,8 +4,6 @@
 //! is trackable in git and lasts. The applied set is untouched; `skot patch apply`
 //! (or a push) realizes the set in the sandbox.
 
-use std::io::IsTerminal as _;
-
 use anyhow::{Context, Result, bail};
 use log::{debug, info};
 use serde_json::json;
@@ -64,7 +62,7 @@ pub fn run(ctx: &Ctx, args: &EnableArgs) -> Result<Exit> {
             targets.push(authoring::resolve_patch(&universe, &names, want)?.name(&names));
         }
         targets
-    } else if !ctx.cli.json && std::io::stdin().is_terminal() {
+    } else if !ctx.cli.json && crate::ui::stdin_is_terminal() {
         pick(&disabled)?
     } else {
         bail!(

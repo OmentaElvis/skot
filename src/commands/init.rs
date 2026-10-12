@@ -1,5 +1,3 @@
-use std::io::IsTerminal as _;
-
 use anyhow::{Context, Result, bail};
 use log::{info, warn};
 
@@ -273,7 +271,7 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
         hooks.push((name, cmd));
     }
 
-    let ask = !ctx.cli.json && std::io::stdin().is_terminal();
+    let ask = !ctx.cli.json && crate::ui::stdin_is_terminal();
 
     let url = match &args.url {
         Some(url) => Some(url.clone()),
@@ -480,7 +478,7 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
         hints
             .entry(
                 skot_args("new", "<name>"),
-                "start a patch, with the series applied",
+                "start a patch and open a work area on it",
             )
             .print();
     }

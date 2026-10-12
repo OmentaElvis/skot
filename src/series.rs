@@ -310,8 +310,8 @@ impl Series {
         // Everything else is checked before anything moves: a *rename* target an
         // out-of-series file occupies is refused rather than overwritten, and one that
         // belongs to a tail entry about to be renamed is fine because those are freed
-        // first. The new name's own file is the caller's to write (or, for `refresh`, already
-        // written), so guarding it lives with the caller.
+        // first. The new name's own file is the caller's to write (or, for `edit-save`,
+        // already written), so guarding it lives with the caller.
         let source_names: Vec<&str> = old[at..].iter().map(String::as_str).collect();
         for (_, new_name) in &renames {
             let path = resolve(layout, new_name);

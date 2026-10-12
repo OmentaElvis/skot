@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ui::Styled;
 
-/// Width of the command column: wide enough for `skot patch refresh <name>`, the longest
+/// Width of the command column: wide enough for `skot patch edit-save <name>`, the longest
 /// entry today, so every description starts in the same place and the block reads as pairs
 /// rather than as prose.
 const CMD: usize = 25;

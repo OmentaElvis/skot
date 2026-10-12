@@ -109,9 +109,43 @@ impl Layout {
         self.state_dir().join("sandbox")
     }
 
-    /// Scratch that `clean build` does not remove.
+    /// Scratch that `clean sandbox` does not remove.
     pub fn out_dir(&self) -> PathBuf {
         self.state_dir().join("out")
+    }
+
+    /// The authoring area: one worktree per patch that has a work area open, plus the
+    /// manifest.
+    ///
+    /// Derived state like the sandbox, but never touched by a default clean: these
+    /// directories hold edits that exist nowhere else until `edit-save` writes them into a
+    /// patch file, so removing them is a decision the user makes explicitly
+    /// (`clean --sessions`) rather than a side effect of tidying.
+    pub fn work_dir(&self) -> PathBuf {
+        self.state_dir().join("work")
+    }
+
+    /// The worktree holding one patch's in-progress edits.
+    ///
+    /// The directory is named after the series entry verbatim (`sub/0002-fix.patch` keeps
+    /// its subdirectory), so what `list` shows and what a file manager opens are the same
+    /// path. A name that would leave the work directory is refused rather than rewritten:
+    /// a session found somewhere other than its own name would be invisible, and a
+    /// manifest pointing outside `work/` would be a delete waiting to happen.
+    pub fn work_patch_dir(&self, patch: &str) -> Result<PathBuf> {
+        let path = normalise(&self.work_dir().join(patch));
+        if !path.starts_with(normalise(&self.work_dir())) {
+            bail!(
+                "`{patch}` cannot be a session directory: it points outside {}.",
+                self.work_dir().display()
+            );
+        }
+        Ok(path)
+    }
+
+    /// The manifest recording which patches have a session open, and on what base.
+    pub fn sessions_file(&self) -> PathBuf {
+        self.work_dir().join("sessions.json")
     }
 
     pub fn lock_file(&self) -> PathBuf {
@@ -230,6 +264,7 @@ impl Layout {
         push("mirror", self.mirror_dir(), "");
         push("sandbox", self.sandbox_dir(), "");
         push("out", self.out_dir(), "");
+        push("work", self.work_dir(), "");
         out
     }
 }
@@ -373,9 +408,31 @@ mod tests {
             l.out_dir(),
             l.lock_file(),
             l.state_file(),
+            l.sessions_file(),
+            l.work_patch_dir("0001-a.patch").unwrap(),
+            l.work_patch_dir("sub/0002-b.patch").unwrap(),
         ] {
             assert!(p.starts_with(l.root()), "{} escaped the root", p.display());
         }
+    }
+
+    #[test]
+    fn a_session_name_that_escapes_the_work_directory_is_refused() {
+        // The manifest is read back and acted on, including by deletion: a name that
+        // climbs out of `work/` has to be refused at the only place that forms the path.
+        let (_tmp, l) = layout();
+        for bad in ["..", "../x", "/etc/passwd", "a/../../x"] {
+            assert!(
+                l.work_patch_dir(bad).is_err(),
+                "{bad:?} was allowed as a session directory"
+            );
+        }
+        // A subdirectory inside `work/` is a normal patch name, not an escape.
+        assert!(
+            l.work_patch_dir("sub/0002-b.patch")
+                .unwrap()
+                .starts_with(l.work_dir())
+        );
     }
 
     #[test]

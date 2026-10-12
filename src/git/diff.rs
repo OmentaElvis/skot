@@ -2,7 +2,7 @@
 //!
 //! This is the other half of [`crate::check`]. `check` consumes a patch file and applies
 //! it to a tree; this module produces one by diffing a tree against what the user has in
-//! the sandbox. `refresh` and `rebase` both need it, and neither writes patch text by hand,
+//! the sandbox. `edit-save` and `rebase` both need it, and neither writes patch text by hand,
 //! because a patch file is a structured format that libgit2 already knows how to write.
 //!
 //! Two details that are easy to get wrong and expensive to debug:
@@ -11,7 +11,7 @@
 //!   diff that only sees tracked files silently drops every file the user just created.
 //!   `include_untracked` and `recurse_untracked_dirs` together are what make a new
 //!   directory appear in the output rather than as an empty entry.
-//! - **Author and date are preserved from the patch being replaced.** A refreshed patch that
+//! - **Author and date are preserved from the patch being replaced.** A re-saved patch that
 //!   re-stamps the committer turns every rebase into a diff in the series' history. The
 //!   mail header is parsed out of the existing patch and re-emitted verbatim; only the diff
 //!   body is regenerated.
@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 /// The mail header of a `format-patch` file: everything before the diff.
 ///
 /// Kept as its own type so that "re-export this patch with a new body" cannot accidentally
-/// re-stamp the author, which is the failure mode that makes a refreshed series churn.
+/// re-stamp the author, which is the failure mode that makes a re-saved series churn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
     /// The `From <sha> Mon Sep 17 00:00:00 2001` line, preserved verbatim.
@@ -36,9 +36,9 @@ pub struct Header {
     ///
     /// The mail format allows headers beyond the four above, and dropping one would be
     /// silent data loss: `import` records where a patch came from in an `X-Skot-Import`
-    /// line, which is how a later run recognises the same request. `refresh` parses the
+    /// line, which is how a later run recognises the same request. `edit-save` parses the
     /// existing header before re-exporting, so anything a parser forgot here would
-    /// disappear from the patch the first time it was refreshed.
+    /// disappear from the patch the first time it was saved.
     pub extra: Vec<String>,
     /// Anything after the headers and before the `---` separator: the commit body.
     pub body: String,
@@ -226,7 +226,7 @@ fn rfc2822(seconds: i64) -> String {
 fn strip_patch_prefix(subject: &str) -> String {
     // `format-patch` writes `Subject: [PATCH] title`, and a later `format-patch -v` writes
     // `[PATCH v2]`. Both prefixes are display metadata, not part of the title, and both
-    // would otherwise accumulate into the title on every refresh.
+    // would otherwise accumulate into the title on every save.
     let mut rest = subject.trim();
     if let Some(after) = rest.strip_prefix('[')
         && let Some(close) = after.find(']')
@@ -374,6 +374,29 @@ pub fn summarise(text: &str) -> String {
         [only] => (*only).to_owned(),
         [first, rest @ ..] => format!("{first} and {} more file(s)", rest.len()),
     }
+}
+
+/// What a patch *does*, as opposed to how it is written.
+///
+/// Skips the parts that are re-derived every time: blob ids in `index`, and the line numbers
+/// in hunk headers. Both come out of libgit2 now rather than off the author's keyboard, so
+/// they change when a patch is saved even though the patch still makes exactly the same
+/// edit. Comparing these is what makes `edit-save` idempotent and tells a work area whether
+/// it has been edited; comparing whole files does neither.
+pub fn change_of(patch: &str) -> Vec<&str> {
+    let body = match patch.find("diff --git ") {
+        Some(at) => &patch[at..],
+        None => "",
+    };
+    body.lines()
+        .filter(|line| {
+            !line.starts_with("diff --git")
+                && !line.starts_with("index ")
+                && !line.starts_with("@@")
+                && !line.starts_with("+++")
+                && !line.starts_with("---")
+        })
+        .collect()
 }
 
 /// Match a `keep` glob against a path.
@@ -690,7 +713,7 @@ diff --git a/a.txt b/a.txt
             "a header line the parser does not model must not be dropped"
         );
 
-        // And re-emitting it keeps the author, which is the point: a refreshed patch must
+        // And re-emitting it keeps the author, which is the point: a re-saved patch must
         // not re-stamp the committer. The provenance line survives with it, or the next
         // import of the same request could not recognise the patch.
         let again = Header::parse(&header.render(Some(" a.txt | 1 +\n"))).unwrap();
@@ -717,7 +740,7 @@ diff --git a/a.txt b/a.txt
     #[test]
     fn the_patch_prefix_is_not_part_of_the_subject() {
         // `format-patch -v` writes `[PATCH v2]`. Re-stamping that into the title would make
-        // every refresh of a v2 patch a v3.
+        // every save of a v2 patch a v3.
         let header = Header::parse(
             "From: a@b\nSubject: [PATCH v2] title here\n\n---\n\ndiff --git a/a b/a\n",
         )
@@ -781,6 +804,20 @@ diff --git a/a.txt b/a.txt
         assert_eq!(summarise(text), "a.txt and 1 more file(s)");
         assert_eq!(summarise("diff --git a/only b/only\n"), "only");
         assert_eq!(summarise("nothing"), "no changes");
+    }
+
+    #[test]
+    fn change_of_sees_the_edit_but_not_the_parts_libgit2_rederives() {
+        // The re-derived version has different blob ids and a shifted hunk offset, which
+        // is what every save produces; it must read as the same change, or saving
+        // twice rewrites the patch twice. A different edit must not.
+        let written = "diff --git a/f.txt b/f.txt\nindex 1111111..2222222 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+b\n";
+        let rederived = "diff --git a/f.txt b/f.txt\nindex aaaaaaa..bbbbbbb 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -42 +42 @@\n-a\n+b\n";
+        let different = "diff --git a/f.txt b/f.txt\nindex 1111111..2222222 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-a\n+c\n";
+
+        assert_eq!(change_of(written), change_of(rederived));
+        assert_ne!(change_of(written), change_of(different));
+        assert_ne!(change_of(written), change_of("no diff at all"));
     }
 
     /// A repository with one commit holding `f.txt`, plus a working tree to edit.
@@ -994,7 +1031,7 @@ diff --git a/a.txt b/a.txt
 
     #[test]
     fn an_export_of_a_file_only_the_sandbox_has_still_applies() {
-        // The end-to-end promise of `refresh`: whatever the export says, it must apply back.
+        // The end-to-end promise of `edit-save`: whatever the export says, it must apply back.
         let s = Sandbox::new();
         std::fs::write(s.dir().join("a.txt"), "a\n").unwrap();
         std::fs::create_dir_all(s.dir().join("d")).unwrap();

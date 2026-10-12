@@ -6,13 +6,43 @@
 //! which means `RUST_LOG` filters by level and by module (`skot::commands::rebase=debug`)
 //! with no wrapper layer in between.
 
-use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use git2::Progress as Transfer;
 use log::{Level, info};
+
+/// True when stdin is a terminal and a prompt would have somebody to answer it.
+///
+/// Always false in tests: `cargo test` run interactively has a terminal on stdin, and
+/// an `inquire` prompt opened against it would sit there waiting for a person.
+pub fn stdin_is_terminal() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        use std::io::IsTerminal as _;
+        std::io::stdin().is_terminal()
+    }
+}
+
+/// True when stderr is a terminal, i.e. colour and spinners will actually be seen.
+///
+/// Always false in tests so `cargo test` stays quiet whatever it is run from.
+pub fn stderr_is_terminal() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        use std::io::IsTerminal as _;
+        std::io::stderr().is_terminal()
+    }
+}
 
 /// Install the process logger.
 ///
@@ -94,7 +124,7 @@ fn colour() -> bool {
         if std::env::var_os("NO_COLOR").is_some() {
             return false;
         }
-        std::io::stderr().is_terminal()
+        stderr_is_terminal()
     })
 }
 
@@ -205,7 +235,7 @@ impl Spinner {
     /// that (the filter is `off` under `--json` anyway). Every bar joins the shared
     /// `MultiProgress`, which is built for several at once.
     pub fn new(message: &str) -> Self {
-        let bar = if is_json() || !std::io::stderr().is_terminal() {
+        let bar = if is_json() || !stderr_is_terminal() {
             None
         } else {
             let bar = indicatif::ProgressBar::new_spinner();

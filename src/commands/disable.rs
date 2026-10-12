@@ -5,8 +5,6 @@
 //! patch the sandbox is holding cannot be disabled underneath it: `skot patch pop` puts
 //! it down first.
 
-use std::io::IsTerminal as _;
-
 use anyhow::{Context, Result, bail};
 use log::{debug, info};
 use serde_json::json;
@@ -63,7 +61,7 @@ pub fn run(ctx: &Ctx, args: &DisableArgs) -> Result<Exit> {
             targets.push(name);
         }
         targets
-    } else if !ctx.cli.json && std::io::stdin().is_terminal() {
+    } else if !ctx.cli.json && crate::ui::stdin_is_terminal() {
         pick(&enabled, &state.applied)?
     } else {
         bail!(

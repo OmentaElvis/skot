@@ -1,10 +1,10 @@
-//! Shared plumbing for the authoring commands: `patch new`, `patch refresh`, `patch push`,
-//! `patch pop`, and `rebase`.
+//! Shared plumbing for the authoring commands: `patch new`, `patch edit-save`,
+//! `patch push`, `patch pop`, and `rebase`.
 //!
-//! These five all move between three states — the series on disk, the sandbox working tree,
-//! and the recorded state — and each of them has to work out the same three things first:
+//! These five all move between three states: the series on disk, the sandbox working tree,
+//! and the recorded state. Each of them has to work out the same three things first:
 //! which ref the sandbox is on, which series entries are in it, and what tree the sandbox
-//! should be diffed against. Getting that in one place is what keeps `refresh` from silently
+//! should be diffed against. Getting that in one place is what keeps `push` from silently
 //! diffing against a base that `apply` would never have produced.
 
 use anyhow::{Context, Result, bail};
@@ -36,69 +36,6 @@ pub fn wanted_ref(
              Pass one (as in `{command_line} <ref>`) or set `upstream.default-ref` in {}.",
             layout.config_file().display()
         ))
-}
-
-/// The tree that the patch at `index` sits on top of: the applied patches *before* it.
-///
-/// This is the base a patch has to be expressed against, and it is deliberately not the
-/// tree after the whole set:
-///
-/// ```text
-/// tree(ref + applied set)  <- what `apply` puts in the sandbox, after the last patch
-/// sandbox                  = that, plus your edits
-/// ```
-///
-/// Diffing the sandbox against *that* yields *only your edits*, so replacing the patch with
-/// the result silently throws away everything the patch originally did — the patch looks
-/// plausible and the series no longer applies. The patch's own base is what sits below it:
-///
-/// ```text
-/// tree(ref + applied below p(n))         <- what the applied patch below leaves behind
-/// sandbox - that = p(n)'s own change, plus your edits
-/// ```
-///
-/// For a patch `new` has just created and `push` has applied, the two trees are equal, because
-/// an empty patch produces no change — so the same expression correctly yields just your edits.
-///
-/// It is recomputed by replaying rather than read from recorded state, which is
-/// the point: a recorded tree is a claim about a sandbox that has since been edited, and a
-/// stale claim would silently produce a patch that drops earlier work. With holes allowed,
-/// only the patches the sandbox actually holds below `index` take part in the replay: the
-/// others were never in the tree the sandbox grew from.
-pub fn base_tree_for_patch<'r>(
-    layout: &Layout,
-    state: &State,
-    config: &Config,
-    repo: &'r git2::Repository,
-    entries: &[Entry],
-    index: usize,
-) -> Result<git2::Tree<'r>> {
-    let ref_name = stack_ref(layout, state, config)?;
-    let (_mirror, sha) = super::sync::resolve_in_mirror(layout, &ref_name)?;
-
-    let below: Vec<Entry> = entries[..index]
-        .iter()
-        .filter(|e| state.applied.contains(&e.name))
-        .cloned()
-        .collect();
-    if below.is_empty() {
-        let oid = git2::Oid::from_str(&sha)
-            .context(format!("the resolved ref {ref_name} is not a commit id"))?;
-        let commit = repo.find_commit(oid)?;
-        return Ok(commit.tree()?);
-    }
-
-    let applied = replay(repo, &sha, &below)?;
-    if !applied.report.ok {
-        bail!(
-            "cannot work out what `{}` sits on, because the patches below it do not apply \
-             cleanly.\n\
-             {}",
-            entries[index].name,
-            applied.report.summary()
-        );
-    }
-    Ok(repo.find_tree(applied.tree)?)
 }
 
 /// Replay `entries` against `base` in the sandbox repository, without checking anything out.
@@ -138,8 +75,8 @@ pub fn signature(repo: &git2::Repository) -> git2::Signature<'static> {
 
 /// Read the header of an existing patch file, or make one for a new patch.
 ///
-/// Preserving the existing header is the point: a refreshed patch that re-stamps the author
-/// makes every rebase show up as a diff in the series.
+/// Preserving the existing header is the point: a patch that is re-saved with a re-stamped
+/// author makes every rebase show up as a diff in the series.
 pub fn header_for(
     existing: Option<&str>,
     fallback_subject: &str,
@@ -455,7 +392,7 @@ pub fn resolve_stack(
 ///
 /// One function because the order matters and `push` and `pop` must not disagree about it:
 /// replay first, so a patch that does not apply leaves the sandbox alone; check out second,
-/// so the tree and the index never disagree; record third, so `status`, `pop` and `refresh`
+/// so the tree and the index never disagree; record third, so `status` and `pop`
 /// see the same stack the sandbox actually holds.
 pub fn land(layout: &Layout, ref_name: &str, base: &Sha, stack: &Stack) -> Result<git2::Oid> {
     let repo = require_sandbox(layout)?;
@@ -617,7 +554,7 @@ mod tests {
 
     #[test]
     fn a_header_from_a_bare_diff_is_stamped_rather_than_ignored() {
-        // An empty patch file has no header, and `refresh` has to turn it into a real patch.
+        // An empty patch file has no header, and `edit-save` has to turn it into a real patch.
         let sig = git2::Signature::now("A U Thor", "author@example.com").unwrap();
         let header = header_for(Some("diff --git a/a b/a\n"), "fallback", &sig);
         assert_eq!(header.subject(), "fallback");

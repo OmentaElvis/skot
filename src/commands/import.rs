@@ -56,6 +56,9 @@ struct Imported {
     from_sha: Sha,
     to: String,
     to_sha: Sha,
+    /// True when the patch was extracted with `--reverse`: its diff runs from `to`
+    /// back to `from`.
+    reverse: bool,
     commits: usize,
     summary: String,
     /// How the run ended: a patch was written, an existing one was replaced, or none was.
@@ -127,6 +130,7 @@ pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<Exit> {
             "from_sha": done.from_sha,
             "to": done.to,
             "to_sha": done.to_sha,
+            "reverse": done.reverse,
             "commits": done.commits,
             "summary": done.summary,
             "outcome": done.outcome.as_str(),
@@ -206,7 +210,7 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
 
     // Fill the mirror from the origin for what this range actually reads. The fetch runs
     // whenever there is a URL to ask (an upstream that moved the branch since the last
-    // import is seen now, not after an explicit refresh) and takes only the range's own
+    // import is seen now, not after an explicit sync) and takes only the range's own
     // refs at full depth: an import *walks* (a merge base, then the commits between the
     // ends), and a mirror after an ordinary sync is a shallow, narrowed view. A mirror
     // with no `origin` has nothing to ask; `resolve` gives the remedy for a ref that
@@ -321,24 +325,39 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
 
     let ends = resolve(&mirror, layout, &config, &request, args.repo.as_deref())?;
 
-    // The lock `refresh` holds now covers import's local work too: deciding whether this
+    // The lock authoring holds now covers import's local work too: deciding whether this
     // change already exists, choosing the next free prefix, and writing. The fetch stays
-    // outside it — network is not what two imports racing over the series need
-    // serialising — but nothing below runs without it.
+    // outside it (network is not what two imports racing over the series need
+    // serialising), but nothing below runs without it.
     let lock = layout.lock()?;
 
     let repo = mirror.repo();
-    let old = git::commit_tree(repo, &ends.from_sha)
+    let from_tree = git::commit_tree(repo, &ends.from_sha)
         .context(format!("reading the tree of {}", ends.from))?;
-    let new =
+    let to_tree =
         git::commit_tree(repo, &ends.to_sha).context(format!("reading the tree of {}", ends.to))?;
-    if old.id() == new.id() {
+    if from_tree.id() == to_tree.id() {
         bail!(
             "`{}` and `{}` are the same tree, so there is nothing to import.",
             ends.from,
             ends.to
         );
     }
+    // `--reverse` extracts the same range the other way round: the patch's diff runs
+    // from `to` back to `from`, undoing what the range did. The provenance line and the
+    // duplicate-scan identity record the direction, so the forward and the reversed
+    // patch of one commit are two different things, and a second run of the same flag
+    // answers to the first.
+    let (old, new) = if args.reverse {
+        (to_tree, from_tree)
+    } else {
+        (from_tree, to_tree)
+    };
+    let (line_from, line_to) = if args.reverse {
+        (ends.to_sha.clone(), ends.from_sha.clone())
+    } else {
+        (ends.from_sha.clone(), ends.to_sha.clone())
+    };
     let commits = count_between(repo, &ends.to_sha, &ends.from_sha)?;
 
     // The tip commit speaks for a single-commit import: its author, its date, its message.
@@ -364,9 +383,18 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         Some(number) => format!("Import PR {number}"),
         None => format!("Import {}", request_expression(&request)),
     };
-    let derived = tip_subject
-        .filter(|s| !s.is_empty() && commits == 1)
-        .unwrap_or(fallback);
+    let derived = if args.reverse {
+        // A reversed single commit is named for what it does: undo that change. The
+        // original subject alone would read as the forward patch in `list`.
+        match tip_subject.as_deref().filter(|s| !s.is_empty()) {
+            Some(subject) if commits == 1 => format!("Revert \"{subject}\""),
+            _ => format!("Revert {}", request_expression(&request)),
+        }
+    } else {
+        tip_subject
+            .filter(|s| !s.is_empty() && commits == 1)
+            .unwrap_or(fallback)
+    };
     let slug = match &args.name {
         Some(name) => super::new::slug(name)?,
         None => filename_slug(&derived),
@@ -397,13 +425,10 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     let bare =
         diff::tree_to_tree_patch(repo, &old, &new, &header).context("rendering the import")?;
     let change = change_id(&bare)?;
-    let identity = identity_of(&request, args.repo.as_deref());
-    header.extra.push(provenance_line(
-        &identity,
-        &ends.from_sha,
-        &ends.to_sha,
-        &change,
-    ));
+    let identity = identity_of(&request, args.repo.as_deref(), args.reverse);
+    header
+        .extra
+        .push(provenance_line(&identity, &line_from, &line_to, &change));
     let text =
         diff::tree_to_tree_patch(repo, &old, &new, &header).context("rendering the import")?;
     let summary = diff::summarise(&text);
@@ -426,6 +451,7 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
             from_sha: ends.from_sha.clone(),
             to: ends.to.clone(),
             to_sha: ends.to_sha.clone(),
+            reverse: args.reverse,
             commits,
             summary,
             outcome: Outcome::Unchanged,
@@ -438,7 +464,7 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     // moved under it. The patch is rewritten where it is — same name, same line — unless
     // you have edited it since, which is refused rather than overwritten.
     if let Some((name, provenance)) = scan.provenance {
-        if provenance.from == ends.from_sha && provenance.to == ends.to_sha {
+        if provenance.from == line_from && provenance.to == line_to {
             // Same ends and yet not byte-identical — `scan` just proved that — which
             // means the file has been edited. Nothing new to import, nothing of yours
             // to touch.
@@ -452,6 +478,7 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
                 from_sha: ends.from_sha.clone(),
                 to: ends.to.clone(),
                 to_sha: ends.to_sha.clone(),
+                reverse: args.reverse,
                 commits,
                 summary,
                 outcome: Outcome::Unchanged,
@@ -481,12 +508,9 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         header
             .extra
             .retain(|line| !line.starts_with("X-Skot-Import: "));
-        header.extra.push(provenance_line(
-            &identity,
-            &ends.from_sha,
-            &ends.to_sha,
-            &change,
-        ));
+        header
+            .extra
+            .push(provenance_line(&identity, &line_from, &line_to, &change));
         if commits == 1 {
             header.body = tip_body;
         } else {
@@ -498,7 +522,13 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         std::fs::write(&path, &text).context(format!("writing {}", path.display()))?;
         let (series_line, registered_now) =
             register_existing(layout, &mut series, &name, args.no_register)?;
-        let previous_commits = count_between(repo, &provenance.to, &provenance.from).ok();
+        // How many commits the range held before: the provenance records the ends in
+        // the patch's own direction, which for a reversed patch is the range reversed.
+        let previous_commits = if args.reverse {
+            count_between(repo, &provenance.from, &provenance.to).ok()
+        } else {
+            count_between(repo, &provenance.to, &provenance.from).ok()
+        };
         return Ok(Imported {
             patch: name,
             path,
@@ -507,6 +537,7 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
             from_sha: ends.from_sha,
             to: ends.to,
             to_sha: ends.to_sha,
+            reverse: args.reverse,
             commits,
             summary,
             outcome: Outcome::Updated,
@@ -542,6 +573,11 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         std::fs::write(&path, &text).context(format!("writing {}", path.display()))?;
         let mut state = crate::state::State::load(layout)?;
         state.follow_renames(layout, &renames)?;
+        // Sessions opened on a renamed patch keep their worktree and follow the new name,
+        // the same way the applied set does.
+        let mut sessions = crate::session::Manifest::load(layout)?;
+        sessions.follow_renames(&renames);
+        sessions.save(layout)?;
         Some(line)
     };
     drop(lock);
@@ -554,6 +590,7 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         from_sha: ends.from_sha,
         to: ends.to,
         to_sha: ends.to_sha,
+        reverse: args.reverse,
         commits,
         summary,
         outcome: Outcome::Created,
@@ -678,7 +715,7 @@ fn refspecs_for(name: &str, into_ns: bool) -> Vec<String> {
 
 /// One of import's fetches, run the way every import run runs: the upstream is asked
 /// first, so a ref that moved upstream is seen now rather than after an explicit
-/// refresh. When it cannot be reached, a mirror that already holds every destination
+/// sync. When it cannot be reached, a mirror that already holds every destination
 /// (`held`) is enough to import from, said out loud, and when it does not, the
 /// failure is the answer.
 fn fetch_or_fall_back(
@@ -816,20 +853,25 @@ fn request_expression(request: &Request) -> String {
 ///
 /// The ends are recorded separately from this, so a pull request that gained commits or
 /// a base that moved still matches — only a different way of asking (another source
-/// repository, another base flag) is a different import.
-fn identity_of(request: &Request, repo: Option<&str>) -> String {
+/// repository, another base flag, the other direction) is a different import: the
+/// forward and the reversed patch of one commit are two different things in the series.
+fn identity_of(request: &Request, repo: Option<&str>, reverse: bool) -> String {
+    let kind = if reverse { "reversed:" } else { "" };
     if let Some(number) = request.pull {
-        return format!("pr:{number}");
+        return format!("{kind}pr:{number}");
     }
     let expression = request_expression(request);
     match repo {
-        Some(url) => format!("repo:{url}#{expression}"),
-        None => format!("range:{expression}"),
+        Some(url) => format!("{kind}repo:{url}#{expression}"),
+        None => format!("{kind}range:{expression}"),
     }
 }
 
 /// The identity as a person would say it, for an error message.
 fn describe_identity(identity: &str) -> String {
+    if let Some(inner) = identity.strip_prefix("reversed:") {
+        return format!("the reverse of {}", describe_identity(inner));
+    }
     match identity.strip_prefix("pr:") {
         Some(number) => format!("pull request {number}"),
         None => identity.to_owned(),
@@ -1040,6 +1082,14 @@ mod tests {
             repo: None,
             name: None,
             no_register: false,
+            reverse: false,
+        }
+    }
+
+    fn reversed(range: Option<&str>) -> ImportArgs {
+        ImportArgs {
+            reverse: true,
+            ..args(range)
         }
     }
 
@@ -1112,6 +1162,60 @@ mod tests {
             text.contains("X-Skot-Import: range:main..feat "),
             "the patch must record where it came from:\n{text}"
         );
+    }
+
+    #[test]
+    fn a_reversed_range_is_the_inverse_patch() {
+        // The use case: upstream deleted something in `feat`; the patch extracted from
+        // `main..feat` removes it, and `--reverse` extracts the same change the other
+        // way round, putting it back.
+        let (_tmp, layout, _main) = fixture();
+
+        let done = import(&layout, &reversed(Some("main..feat"))).unwrap();
+
+        assert!(done.reverse);
+        assert_eq!(done.outcome, Outcome::Created);
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(text.contains("+base"), "the undone change back:\n{text}");
+        assert!(text.contains("-second"), "the removal:\n{text}");
+        assert!(
+            text.contains("Revert \"add the second line\""),
+            "the subject says what the patch does, not what it undoes:\n{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "X-Skot-Import: reversed:range:main..feat {} {} ",
+                done.to_sha, done.from_sha
+            )),
+            "the direction is recorded, ends swapped:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_forward_and_reversed_import_of_one_commit_are_two_patches() {
+        let (_tmp, layout, _main) = fixture();
+
+        let forward = import(&layout, &args(Some("main..feat"))).unwrap();
+        let inverse = import(&layout, &reversed(Some("main..feat"))).unwrap();
+
+        assert_eq!(forward.outcome, Outcome::Created);
+        assert_eq!(inverse.outcome, Outcome::Created);
+        assert_ne!(forward.patch, inverse.patch);
+        let series = std::fs::read_to_string(layout.series_file()).unwrap();
+        assert_eq!(series.lines().count(), 2, "both stay:\n{series}");
+    }
+
+    #[test]
+    fn reimporting_the_same_reversed_range_is_a_no_op() {
+        let (_tmp, layout, _main) = fixture();
+
+        let first = import(&layout, &reversed(Some("main..feat"))).unwrap();
+        let second = import(&layout, &reversed(Some("main..feat"))).unwrap();
+
+        assert_eq!(second.outcome, Outcome::Unchanged);
+        assert_eq!(second.patch, first.patch);
+        let series = std::fs::read_to_string(layout.series_file()).unwrap();
+        assert_eq!(series.lines().count(), 1, "the series must not grow");
     }
 
     #[test]
@@ -1241,6 +1345,122 @@ mod tests {
             1,
             "an update rewrites, it does not add:\n{series}"
         );
+    }
+
+    #[test]
+    fn a_moved_tip_updates_the_reversed_patch_in_place() {
+        // The update path is direction-aware: the reversed patch answers to its own
+        // identity, compares ends the way it recorded them, and reports the previous
+        // commit count in the range's direction.
+        let (_tmp, layout, _main) = fixture();
+        let first = import(&layout, &reversed(Some("feat"))).unwrap();
+
+        let repo = git2::Repository::open_bare(layout.mirror_dir()).unwrap();
+        let tip = repo
+            .find_commit(git2::Oid::from_str(&first.to_sha).unwrap())
+            .unwrap();
+        commit_file(
+            &repo,
+            "refs/heads/feat",
+            "add a third line",
+            b"third\n",
+            &[&tip],
+        );
+
+        let second = import(&layout, &reversed(Some("feat"))).unwrap();
+
+        assert_eq!(second.outcome, Outcome::Updated);
+        assert_eq!(
+            second.patch, first.patch,
+            "the same patch, not a second one"
+        );
+        assert_eq!(second.commits, 2);
+        assert_eq!(
+            second.previous_commits,
+            Some(1),
+            "the count is the range's, not the reversed direction's"
+        );
+        let text = std::fs::read_to_string(&second.path).unwrap();
+        assert!(text.contains("-third"), "the new tip undone:\n{text}");
+        assert!(!text.contains("-second"), "the old one is gone:\n{text}");
+        assert!(text.contains("+base"), "the whole range undone:\n{text}");
+        let series = std::fs::read_to_string(layout.series_file()).unwrap();
+        assert_eq!(series.lines().count(), 1, "an update rewrites:\n{series}");
+    }
+
+    #[test]
+    fn an_edited_reversed_import_is_not_overwritten() {
+        let (_tmp, layout, _main) = fixture();
+        let first = import(&layout, &reversed(Some("feat"))).unwrap();
+
+        let mut text = std::fs::read_to_string(&first.path).unwrap();
+        text.push_str("# my own adjustment\n");
+        std::fs::write(&first.path, text).unwrap();
+
+        let repo = git2::Repository::open_bare(layout.mirror_dir()).unwrap();
+        let tip = repo
+            .find_commit(git2::Oid::from_str(&first.to_sha).unwrap())
+            .unwrap();
+        commit_file(
+            &repo,
+            "refs/heads/feat",
+            "add a third line",
+            b"third\n",
+            &[&tip],
+        );
+
+        let err = import(&layout, &reversed(Some("feat")))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("edited it since"), "got {err}");
+        assert!(err.contains(&first.patch), "names the patch: {err}");
+        assert!(
+            err.contains("the reverse of range:feat"),
+            "the request is described as what it is: {err}"
+        );
+        let after = std::fs::read_to_string(&first.path).unwrap();
+        assert!(
+            after.contains("# my own adjustment"),
+            "your edits must survive:\n{after}"
+        );
+    }
+
+    #[test]
+    fn a_reversed_range_of_several_commits_is_named_for_the_range() {
+        // No single commit speaks for a span, so the name is the range reversed: the
+        // same fallback as a forward import, with what it does in front.
+        let (_tmp, layout, main) = fixture();
+        let repo = git2::Repository::open_bare(layout.mirror_dir()).unwrap();
+        let base = repo
+            .find_commit(git2::Oid::from_str(&main).unwrap())
+            .unwrap();
+        let second = commit_file(
+            &repo,
+            "refs/heads/multi",
+            "add the second line",
+            b"second\n",
+            &[&base],
+        );
+        let third = repo.find_commit(second).unwrap();
+        commit_file(
+            &repo,
+            "refs/heads/multi",
+            "add a third line",
+            b"third\n",
+            &[&third],
+        );
+
+        let done = import(&layout, &reversed(Some("main..multi"))).unwrap();
+
+        assert_eq!(done.commits, 2);
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(
+            text.contains("Subject: [PATCH] Revert main..multi"),
+            "the range is the subject:\n{text}"
+        );
+        assert!(text.contains("+base"), "the span undone:\n{text}");
+        assert!(!text.contains("+second"), "net diff only:\n{text}");
     }
 
     #[test]

@@ -6,11 +6,13 @@ use crate::commands::{Ctx, Exit, emit_json};
 use crate::invocation::skot_args;
 use crate::report;
 use crate::series::Entry;
+use crate::session;
 
 pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
     let (_config, series) = ctx.project()?;
     let entries = series.entries_lenient(&ctx.layout);
     let disabled = series.disabled_lines(&ctx.layout);
+    let unsaved = unsaved_work_areas(&ctx.layout);
 
     if entries.is_empty() && disabled.is_empty() {
         if crate::ui::is_json() {
@@ -47,12 +49,14 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
                     "path": e.path.display().to_string(),
                     "present": e.path.is_file(),
                     "applied": applied.contains(&e.name),
+                    "unsaved": unsaved.contains(&e.name),
                 }))
                 .collect::<Vec<_>>(),
             "disabled": disabled
                 .iter()
                 .map(|(line, name)| serde_json::json!({ "name": name, "line": line }))
                 .collect::<Vec<_>>(),
+            "unsaved": unsaved,
             "missing": missing,
             "applied": applied,
         }))?;
@@ -102,7 +106,14 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
             } else {
                 entry.name.clone()
             };
-            report::item(&format!("{position:>3}  {mark} {name}"));
+            // A work area with unsaved changes is work the patch file does not hold yet:
+            // the name says so rather than making the author remember where they left it.
+            let unsaved_suffix = if unsaved.contains(&entry.name) {
+                report::muted(" (unsaved)").to_string()
+            } else {
+                String::new()
+            };
+            report::item(&format!("{position:>3}  {mark} {name}{unsaved_suffix}"));
             if args.paths && entry.path.is_file() {
                 report::item(&format!(
                     "      {}",
@@ -126,4 +137,53 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
         return Ok(Exit::Failure);
     }
     Ok(Exit::Success)
+}
+
+/// The names of the patches whose work area holds changes the patch file does not, in
+/// whatever order the manifest holds.
+///
+/// Read-only and lockless: a missing manifest or a work area that will not open means
+/// nothing is unsaved, which is all a marker needs to know.
+fn unsaved_work_areas(layout: &crate::layout::Layout) -> Vec<String> {
+    session::Manifest::load(layout)
+        .map(|m| {
+            m.sessions
+                .iter()
+                .filter(|s| session::unsaved(layout, s).unwrap_or(false))
+                .map(|s| s.patch.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::Layout;
+
+    #[test]
+    fn unsaved_work_areas_are_the_manifest_sessions_holding_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(tmp.path());
+
+        assert!(
+            unsaved_work_areas(&layout).is_empty(),
+            "a missing manifest means nothing is unsaved"
+        );
+
+        session::Manifest {
+            sessions: vec![session::Session {
+                patch: "0002-b.patch".to_owned(),
+                dir: "0002-b.patch".to_owned(),
+                ref_name: "main".to_owned(),
+                base_sha: "abc".to_owned(),
+                base_tree: "def".to_owned(),
+            }],
+        }
+        .save(&layout)
+        .unwrap();
+
+        // No work area on disk, so nothing is unsaved: the patch file holds everything.
+        assert!(unsaved_work_areas(&layout).is_empty());
+    }
 }

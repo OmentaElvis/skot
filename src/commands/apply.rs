@@ -100,17 +100,6 @@ pub fn apply_locked(layout: &Layout, ref_name: Option<&str>) -> Result<Applied> 
     apply_inner(layout, ref_name, false, None)
 }
 
-/// [`apply_locked`] for a named subset of the series: membership decides what replays,
-/// the series decides the order. `new` uses it to prepare a sandbox that holds exactly
-/// what the recorded set holds, holes included.
-pub(crate) fn apply_locked_subset(
-    layout: &Layout,
-    ref_name: Option<&str>,
-    only: &[String],
-) -> Result<Applied> {
-    apply_inner(layout, ref_name, false, Some(only))
-}
-
 /// [`apply_locked`] for a run whose sync phase already ensured the ref in this process.
 ///
 /// The fetch-if-missing choke point has been paid moments ago by the same run, so
@@ -357,7 +346,7 @@ fn report_failure(report: &check::Report) {
     info!(
         target: "apply",
         "Rebase the patch against this ref, then `{}` to re-export it.",
-        skot("refresh")
+        skot("edit-save")
     );
 }
 
@@ -650,8 +639,8 @@ index 1111111..2222222 100644
 
     #[test]
     fn apply_twice_is_not_a_conflict() {
-        // Re-running apply is the normal response to a failed one, and to a `refresh` that
-        // rewrote a patch. It must converge rather than report the series against itself.
+        // Re-running apply is the normal response to a failed one, and to a patch that
+        // `edit-save` rewrote. It must converge rather than report the series against itself.
         let f = Fixture::new();
         f.with_upstream();
         f.patch(

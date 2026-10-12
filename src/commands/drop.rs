@@ -14,8 +14,6 @@
 //! nothing here ever guesses. The file the guard will not delete is reported rather than
 //! silently kept.
 
-use std::io::IsTerminal as _;
-
 use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
 use serde_json::json;
@@ -27,6 +25,7 @@ use crate::hints::Hints;
 use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
 use crate::series::FileGone;
+use crate::session;
 use crate::state::State;
 
 /// What `drop` did, presented by [`run`].
@@ -68,7 +67,13 @@ pub fn run(ctx: &Ctx, args: &DropArgs) -> Result<Exit> {
     if state.applied.contains(&name) {
         return Err(refuse_applied(&name));
     }
-    if !confirmed(ctx, &name)? {
+    // An open work area is work the patch holds outside `patches/`, so it goes with the
+    // patch rather than being left behind as a husk. Saying so before the question keeps
+    // the two from being two decisions.
+    let work_area = session::Manifest::load(&ctx.layout)
+        .map(|m| m.get(&name).cloned())
+        .unwrap_or(None);
+    if !confirmed(ctx, &name, work_area.as_ref())? {
         info!(target: "drop", "kept {name}; nothing was removed");
         return Ok(Exit::Failure);
     }
@@ -77,6 +82,16 @@ pub fn run(ctx: &Ctx, args: &DropArgs) -> Result<Exit> {
         remove_disabled(&ctx.layout, &name)?
     } else {
         remove(&ctx.layout, &name)?
+    };
+    // The record must not outlive the worktree it names, so the work area is retired as
+    // part of the same decision that took the patch out.
+    let retired = if let Some(work_area) = work_area {
+        let lock = ctx.layout.lock()?;
+        session::end(&ctx.layout, &work_area)?;
+        drop(lock);
+        Some(work_area.patch)
+    } else {
+        None
     };
 
     if ctx.cli.json {
@@ -94,6 +109,7 @@ pub fn run(ctx: &Ctx, args: &DropArgs) -> Result<Exit> {
                 FileGone::Kept(path) => Some(path.display().to_string()),
                 _ => None,
             },
+            "work_area_retired": retired,
             "left": removed.left,
         }))?;
         return Ok(Exit::Success);
@@ -108,6 +124,9 @@ pub fn run(ctx: &Ctx, args: &DropArgs) -> Result<Exit> {
         )
     };
     info!(target: "drop", "removed {}; {holding}", removed.name);
+    if let Some(patch) = &retired {
+        info!(target: "drop", "retired the work area on {patch}");
+    }
     match &removed.file {
         FileGone::Kept(path) => warn!(
             target: "drop",
@@ -149,6 +168,12 @@ fn remove(layout: &Layout, want: &str) -> Result<Removed> {
     let removal = series.remove_renumbering(layout, &name)?;
     series.save(layout)?;
     state.follow_renames(layout, &removal.renames)?;
+    // A work area opened on a patch the renumbering renamed keeps its worktree and follows
+    // the new name, the same way the applied set does. The dropped patch's own work area is
+    // not this function's business: `run` retires it, having already resolved it.
+    let mut sessions = session::Manifest::load(layout)?;
+    sessions.follow_renames(&removal.renames);
+    sessions.save(layout)?;
     drop(lock);
 
     Ok(Removed {
@@ -182,20 +207,40 @@ fn remove_disabled(layout: &Layout, name: &str) -> Result<Removed> {
 }
 
 /// The question, before anything is deleted: a `--yes` caller has already answered.
-fn confirmed(ctx: &Ctx, name: &str) -> Result<bool> {
+///
+/// An open work area changes the stakes from "the file goes" to "the file and the edits
+/// go", and it changes the wording for the same reason: someone who only meant to tidy the
+/// series should not lose a worktree full of unsaved work by answering a question that
+/// never mentioned it.
+fn confirmed(ctx: &Ctx, name: &str, work_area: Option<&session::Session>) -> Result<bool> {
     if ctx.yes {
         return Ok(true);
     }
-    if ctx.cli.json || !std::io::stdin().is_terminal() {
+    if ctx.cli.json || !crate::ui::stdin_is_terminal() {
         bail!(
             "cannot ask before deleting a patch here.\n`{}` means it.",
             skot_args("drop", "<patch> --yes")
         );
     }
-    let question = format!("Drop {name} and delete its file?");
+    let (question, help) = match work_area {
+        Some(session) => (
+            format!(
+                "Drop {name}, delete its file, and retire its work area at {}?",
+                ctx.layout
+                    .work_patch_dir(session.dir_name())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| session.patch.clone())
+            ),
+            "The worktree goes with it, so anything unsaved is lost. Esc keeps both.",
+        ),
+        None => (
+            format!("Drop {name} and delete its file?"),
+            "Its line leaves the series and the tail renumbers down. Esc keeps it.",
+        ),
+    };
     inquire::Confirm::new(&question)
         .with_default(false)
-        .with_help_message("Its line leaves the series and the tail renumbers down. Esc keeps it.")
+        .with_help_message(help)
         .prompt()
         .context("confirming the drop")
 }
@@ -572,5 +617,105 @@ mod tests {
         );
         assert!(!tmp.path().join("patches").join("0002-b.patch").exists());
         assert!(tmp.path().join("patches").join("0002-c.patch").is_file());
+    }
+
+    /// A two-patch series on a mirror that serves `main`, with no sessions open: the state
+    /// a drop runs in when authoring is in play.
+    fn series_on_a_mirror(root: &std::path::Path) -> Layout {
+        let (layout, _sha) = testsupport::mirror_with_one_commit(root);
+        std::fs::write(
+            layout.config_file(),
+            "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
+        )
+        .unwrap();
+        testsupport::write_series(
+            &layout,
+            &[
+                ("0001-a.patch", testsupport::patch_one()),
+                ("0002-b.patch", ""),
+            ],
+        );
+        layout
+    }
+
+    #[test]
+    fn dropping_a_patch_retires_its_work_area_too() {
+        // A work area is work the patch holds outside `patches/`. Leaving it behind would
+        // strand a worktree whose patch no longer exists, reachable only by knowing to go
+        // looking for it.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = series_on_a_mirror(tmp.path());
+        let entries = layout.project().unwrap().1.entries(&layout).unwrap();
+        let plan = crate::session::plan(&layout, "main", &entries[..1], Some(&entries[1])).unwrap();
+        crate::session::materialise(&layout, "0002-b.patch", &plan).unwrap();
+        let cli = Cli::try_parse_from(["skot", "patch", "drop", "0002-b.patch", "--yes"]).unwrap();
+        let ctx = Ctx {
+            layout: layout.clone(),
+            cli,
+            yes: true,
+        };
+
+        let exit = run(
+            &ctx,
+            &DropArgs {
+                patch: "0002-b.patch".to_owned(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(exit, Exit::Success);
+        assert!(
+            !layout.work_dir().join("0002-b.patch").exists(),
+            "the work area went with the patch"
+        );
+        assert!(
+            crate::session::Manifest::load(&layout)
+                .unwrap()
+                .get("0002-b.patch")
+                .is_none(),
+            "the manifest forgets it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(layout.series_file()).unwrap(),
+            "0001-a.patch\n"
+        );
+        drop(tmp);
+    }
+
+    #[test]
+    fn a_work_area_on_a_different_patch_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = series_on_a_mirror(tmp.path());
+        let entries = layout.project().unwrap().1.entries(&layout).unwrap();
+        let plan = crate::session::plan(&layout, "main", &[], Some(&entries[0])).unwrap();
+        crate::session::materialise(&layout, "0001-a.patch", &plan).unwrap();
+        let cli = Cli::try_parse_from(["skot", "patch", "drop", "0002-b.patch", "--yes"]).unwrap();
+        let ctx = Ctx {
+            layout: layout.clone(),
+            cli,
+            yes: true,
+        };
+
+        let exit = run(
+            &ctx,
+            &DropArgs {
+                patch: "0002-b.patch".to_owned(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(exit, Exit::Success);
+        assert!(
+            layout.work_dir().join("0001-a.patch").exists(),
+            "the unrelated work area must survive"
+        );
+        assert!(
+            crate::session::Manifest::load(&layout)
+                .unwrap()
+                .get("0001-a.patch")
+                .is_some(),
+            "and stay recorded"
+        );
+        drop(tmp);
     }
 }

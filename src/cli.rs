@@ -98,8 +98,11 @@ pub enum PatchCommand {
     /// another one.
     Import(ImportArgs),
 
-    /// Re-export your edits to the patch file.
-    Refresh(RefreshArgs),
+    /// Save your edits to the patch file.
+    EditSave(EditSaveArgs),
+
+    /// Open an existing patch for editing, in a worktree of its own.
+    Edit(EditArgs),
 
     /// Apply the enabled set to the sandbox; choose it with enable and disable.
     Apply(RefArg),
@@ -162,7 +165,7 @@ const ROOT_GROUPS: &[(&str, &[&str])] = &[
 
 /// `skot patch --help`'s groups, same shape as [`ROOT_GROUPS`].
 const PATCH_GROUPS: &[(&str, &[&str])] = &[
-    ("Author", &["new", "import", "refresh"]),
+    ("Author", &["new", "edit", "edit-save", "import"]),
     ("Arrange", &["enable", "disable", "move", "drop"]),
     ("Apply", &["apply", "unapply", "push", "pop"]),
     ("Inspect", &["list"]),
@@ -277,8 +280,11 @@ fn quick_start() -> StyledStr {
     for (command, purpose) in [
         (skot_args("init", "--url <URL>"), "once, per project"),
         (skot("build"), "fetches upstream if needed"),
-        (skot_args("new", "my-fix"), "edit the sandbox, then:"),
-        (skot("refresh"), "record the edit"),
+        (
+            skot_args("new", "my-fix"),
+            "work in the worktree skot opens, then:",
+        ),
+        (skot("edit-save"), "save your changes"),
     ] {
         out.push_str(&format!(
             "  {}{command:<28}{}{purpose}\n",
@@ -323,13 +329,15 @@ pub struct CheckArgs {
 }
 
 /// How much `clean` removes. Ordered, so that each level is a superset of the one
-/// before it, which the `clean` tests assert.
+/// before it, which the `clean` tests assert. Work areas with unsaved changes are not part
+/// of any level: they are an axis of their own (`--sessions`), never a side effect of
+/// tidying.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
 pub enum CleanLevel {
     /// The sandbox. Next build reinstalls dependencies.
-    Build,
-    /// The sandbox and everything skot generated under .skot/out.
     Sandbox,
+    /// Also everything skot generated under .skot/out.
+    Out,
     /// Also the bare mirror. Next run re-clones.
     Mirror,
     /// All of it. Next run re-clones and reinstalls.
@@ -339,8 +347,16 @@ pub enum CleanLevel {
 #[derive(Debug, Clone, Args)]
 pub struct CleanArgs {
     /// How much to remove.
-    #[arg(value_enum, default_value_t = CleanLevel::Build)]
+    #[arg(value_enum, default_value_t = CleanLevel::Sandbox)]
     pub level: CleanLevel,
+
+    /// Also drop work areas that hold unsaved changes.
+    ///
+    /// Work areas are never in a default plan: their directories hold edits that exist
+    /// nowhere else until `edit-save` writes them into a patch. `mirror` and `all` refuse
+    /// while any remain, and a work area that matches its patch is already gone by then.
+    #[arg(long)]
+    pub sessions: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -468,6 +484,12 @@ pub struct ImportArgs {
     /// Write the patch file without adding it to the series.
     #[arg(long)]
     pub no_register: bool,
+
+    /// Extract the range's diff the other way round: the patch undoes the change the
+    /// range made, the way `git revert` would, but stays an ordinary patch in the
+    /// series. How you put back a feature upstream deleted.
+    #[arg(long, short = 'r')]
+    pub reverse: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -486,8 +508,8 @@ pub struct NewArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct RefreshArgs {
-    /// Patch to refresh. Defaults to the one currently being authored.
+pub struct EditSaveArgs {
+    /// Patch to save into. Defaults to the work area with unsaved changes.
     pub name: Option<String>,
 
     /// Where to insert it in the series. Patches after it are renumbered so the numbers
@@ -498,6 +520,26 @@ pub struct RefreshArgs {
     /// Do not add it to the series.
     #[arg(long)]
     pub no_register: bool,
+
+    /// Save even though the patches below changed since the work area opened, against the
+    /// base it recorded rather than the one the series now produces.
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct EditArgs {
+    /// Patch to open, as the series lists it.
+    #[arg(value_name = "PATCH")]
+    pub patch: String,
+
+    /// Open on this ref instead of the recorded one.
+    #[arg(long, value_name = "REF")]
+    pub base: Option<String>,
+
+    /// Discard the unsaved changes in the work area and start over from the patch.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -583,19 +625,20 @@ mod tests {
     }
 
     #[test]
-    fn clean_defaults_to_the_build_level() {
+    fn clean_defaults_to_the_sandbox_level() {
         let cli = Cli::try_parse_from(["skot", "clean"]).unwrap();
         let Command::Clean(args) = cli.command else {
             panic!("expected clean")
         };
-        assert_eq!(args.level, CleanLevel::Build);
+        assert_eq!(args.level, CleanLevel::Sandbox);
+        assert!(!args.sessions, "sessions are never in the default plan");
     }
 
     #[test]
     fn clean_levels_parse_by_name() {
         for (text, expected) in [
-            ("build", CleanLevel::Build),
             ("sandbox", CleanLevel::Sandbox),
+            ("out", CleanLevel::Out),
             ("mirror", CleanLevel::Mirror),
             ("all", CleanLevel::All),
         ] {
@@ -605,6 +648,10 @@ mod tests {
             };
             assert_eq!(args.level, expected);
         }
+        assert!(
+            Cli::try_parse_from(["skot", "clean", "--sessions"]).is_ok(),
+            "sessions are an axis flag, not a level"
+        );
     }
 
     #[test]
@@ -677,7 +724,7 @@ mod tests {
         let err = Cli::try_parse_from(["skot", "clean", "everything"])
             .unwrap_err()
             .to_string();
-        for level in ["build", "sandbox", "mirror", "all"] {
+        for level in ["sandbox", "out", "mirror", "all"] {
             assert!(err.contains(level), "error should list {level}: {err}");
         }
     }
@@ -764,11 +811,14 @@ mod tests {
             .map(|about| about.to_string());
         assert_eq!(help_about.as_deref(), Some(HELP_ABOUT));
 
-        // Each listed command appears exactly once, as one styled row.
+        // Each listed command appears exactly once, as one styled row. Matched on a whole
+        // word because `edit` is a prefix of `edit-save` and a substring count would see
+        // the longer row twice.
         for name in listed_names(ROOT_GROUPS) {
             assert_eq!(
                 root_help
-                    .matches(&format!("{}{name}", LITERAL.render()))
+                    .lines()
+                    .filter(|l| row_name(l).as_deref() == Some(name.as_str()))
                     .count(),
                 1,
                 "`{name}` should be rendered as a row exactly once"
@@ -776,7 +826,8 @@ mod tests {
         }
         assert_eq!(
             root_help
-                .matches(&format!("{}help", LITERAL.render()))
+                .lines()
+                .filter(|l| row_name(l).as_deref() == Some("help"))
                 .count(),
             1,
             "clap's help should be rendered as a row exactly once"
@@ -799,12 +850,48 @@ mod tests {
         for name in listed_names(PATCH_GROUPS) {
             assert_eq!(
                 patch_help
-                    .matches(&format!("{}{name}", LITERAL.render()))
+                    .lines()
+                    .filter(|l| row_name(l).as_deref() == Some(name.as_str()))
                     .count(),
                 1,
                 "`{name}` should be rendered as a row exactly once"
             );
         }
+    }
+
+    /// The command name at the start of a rendered help row, if the line is one.
+    ///
+    /// Whole-row, whole-word: `edit` is a prefix of `edit-save`, and a styled substring
+    /// count would see the longer row as both.
+    fn row_name(line: &str) -> Option<String> {
+        let stripped = strip_ansi(line);
+        let mut words = stripped.split_whitespace().map(str::to_owned);
+        let name = words.next()?;
+        // A row's name is followed by its description; a bare word with nothing after it
+        // is a heading or an option, not a command row.
+        words.next()?;
+        name.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase())
+            .then_some(name)
+    }
+
+    /// Remove ANSI escapes so a row's words can be compared plainly.
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     #[test]
@@ -902,6 +989,19 @@ mod tests {
             Cli::try_parse_from(["skot", "patch", "enable", "0003", "--all"]).is_err(),
             "--all and names are two different questions"
         );
+        // The reversed extraction of `import`, by either spelling.
+        for flag in ["--reverse", "-r"] {
+            let cli = Cli::try_parse_from(["skot", "patch", "import", "main..feat", flag]).unwrap();
+            let Command::Patch(PatchCommand::Import(args)) = cli.command else {
+                panic!("expected import");
+            };
+            assert!(args.reverse, "{flag} should set reverse");
+        }
+        let cli = Cli::try_parse_from(["skot", "patch", "import", "main..feat"]).unwrap();
+        let Command::Patch(PatchCommand::Import(args)) = cli.command else {
+            panic!("expected import");
+        };
+        assert!(!args.reverse, "reversed is the opt-in");
     }
 
     /// Every name in the tables exists in the tree, appears once across the tables,

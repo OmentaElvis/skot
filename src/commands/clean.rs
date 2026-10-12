@@ -1,16 +1,22 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use log::warn;
 
 use crate::cli::{CleanArgs, CleanLevel};
 use crate::commands::{Ctx, Exit, emit_json};
+use crate::invocation::skot_args;
 use crate::layout::{self, Layout};
 use crate::report;
+use crate::session;
 
 /// What a clean level would remove.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub level: CleanLevel,
     pub paths: Vec<(String, std::path::PathBuf)>,
+    /// The patches whose work areas this plan drops, if any. Work areas with unsaved
+    /// changes are an axis, not a level: they only appear when `--sessions` asked for
+    /// them. Work areas that match their patch are derived state and join any plan.
+    pub sessions: Vec<String>,
 }
 
 impl Plan {
@@ -18,17 +24,40 @@ impl Plan {
     ///
     /// The sandbox and the mirror are listed whenever they exist, because only a real
     /// build or a real sync ever creates them. The out directory gets a stricter test:
-    /// `skot init` creates it empty, so counting it would leave every `clean --all`
-    /// with one entry that reclaims nothing, and a message that is always the same is a
+    /// `skot init` creates it empty, so counting it would leave every `clean out` with
+    /// one entry that reclaims nothing, and a message that is always the same is a
     /// message people stop reading.
-    pub fn for_level(layout: &Layout, level: CleanLevel) -> Self {
+    ///
+    /// Work areas are split by whether they hold unsaved changes. A work area that
+    /// matches its patch holds nothing the patch file does not, so it is derived state
+    /// like the sandbox: every plan reaps the saved ones, one directory at a time so an
+    /// unsaved sibling is never taken with them. Unsaved work areas join only when
+    /// `with_sessions` says so, and even then they sit after the sandbox (their worktrees
+    /// are registered in the mirror and must be pruned while it still exists) and before
+    /// the mirror itself.
+    pub fn for_level(layout: &Layout, level: CleanLevel, with_sessions: bool) -> Self {
         let mut paths = Vec::new();
+        let mut sessions = Vec::new();
         let sandbox = layout.sandbox_dir();
         if sandbox.exists() {
             paths.push(("the sandbox".to_owned(), sandbox));
         }
+        let open = open_sessions(layout);
+        if with_sessions && !open.is_empty() {
+            // The whole work directory goes: the unsaved ones were asked for, and the
+            // saved ones inside it are derived state that would have gone anyway.
+            paths.push(("work areas".to_owned(), layout.work_dir()));
+            sessions = open;
+        } else {
+            // Saved ones only, one directory at a time so an unsaved sibling is never
+            // taken with them. This is also the `--sessions` plan when nothing is
+            // unsaved: there is nothing protected left to ask about.
+            for (patch, dir) in saved_work_areas(layout) {
+                paths.push((format!("{patch} (saved)"), dir));
+            }
+        }
         let out = layout.out_dir();
-        if level >= CleanLevel::Sandbox && holds_content(&out) {
+        if level >= CleanLevel::Out && holds_content(&out) {
             paths.push(("the out directory".to_owned(), out));
         }
         let mirror = layout.mirror_dir();
@@ -41,7 +70,11 @@ impl Plan {
                 paths.push(("the lock file".to_owned(), lock));
             }
         }
-        Self { level, paths }
+        Self {
+            level,
+            paths,
+            sessions,
+        }
     }
 
     pub fn bytes(&self) -> u64 {
@@ -62,8 +95,64 @@ fn holds_content(path: &std::path::Path) -> bool {
     std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_some())
 }
 
+/// The patches with a work area that holds unsaved changes, in a stable order.
+///
+/// Only these are worth a complaint: their edits exist nowhere else. A work area that
+/// matches its patch is derived state, reaped like the sandbox. A comparison that fails
+/// counts as unsaved: the safe direction is to protect it, not to delete it.
+fn open_sessions(layout: &Layout) -> Vec<String> {
+    session::Manifest::load(layout)
+        .map(|m| {
+            m.sessions
+                .iter()
+                .filter(|s| session::unsaved(layout, s).unwrap_or(true))
+                .map(|s| s.patch.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The work areas that hold nothing their patch does not: derived state, safe to reap.
+/// Paired with the directory so each can be pruned individually.
+fn saved_work_areas(layout: &Layout) -> Vec<(String, std::path::PathBuf)> {
+    session::Manifest::load(layout)
+        .map(|m| {
+            m.sessions
+                .iter()
+                .filter(|s| matches!(session::unsaved(layout, s), Ok(false)))
+                .filter_map(|s| {
+                    layout
+                        .work_patch_dir(s.dir_name())
+                        .ok()
+                        .map(|dir| (s.patch.clone(), dir))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn run(ctx: &Ctx, args: &CleanArgs) -> Result<Exit> {
-    let plan = Plan::for_level(&ctx.layout, args.level);
+    let open = open_sessions(&ctx.layout);
+
+    // Removing the mirror orphans every work area with unsaved changes: their worktrees are
+    // registered in it, so without it they are directories nothing can open, holding edits
+    // that exist nowhere else. That is not a side effect a tidy is allowed to have
+    // silently, so it is refused until those work areas are named as the thing to drop.
+    // Work areas that match their patch are already in the plan as derived state.
+    if !args.sessions && args.level >= CleanLevel::Mirror && !open.is_empty() {
+        bail!(
+            "{} would orphan {} work area(s) with unsaved changes: {}.\n\
+             Their worktrees live in the mirror, so the edits would be unreachable.\n\
+             `{}` drops them with the rest; `{}` saves one when you are done with it.",
+            label(args.level),
+            open.len(),
+            open.join(", "),
+            skot_args("clean", "--sessions"),
+            skot_args("edit-save", "<patch>"),
+        );
+    }
+
+    let plan = Plan::for_level(&ctx.layout, args.level, args.sessions);
 
     if ctx.cli.json {
         emit_json(&serde_json::json!({
@@ -73,6 +162,7 @@ pub fn run(ctx: &Ctx, args: &CleanArgs) -> Result<Exit> {
                 "path": p.display().to_string(),
                 "size": layout::human_bytes(layout::dir_size(p)),
             })).collect::<Vec<_>>(),
+            "sessions": plan.sessions,
             "bytes": plan.bytes(),
             "dry_run": !ctx.yes,
         }))?;
@@ -83,6 +173,14 @@ pub fn run(ctx: &Ctx, args: &CleanArgs) -> Result<Exit> {
 
     if plan.is_empty() {
         report::note("nothing to clean");
+        if !open.is_empty() {
+            report::note(&format!(
+                "Keeping {} work area(s) with unsaved changes: {}. `{}` saves them.",
+                open.len(),
+                open.join(", "),
+                skot_args("edit-save", "<patch>")
+            ));
+        }
         return Ok(Exit::Success);
     }
 
@@ -111,8 +209,12 @@ pub fn run(ctx: &Ctx, args: &CleanArgs) -> Result<Exit> {
 
     // The record must not outlive the tree it describes. `ref_name` and `sha` are left
     // alone: they are the last known apply target, which is what `unapply` needs if a
-    // mirror happens to still be there, and the sandbox is gone either way.
-    crate::state::State::load(&ctx.layout)?.clear_applied(&ctx.layout)?;
+    // mirror happens to still be there, and the sandbox is gone either way. Nothing is
+    // cleared when the plan held only work areas: a work area is not an apply, and
+    // the set it left behind is exactly what the next run should still see.
+    if args.level >= CleanLevel::Sandbox {
+        crate::state::State::load(&ctx.layout)?.clear_applied(&ctx.layout)?;
+    }
 
     drop(lock);
 
@@ -131,9 +233,37 @@ pub fn run(ctx: &Ctx, args: &CleanArgs) -> Result<Exit> {
 /// with "directory exists" inside the mirror's `worktrees/` directory — a libgit2 message
 /// that never mentions the clean that caused it. The plan always lists the sandbox before
 /// the mirror, so this runs while there is still a mirror to unregister from.
+///
+/// Work areas are the same shape: each worktree is registered in the mirror, so they are
+/// ended one by one (pruning the registration) before the whole work directory goes, and
+/// a single saved work area is ended by name rather than deleted as a bare directory.
 fn remove_one(layout: &Layout, label: &str, path: &std::path::Path) -> Result<()> {
     if label == "the sandbox" {
         crate::git::sandbox::remove(layout)?;
+        return Ok(());
+    }
+    if label == "work areas" {
+        for s in session::Manifest::load(layout)?.sessions {
+            session::end(layout, &s)?;
+        }
+        let _ = layout.guarded_remove(path)?;
+        return Ok(());
+    }
+    if label.ends_with(" (saved)") {
+        let patch = label.trim_end_matches(" (saved)");
+        if let Some(s) = session::Manifest::load(layout)?
+            .sessions
+            .into_iter()
+            .find(|s| {
+                s.patch == patch
+                    || std::path::Path::new(&s.patch)
+                        .file_name()
+                        .is_some_and(|f| f == patch)
+            })
+        {
+            session::end(layout, &s)?;
+        }
+        let _ = layout.guarded_remove(path)?;
         return Ok(());
     }
     let _ = layout.guarded_remove(path)?;
@@ -142,8 +272,8 @@ fn remove_one(layout: &Layout, label: &str, path: &std::path::Path) -> Result<()
 
 fn label(level: CleanLevel) -> &'static str {
     match level {
-        CleanLevel::Build => "build (the sandbox; next build reinstalls dependencies)",
-        CleanLevel::Sandbox => "sandbox (also the out directory)",
+        CleanLevel::Sandbox => "sandbox (the worktree; next build reinstalls dependencies)",
+        CleanLevel::Out => "out (also the generated out directory)",
         CleanLevel::Mirror => "mirror (also the bare mirror; next run re-clones)",
         CleanLevel::All => "all (everything under .skot; next run re-clones and reinstalls)",
     }
@@ -152,6 +282,7 @@ fn label(level: CleanLevel) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser as _;
 
     fn layout() -> (tempfile::TempDir, Layout) {
         let tmp = tempfile::tempdir().unwrap();
@@ -166,7 +297,7 @@ mod tests {
         std::fs::create_dir_all(l.sandbox_dir()).unwrap();
         std::fs::create_dir_all(l.mirror_dir()).unwrap();
 
-        let plan = Plan::for_level(&l, CleanLevel::Build);
+        let plan = Plan::for_level(&l, CleanLevel::Sandbox, false);
         assert_eq!(plan.paths.len(), 1);
         assert_eq!(plan.paths[0].1, l.sandbox_dir());
     }
@@ -179,12 +310,12 @@ mod tests {
         }
         let mut previous = 0;
         for level in [
-            CleanLevel::Build,
             CleanLevel::Sandbox,
+            CleanLevel::Out,
             CleanLevel::Mirror,
             CleanLevel::All,
         ] {
-            let plan = Plan::for_level(&l, level);
+            let plan = Plan::for_level(&l, level, false);
             assert!(
                 plan.paths.len() >= previous,
                 "{level:?} removed less than the level before"
@@ -196,7 +327,7 @@ mod tests {
     #[test]
     fn a_plan_is_empty_when_there_is_nothing_to_clean() {
         let (_tmp, l) = layout();
-        assert!(Plan::for_level(&l, CleanLevel::All).is_empty());
+        assert!(Plan::for_level(&l, CleanLevel::All, false).is_empty());
     }
 
     #[test]
@@ -208,12 +339,12 @@ mod tests {
         std::fs::write(l.series_file(), "0001-a.patch\n").unwrap();
 
         for level in [
-            CleanLevel::Build,
             CleanLevel::Sandbox,
+            CleanLevel::Out,
             CleanLevel::Mirror,
             CleanLevel::All,
         ] {
-            let plan = Plan::for_level(&l, level);
+            let plan = Plan::for_level(&l, level, true);
             for (_, path) in &plan.paths {
                 assert!(
                     !path.starts_with(l.patches_dir()),
@@ -226,12 +357,12 @@ mod tests {
 
     #[test]
     fn clean_labels_explain_the_recovery_cost() {
-        assert!(label(CleanLevel::Build).contains("reinstalls"));
+        assert!(label(CleanLevel::Sandbox).contains("reinstalls"));
         assert!(label(CleanLevel::Mirror).contains("re-clones"));
     }
 
     /// A bare mirror with one commit, a sandbox worktree registered in it, and the state
-    /// file — the minimum for `clean build` to have something real to remove.
+    /// file: the minimum for `clean sandbox` to have something real to remove.
     fn layout_with_sandbox() -> (tempfile::TempDir, Layout) {
         let (tmp, l) = layout();
         std::fs::create_dir_all(l.mirror_dir()).unwrap();
@@ -267,7 +398,7 @@ mod tests {
         // mirror, and the next apply died with a raw libgit2 "directory exists" from inside
         // the mirror — with nothing pointing at the clean that caused it.
         let (_tmp, l) = layout_with_sandbox();
-        let plan = Plan::for_level(&l, CleanLevel::Build);
+        let plan = Plan::for_level(&l, CleanLevel::Sandbox, false);
 
         for (label, path) in &plan.paths {
             remove_one(&l, label, path).unwrap();
@@ -290,7 +421,7 @@ mod tests {
     fn cleaning_the_mirror_removes_the_sandbox_first() {
         // Order is load-bearing: pruning needs the mirror to still be there.
         let (_tmp, l) = layout_with_sandbox();
-        let plan = Plan::for_level(&l, CleanLevel::Mirror);
+        let plan = Plan::for_level(&l, CleanLevel::Mirror, false);
         let sandbox = plan.paths.iter().position(|(n, _)| n == "the sandbox");
         let mirror = plan.paths.iter().position(|(n, _)| n == "the mirror");
         assert!(
@@ -302,6 +433,239 @@ mod tests {
             remove_one(&l, label, path).unwrap();
         }
         assert!(!l.mirror_dir().exists());
+        assert!(!l.sandbox_dir().exists());
+    }
+
+    /// A project with a mirror, a two-patch series, and a work area on each holding
+    /// unsaved changes: the state `clean` has to be careful around.
+    fn layout_with_work_areas(root: &std::path::Path) -> Layout {
+        let (l, _sha) = crate::commands::testsupport::mirror_with_one_commit(root);
+        std::fs::write(
+            l.config_file(),
+            "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
+        )
+        .unwrap();
+        crate::commands::testsupport::write_series(
+            &l,
+            &[
+                ("0001-a.patch", crate::commands::testsupport::patch_one()),
+                ("0002-b.patch", crate::commands::testsupport::patch_two()),
+            ],
+        );
+        let entries = l.project().unwrap().1.entries(&l).unwrap();
+        for entry in &entries {
+            let below = entries
+                .iter()
+                .take_while(|e| e.line < entry.line)
+                .cloned()
+                .collect::<Vec<_>>();
+            let plan = session::plan(&l, "main", &below, Some(entry)).unwrap();
+            session::materialise(&l, &entry.name, &plan).unwrap();
+            // Something the patch file does not have, so the work area counts as unsaved
+            // and is protected rather than reaped as derived state.
+            let dir = l.work_patch_dir(&entry.name).unwrap();
+            std::fs::write(dir.join("unsaved.txt"), "work in progress\n").unwrap();
+        }
+        l
+    }
+
+    #[test]
+    fn unsaved_work_areas_are_never_in_a_default_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = layout_with_work_areas(tmp.path());
+
+        for level in [
+            CleanLevel::Sandbox,
+            CleanLevel::Out,
+            CleanLevel::Mirror,
+            CleanLevel::All,
+        ] {
+            let plan = Plan::for_level(&l, level, false);
+            assert!(
+                !plan.paths.iter().any(|(n, _)| n == "work areas"),
+                "{level:?} must not touch unsaved work areas on its own"
+            );
+            assert!(plan.sessions.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_saved_work_area_is_derived_state_and_joins_every_plan() {
+        // Nothing unsaved in it, so the patch file holds everything it does: reaped like
+        // the sandbox, one directory at a time so an unsaved sibling is never taken too.
+        let tmp = tempfile::tempdir().unwrap();
+        let (l, _sha) = crate::commands::testsupport::mirror_with_one_commit(tmp.path());
+        std::fs::write(
+            l.config_file(),
+            "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
+        )
+        .unwrap();
+        crate::commands::testsupport::write_series(
+            &l,
+            &[("0001-a.patch", crate::commands::testsupport::patch_one())],
+        );
+        let entries = l.project().unwrap().1.entries(&l).unwrap();
+        let plan = session::plan(&l, "main", &[], Some(&entries[0])).unwrap();
+        session::materialise(&l, "0001-a.patch", &plan).unwrap();
+
+        let plan = Plan::for_level(&l, CleanLevel::Sandbox, false);
+
+        assert!(
+            plan.paths.iter().any(|(n, _)| n == "0001-a.patch (saved)"),
+            "a saved work area is derived state: {plan:?}"
+        );
+        assert!(plan.sessions.is_empty(), "and is not an unsaved complaint");
+
+        for (label, path) in &plan.paths {
+            remove_one(&l, label, path).unwrap();
+        }
+        assert!(
+            !l.work_patch_dir("0001-a.patch").unwrap().exists(),
+            "the work area is gone"
+        );
+        assert!(
+            session::Manifest::load(&l).unwrap().sessions.is_empty(),
+            "and so is its record"
+        );
+        assert!(l.mirror_dir().exists(), "the mirror is untouched");
+    }
+
+    #[test]
+    fn unsaved_work_areas_join_the_plan_only_when_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = layout_with_work_areas(tmp.path());
+
+        let plan = Plan::for_level(&l, CleanLevel::Sandbox, true);
+
+        assert_eq!(
+            plan.sessions,
+            ["0001-a.patch", "0002-b.patch"],
+            "both work areas with unsaved changes are named"
+        );
+        assert!(plan.paths.iter().any(|(n, _)| n == "work areas"));
+        let (_, path) = plan.paths.iter().find(|(n, _)| n == "work areas").unwrap();
+        assert_eq!(path, &l.work_dir());
+    }
+
+    #[test]
+    fn work_areas_go_after_the_sandbox_and_before_the_mirror() {
+        // Both orderings are load-bearing: pruning a worktree needs the mirror, and the
+        // sandbox is a worktree too, so it is unregistered first.
+        let tmp = tempfile::tempdir().unwrap();
+        let l = layout_with_work_areas(tmp.path());
+        std::fs::create_dir_all(l.sandbox_dir()).unwrap();
+
+        let plan = Plan::for_level(&l, CleanLevel::Mirror, true);
+        let sandbox = plan.paths.iter().position(|(n, _)| n == "the sandbox");
+        let sessions = plan.paths.iter().position(|(n, _)| n == "work areas");
+        let mirror = plan.paths.iter().position(|(n, _)| n == "the mirror");
+
+        assert!(sandbox.unwrap() < sessions.unwrap());
+        assert!(sessions.unwrap() < mirror.unwrap());
+    }
+
+    #[test]
+    fn cleaning_work_areas_prunes_their_worktrees_and_keeps_the_mirror() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = layout_with_work_areas(tmp.path());
+
+        let plan = Plan::for_level(&l, CleanLevel::Sandbox, true);
+        for (label, path) in &plan.paths {
+            remove_one(&l, label, path).unwrap();
+        }
+
+        assert!(
+            !l.work_dir().exists(),
+            "the work directory goes with the work areas"
+        );
+        assert!(
+            session::Manifest::load(&l).unwrap().sessions.is_empty(),
+            "the manifest is emptied"
+        );
+        assert!(
+            l.mirror_dir().exists(),
+            "a sandbox-level clean never touches the mirror"
+        );
+        let repo = git2::Repository::open_bare(l.mirror_dir()).unwrap();
+        for name in ["0001-a.patch", "0002-b.patch"] {
+            assert!(
+                repo.find_worktree(name).is_err(),
+                "{name}'s registration outlived the clean"
+            );
+        }
+    }
+
+    #[test]
+    fn removing_the_mirror_with_unsaved_changes_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let l = layout_with_work_areas(tmp.path());
+        let ctx = Ctx {
+            layout: l.clone(),
+            cli: crate::cli::Cli::try_parse_from(["skot", "clean", "mirror"]).unwrap(),
+            yes: true,
+        };
+        let args = CleanArgs {
+            level: CleanLevel::Mirror,
+            sessions: false,
+        };
+
+        let err = run(&ctx, &args).unwrap_err().to_string();
+
+        assert!(err.contains("orphan"), "it should say why: {err}");
+        assert!(err.contains("0001-a.patch"), "it should name them: {err}");
+        assert!(err.contains(&skot_args("clean", "--sessions")), "{err}");
+        assert!(
+            err.contains(&skot_args("edit-save", "<patch>")),
+            "it should say how to save them: {err}"
+        );
+        assert!(
+            l.mirror_dir().exists(),
+            "the refusal left everything in place"
+        );
+        assert!(
+            l.work_dir().exists(),
+            "the work areas are still there to be saved"
+        );
+    }
+
+    #[test]
+    fn all_is_refused_while_changes_are_unsaved_and_allowed_once_asked() {
+        let refused_root = tempfile::tempdir().unwrap();
+        let l = layout_with_work_areas(refused_root.path());
+        let refused = Ctx {
+            layout: l.clone(),
+            cli: crate::cli::Cli::try_parse_from(["skot", "clean", "all"]).unwrap(),
+            yes: true,
+        };
+        let err = run(
+            &refused,
+            &CleanArgs {
+                level: CleanLevel::All,
+                sessions: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--sessions"), "{err}");
+
+        let asked_root = tempfile::tempdir().unwrap();
+        let l = layout_with_work_areas(asked_root.path());
+        let asked = Ctx {
+            layout: l.clone(),
+            cli: crate::cli::Cli::try_parse_from(["skot", "clean", "all", "--sessions"]).unwrap(),
+            yes: true,
+        };
+        run(
+            &asked,
+            &CleanArgs {
+                level: CleanLevel::All,
+                sessions: true,
+            },
+        )
+        .unwrap();
+
+        assert!(!l.mirror_dir().exists());
+        assert!(!l.work_dir().exists());
         assert!(!l.sandbox_dir().exists());
     }
 }

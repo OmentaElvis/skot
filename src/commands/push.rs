@@ -95,7 +95,7 @@ pub fn run(ctx: &Ctx, arg: &PatchArg) -> Result<Exit> {
         pushed.ref_name, pushed.sha
     );
     Hints::new("next")
-        .entry(skot("refresh"), "export what you change next")
+        .entry(skot("edit-save"), "save what you change next")
         .entry(skot("pop"), "take a patch off")
         .print();
     Ok(verdict)
