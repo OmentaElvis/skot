@@ -359,10 +359,10 @@ mod tests {
     /// An `Env` rooted at a real, existing sandbox, so a test that actually spawns a
     /// hook has a working directory to run in. `/proj` does not exist, so it can only
     /// be used for assertions about variable construction.
-    fn env_in(sandbox: &std::path::Path) -> Env {
+    fn env_in(l: &Layout) -> Env {
         Env {
-            project_root: sandbox.parent().unwrap().parent().unwrap().to_path_buf(),
-            sandbox: sandbox.to_path_buf(),
+            project_root: l.root().to_path_buf(),
+            sandbox: l.sandbox_dir(),
             ref_name: "v1.2.3".into(),
             sha: "abc".into(),
             version: "1.2.3".into(),
@@ -386,7 +386,7 @@ mod tests {
         std::fs::create_dir_all(&sandbox).unwrap();
         let cfg = Config::parse("[hooks]\npost-apply = \"echo hi > out.txt\"\n").unwrap();
         assert_eq!(
-            run_point(HookPoint::PostApply, &env_in(&sandbox), &cfg, false).unwrap(),
+            run_point(HookPoint::PostApply, &env_in(&l), &cfg, false).unwrap(),
             Outcome::Ran
         );
         assert_eq!(
@@ -403,7 +403,7 @@ mod tests {
         let sandbox = l.sandbox_dir();
         std::fs::create_dir_all(&sandbox).unwrap();
         let cfg = Config::parse("[hooks]\npre-build = \"exit 3\"\n").unwrap();
-        let err = run_point(HookPoint::PreBuild, &env_in(&sandbox), &cfg, false)
+        let err = run_point(HookPoint::PreBuild, &env_in(&l), &cfg, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("exit status 3"), "got {err}");
@@ -417,7 +417,7 @@ mod tests {
         let cfg = Config::parse("[[hook]]\nname = \"lint\"\ncmd = \"exit 1\"\nrequired = false\n")
             .unwrap();
         assert_eq!(
-            run_named("lint", &l, &env_in(&sandbox), &cfg, false).unwrap(),
+            run_named("lint", &l, &env_in(&l), &cfg, false).unwrap(),
             Outcome::Failed
         );
     }
@@ -428,7 +428,7 @@ mod tests {
         let sandbox = l.sandbox_dir();
         std::fs::create_dir_all(&sandbox).unwrap();
         let cfg = Config::parse("[hooks]\nbuild = \"pwd > where.txt\"\n").unwrap();
-        run_point(HookPoint::Build, &env_in(&sandbox), &cfg, false).unwrap();
+        run_point(HookPoint::Build, &env_in(&l), &cfg, false).unwrap();
         let where_file = std::fs::read_to_string(sandbox.join("where.txt")).unwrap();
         assert_eq!(where_file.trim(), sandbox.display().to_string());
     }
@@ -448,7 +448,7 @@ mod tests {
         }
         let cfg = Config::parse(&config_text).unwrap();
         for point in points {
-            run_point(point, &env_in(&sandbox), &cfg, false).unwrap();
+            run_point(point, &env_in(&l), &cfg, false).unwrap();
             let marker = format!("{point}-where.txt");
             assert_eq!(
                 std::fs::read_to_string(l.root().join(&marker))

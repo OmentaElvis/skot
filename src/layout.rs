@@ -14,21 +14,48 @@ use anyhow::{Context, Result, bail};
 pub const STATE_DIR: &str = ".skot";
 /// Config file name, looked up when walking up from the starting directory.
 pub const CONFIG_FILE: &str = "skot.toml";
-/// The ordered series file.
+/// The ordered series file, inside each series directory.
 pub const SERIES_FILE: &str = "series";
-/// Default patch directory, relative to the project root.
+/// The file recording the ref a series sits on, next to its `series` file.
+pub const BASE_FILE: &str = "base";
+/// Patch directory, relative to the project root: holds one subdirectory per series.
 pub const PATCHES_DIR: &str = "patches";
+/// The series a project starts with, and the one used when no pointer is recorded.
+pub const DEFAULT_SERIES: &str = "default";
+/// The one slot a shared sandbox lives in, under `sandbox/`.
+///
+/// Starts with `@`, which a series name can never contain, so a shared sandbox and a
+/// per-series one can never claim the same path.
+pub const SHARED_SANDBOX: &str = "@shared";
 
 /// All paths skot may read or write, derived from one project root.
+///
+/// The active series is part of the layout rather than an argument every path function
+/// takes: command code asks once (through [`crate::commands::Ctx`]) and never spells a
+/// series name itself, so `patches/<series>/` cannot leak in from two directions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     root: PathBuf,
+    /// The series this layout operates on. Validated by [`Layout::with_series`].
+    series: String,
+    /// Whether each series owns its sandbox worktree (`sandbox.per-series` in the config).
+    per_series_sandbox: bool,
 }
 
 impl Layout {
-    /// Build a layout for an explicit root. Does not check that the root exists.
+    /// Build a layout for an explicit root, operating on the default series with a
+    /// shared sandbox. Does not check that the root exists.
+    ///
+    /// Commands get their real series from [`crate::commands::Ctx::discover`], which
+    /// resolves `--series`, the recorded pointer, and the configured sandbox scope;
+    /// everything else (tests, fetches, anything working from a directory alone) means
+    /// the default series in shared-sandbox mode, which is what this builds.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            series: DEFAULT_SERIES.to_owned(),
+            per_series_sandbox: false,
+        }
     }
 
     /// Walk up from `start` looking for `skot.toml`.
@@ -47,8 +74,40 @@ impl Layout {
         )
     }
 
+    /// The same layout, operating on `series`.
+    ///
+    /// Validates the name: it becomes a directory under `patches/` and part of worktree
+    /// registration names in the mirror, so a name that is not a single path component,
+    /// or that git would refuse as a ref, is rejected here rather than at the first
+    /// filesystem call that happens to notice.
+    pub fn with_series(&self, series: &str) -> Result<Self> {
+        validate_series_name(series)?;
+        Ok(Self {
+            series: series.to_owned(),
+            ..self.clone()
+        })
+    }
+
+    /// The same layout, with the sandbox scope from the config.
+    pub fn with_per_series_sandbox(&self, per_series: bool) -> Self {
+        Self {
+            per_series_sandbox: per_series,
+            ..self.clone()
+        }
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The active series this layout operates on.
+    pub fn series(&self) -> &str {
+        &self.series
+    }
+
+    /// Whether each series has its own sandbox worktree rather than sharing one.
+    pub fn per_series_sandbox(&self) -> bool {
+        self.per_series_sandbox
     }
 
     pub fn config_file(&self) -> PathBuf {
@@ -88,12 +147,81 @@ impl Layout {
         Ok((config, series))
     }
 
-    pub fn series_file(&self) -> PathBuf {
-        self.root.join(SERIES_FILE)
+    /// The active series' directory: its `series` file, its `base`, and its patches.
+    ///
+    /// Kept under its old name because this is where every patch file read or written
+    /// goes; the series framing is [`Layout::series_root`] and [`Layout::series_file`].
+    pub fn patches_dir(&self) -> PathBuf {
+        self.series_root().join(&self.series)
     }
 
-    pub fn patches_dir(&self) -> PathBuf {
+    /// The directory holding one subdirectory per series.
+    pub fn series_root(&self) -> PathBuf {
         self.root.join(PATCHES_DIR)
+    }
+
+    /// The series that exist on disk, sorted.
+    ///
+    /// Every directory under the series root is one: nothing skot writes there is not
+    /// a series, so a name that looks unusual is a series that looks unusual.
+    pub fn series_names(&self) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(self.series_root()) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The active series' ordered list of patch filenames.
+    pub fn series_file(&self) -> PathBuf {
+        self.patches_dir().join(SERIES_FILE)
+    }
+
+    /// The active series' base: the ref it sits on, and (since rebase recorded it) the
+    /// commit that ref pointed at, on the same line.
+    ///
+    /// Absent until something records one (`series create`, `series copy`, `rebase`), which
+    /// is why every ref chain treats it as a fallback rather than a requirement.
+    pub fn base_file(&self) -> PathBuf {
+        self.patches_dir().join(BASE_FILE)
+    }
+
+    /// The ref recorded in [`Layout::base_file`], if there is one.
+    ///
+    /// A missing file and an empty one both mean "nothing recorded": the file appears
+    /// when something establishes a base, and the chain above it (the configured default)
+    /// is what a series that has never been based anywhere falls back to.
+    pub fn base_ref(&self) -> Option<String> {
+        let text = std::fs::read_to_string(self.base_file()).ok()?;
+        // The first word: `rebase` records the ref and the commit it moved from, and
+        // only the ref answers "what is this series based on".
+        text.split_whitespace().next().map(str::to_owned)
+    }
+
+    /// Record what this series sits on: the ref, and the commit it pointed at when it
+    /// was recorded (when known).
+    ///
+    /// Both halves fit on the one line the file has always held, so a base written
+    /// before the sha was recorded still reads the same way everywhere.
+    pub fn set_base(&self, ref_name: &str, sha: Option<&str>) -> Result<()> {
+        std::fs::write(self.base_file(), Self::base_text(ref_name, sha))
+            .context(format!("writing {}", self.base_file().display()))
+    }
+
+    /// The text [`Layout::set_base`] writes, as a value rather than a write.
+    ///
+    /// A series directory is assembled in full before it is renamed into place, so the
+    /// base has to be computable without touching the live file.
+    pub fn base_text(ref_name: &str, sha: Option<&str>) -> String {
+        match sha {
+            Some(sha) => format!("{ref_name} {sha}\n"),
+            None => format!("{ref_name}\n"),
+        }
     }
 
     /// Root of all generated state.
@@ -101,11 +229,53 @@ impl Layout {
         self.root.join(STATE_DIR)
     }
 
+    /// Where a series directory is assembled before a rename puts it under `patches/`.
+    ///
+    /// Scratch, and the only place a half-built series can exist. Cleared by the next
+    /// atomic operation and by nothing else, because a leftover here is either a build
+    /// that never finished or a swap that was interrupted, and
+    /// [`crate::seriesdir::recover`] puts the second kind back before anything else runs.
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.state_dir().join("tmp")
+    }
+
+    /// The version of a series that the last successful rebase replaced.
+    ///
+    /// One entry per series, overwritten rather than accumulated: this is a recovery
+    /// buffer for an accidental rebase, not a history. Nothing lists it and nothing
+    /// except [`Self::undo_entry`] reads it, so it costs one small directory and
+    /// disappears with `.skot`.
+    pub fn undo_dir(&self) -> PathBuf {
+        self.state_dir().join("undo")
+    }
+
+    /// This series' undo entry, if one is being held.
+    pub fn undo_entry(&self) -> PathBuf {
+        self.undo_dir().join(&self.series)
+    }
+
     pub fn mirror_dir(&self) -> PathBuf {
         self.state_dir().join("mirror.git")
     }
 
+    /// The active series' sandbox working tree.
+    ///
+    /// One worktree per series under `.skot/sandbox/<series>`, whatever the mode; the
+    /// difference is only how many are ever *registered at once*. `sandbox.per-series =
+    /// false` keeps a single slot for the whole project, at `.skot/sandbox/@shared`, and
+    /// a switch moves the one sandbox rather than opening another. The slot's name starts
+    /// with `@`, which a series name can never contain, so the two can never collide.
     pub fn sandbox_dir(&self) -> PathBuf {
+        if self.per_series_sandbox {
+            self.sandbox_root().join(&self.series)
+        } else {
+            self.sandbox_root().join(SHARED_SANDBOX)
+        }
+    }
+
+    /// The root every sandbox lives in: one directory per series, plus the shared slot
+    /// when `sandbox.per-series` is off. `clean sandbox` frees this.
+    pub fn sandbox_root(&self) -> PathBuf {
         self.state_dir().join("sandbox")
     }
 
@@ -125,7 +295,7 @@ impl Layout {
         self.state_dir().join("work")
     }
 
-    /// The worktree holding one patch's in-progress edits.
+    /// The worktree holding one patch's in-progress edits, in the active series.
     ///
     /// The directory is named after the series entry verbatim (`sub/0002-fix.patch` keeps
     /// its subdirectory), so what `list` shows and what a file manager opens are the same
@@ -133,10 +303,22 @@ impl Layout {
     /// a session found somewhere other than its own name would be invisible, and a
     /// manifest pointing outside `work/` would be a delete waiting to happen.
     pub fn work_patch_dir(&self, patch: &str) -> Result<PathBuf> {
-        let path = normalise(&self.work_dir().join(patch));
-        if !path.starts_with(normalise(&self.work_dir())) {
+        self.work_patch_dir_for(&self.series, patch)
+    }
+
+    /// [`Layout::work_patch_dir`] for a session in `series`, which is not necessarily the
+    /// active one: `clean` and `reconcile` walk the manifest, and the manifest can hold
+    /// open work areas in every series at once.
+    pub fn work_patch_dir_for(&self, series: &str, patch: &str) -> Result<PathBuf> {
+        let work = normalise(&self.work_dir());
+        let series_dir = normalise(&work.join(series));
+        let path = normalise(&series_dir.join(patch));
+        // Both halves are checked: the series comes from a manifest that any corruption
+        // can rewrite, and a patch name of `../x` escapes its series directory even when
+        // it stays inside `work/`.
+        if !series_dir.starts_with(&work) || !path.starts_with(&series_dir) {
             bail!(
-                "`{patch}` cannot be a session directory: it points outside {}.",
+                "`{series}/{patch}` cannot be a session directory: it points outside {}.",
                 self.work_dir().display()
             );
         }
@@ -171,7 +353,7 @@ impl Layout {
     /// combination of layout values can turn into a delete of the user's checkout.
     pub fn guarded_remove(&self, path: &Path) -> Result<bool> {
         let target = normalise(path);
-        let allowed: Vec<PathBuf> = [self.state_dir(), self.patches_dir(), self.out_dir()]
+        let allowed: Vec<PathBuf> = [self.state_dir(), self.series_root(), self.out_dir()]
             .iter()
             .map(|p| normalise(p))
             .collect();
@@ -327,6 +509,51 @@ pub fn normalise(path: &Path) -> PathBuf {
         out.push(Component::CurDir);
     }
     out
+}
+
+/// Check a series name before it becomes a directory and a worktree registration.
+///
+/// Series names are user-chosen labels, so the rules are the ones any file name has to
+/// obey on the platforms skot supports, plus the two git refuses in a ref name: a `..`
+/// anywhere and a `.lock` ending. The latter matters because a sandbox is registered in
+/// the mirror under a name derived from the series, and that registration is a branch
+/// while it is being made. Two names commands or skot itself own are refused outright,
+/// for the same reason: the same word would mean two things.
+pub fn validate_series_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("a series name cannot be empty.");
+    }
+    if name == "." || name == ".." {
+        bail!("`{name}` cannot be a series name: it names a directory position, not a series.");
+    }
+    if name.trim() != name {
+        bail!("`{name}` cannot be a series name: it starts or ends with whitespace.");
+    }
+    if let Some(c) = name.chars().find(|c| c.is_control()) {
+        bail!("`{name}` cannot be a series name: `{c:?}` is not a printable character.");
+    }
+    if let Some(c) = name.chars().find(|c| "<>:\"/\\|?*".contains(*c)) {
+        bail!("`{name}` cannot be a series name: `{c}` is not allowed in a file name.");
+    }
+    if name.contains("..") {
+        bail!("`{name}` cannot be a series name: it contains `..`.");
+    }
+    if name.ends_with(".lock") {
+        bail!("`{name}` cannot be a series name: git reserves names ending in `.lock`.");
+    }
+    if name.eq_ignore_ascii_case(SHARED_SANDBOX) {
+        bail!(
+            "`{name}` cannot be a series name: `{SHARED_SANDBOX}` is the slot the shared \
+             sandbox lives in, and a series of that name would claim the same path."
+        );
+    }
+    if name.eq_ignore_ascii_case("all") || name.eq_ignore_ascii_case("current") {
+        bail!(
+            "`{name}` cannot be a series name: `all` and `current` are words commands use \
+             for every series and the active one."
+        );
+    }
+    Ok(())
 }
 
 /// Recursive size in bytes, for `status`. Returns 0 for a missing path.
@@ -540,5 +767,113 @@ mod tests {
         assert_eq!(human_bytes(512), "512B");
         assert_eq!(human_bytes(1536), "1.5K");
         assert_eq!(human_bytes(3 * 1024 * 1024), "3.0M");
+    }
+
+    #[test]
+    fn a_series_layout_puts_every_series_path_under_its_directory() {
+        let (_tmp, l) = layout();
+        let foo = l.with_series("foo").unwrap();
+
+        assert_eq!(foo.series(), "foo");
+        assert_eq!(foo.series_root(), l.root().join("patches"));
+        assert_eq!(
+            foo.patches_dir(),
+            l.root().join("patches").join("foo"),
+            "patches_dir is the series directory"
+        );
+        assert_eq!(foo.series_file(), l.root().join("patches/foo/series"));
+        assert_eq!(foo.base_file(), l.root().join("patches/foo/base"));
+        // The default series is the layout every caller gets without asking.
+        assert_eq!(l.series(), DEFAULT_SERIES);
+        assert_eq!(l.patches_dir(), l.root().join("patches/default"));
+    }
+
+    #[test]
+    fn series_names_that_are_not_single_safe_components_are_refused() {
+        let (_tmp, l) = layout();
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a..b",
+            "x.lock",
+            " leading",
+            "trailing ",
+            "co:lon",
+            "star*",
+            "question?",
+            "@shared",
+            "@Shared",
+            "all",
+            "Current",
+        ] {
+            let err = l.with_series(bad).unwrap_err().to_string();
+            assert!(!err.is_empty(), "{bad:?} was accepted as a series name");
+        }
+        // Names that are unusual but safe go through. `@` is a character like any
+        // other: only the one name that is already the shared sandbox slot is taken.
+        for good in [
+            "default",
+            "experiment-1",
+            "v2.0",
+            "plus+one",
+            "long_descriptive",
+            "exp@v1.4",
+            "a@b",
+        ] {
+            l.with_series(good).unwrap();
+        }
+    }
+
+    #[test]
+    fn every_directory_under_the_series_root_is_a_series() {
+        // Nothing skot writes lives beside a series any more, so a directory there is
+        // one, however it is named.
+        let (_tmp, l) = layout();
+        std::fs::create_dir_all(l.series_root().join("alpha")).unwrap();
+        std::fs::create_dir_all(l.series_root().join("exp")).unwrap();
+        std::fs::create_dir_all(l.series_root().join("exp@v1.4")).unwrap();
+
+        assert_eq!(
+            l.series_names(),
+            vec!["alpha".to_owned(), "exp".to_owned(), "exp@v1.4".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_sandbox_dir_follows_the_configured_scope() {
+        let (_tmp, l) = layout();
+        // Shared mode parks one slot beside the per-series trees, never on top of them.
+        assert_eq!(
+            l.sandbox_dir(),
+            l.state_dir().join("sandbox").join(SHARED_SANDBOX)
+        );
+        assert_eq!(l.sandbox_root(), l.state_dir().join("sandbox"));
+
+        let per = l.with_per_series_sandbox(true);
+        assert_eq!(
+            per.sandbox_dir(),
+            per.state_dir().join("sandbox").join(DEFAULT_SERIES)
+        );
+        // The root does not move: `clean sandbox` frees every sandbox either way, and
+        // the two scopes are siblings under it rather than nested.
+        assert_eq!(per.sandbox_root(), l.sandbox_root());
+        assert_ne!(per.sandbox_dir(), l.sandbox_dir());
+    }
+
+    #[test]
+    fn a_session_in_another_series_is_found_under_its_own_directory() {
+        // `clean` and `reconcile` walk sessions from every series while the layout
+        // still names the active one, so the path has to come from the session.
+        let (_tmp, l) = layout();
+        let path = l.work_patch_dir_for("other", "sub/0001-a.patch").unwrap();
+        assert!(path.starts_with(l.work_dir()));
+        assert!(path.ends_with("work/other/sub/0001-a.patch"));
+
+        // Containment is checked against the work directory for every series.
+        assert!(l.work_patch_dir_for("..", "x").is_err());
+        assert!(l.work_patch_dir_for("ok", "../../x").is_err());
     }
 }

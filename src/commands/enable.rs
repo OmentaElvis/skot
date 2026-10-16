@@ -105,6 +105,7 @@ pub fn run(ctx: &Ctx, args: &EnableArgs) -> Result<Exit> {
     if ctx.cli.json {
         emit_json(&json!({
             "ok": true,
+            "series_name": ctx.layout.series(),
             "enabled_now": changed.names,
             "enabled": changed.enabled,
             "disabled": changed.disabled,
@@ -192,7 +193,7 @@ mod tests {
 
     #[test]
     fn enabling_uncomments_the_line_and_the_set_follows() {
-        let (tmp, layout) = two_enabled_one_disabled();
+        let (_tmp, layout) = two_enabled_one_disabled();
         let cli = Cli::try_parse_from(["skot", "patch", "enable", "0002-b.patch"]).unwrap();
         let ctx = Ctx {
             layout,
@@ -211,14 +212,14 @@ mod tests {
 
         assert_eq!(exit, Exit::Success);
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
             "0001-a.patch\n0002-b.patch\n0003-c.patch\n"
         );
     }
 
     #[test]
     fn enabling_an_already_enabled_patch_is_a_no_op() {
-        let (tmp, layout) = two_enabled_one_disabled();
+        let (_tmp, layout) = two_enabled_one_disabled();
         let cli = Cli::try_parse_from(["skot", "patch", "enable", "0001-a.patch"]).unwrap();
         let ctx = Ctx {
             layout,
@@ -237,7 +238,7 @@ mod tests {
 
         assert_eq!(exit, Exit::Failure);
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
             "0001-a.patch\n# 0002-b.patch\n0003-c.patch\n",
             "the file is untouched"
         );
@@ -245,7 +246,7 @@ mod tests {
 
     #[test]
     fn several_patches_can_be_enabled_at_once_by_prefix() {
-        let (tmp, layout) = two_enabled_one_disabled();
+        let (_tmp, layout) = two_enabled_one_disabled();
         // Two disabled this time, so the batch has something to do for both names.
         std::fs::write(
             layout.series_file(),
@@ -270,14 +271,14 @@ mod tests {
 
         assert_eq!(exit, Exit::Success);
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
             "0001-a.patch\n0002-b.patch\n0003-c.patch\n"
         );
     }
 
     #[test]
     fn all_takes_every_disabled_patch() {
-        let (tmp, layout) = two_enabled_one_disabled();
+        let (_tmp, layout) = two_enabled_one_disabled();
         std::fs::write(
             layout.series_file(),
             "0001-a.patch\n# 0002-b.patch\n# 0003-c.patch\n",
@@ -301,14 +302,14 @@ mod tests {
 
         assert_eq!(exit, Exit::Success);
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
             "0001-a.patch\n0002-b.patch\n0003-c.patch\n"
         );
     }
 
     #[test]
     fn all_with_nothing_disabled_is_a_no_op() {
-        let (tmp, layout) = two_enabled_one_disabled();
+        let (_tmp, layout) = two_enabled_one_disabled();
         std::fs::write(
             layout.series_file(),
             "0001-a.patch\n0002-b.patch\n0003-c.patch\n",
@@ -332,14 +333,14 @@ mod tests {
 
         assert_eq!(exit, Exit::Failure);
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
             "0001-a.patch\n0002-b.patch\n0003-c.patch\n"
         );
     }
 
     #[test]
     fn a_batch_with_one_already_enabled_enables_the_rest() {
-        let (tmp, layout) = two_enabled_one_disabled();
+        let (_tmp, layout) = two_enabled_one_disabled();
         std::fs::write(
             layout.series_file(),
             "0001-a.patch\n# 0002-b.patch\n# 0003-c.patch\n",
@@ -363,7 +364,7 @@ mod tests {
 
         assert_eq!(exit, Exit::Success, "the patch that could go, went");
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
             "0001-a.patch\n0002-b.patch\n# 0003-c.patch\n"
         );
     }
@@ -420,7 +421,7 @@ mod tests {
 
     #[test]
     fn json_is_one_document_with_the_sets_after() {
-        let (tmp, layout) = two_enabled_one_disabled();
+        let (_tmp, layout) = two_enabled_one_disabled();
         let cli =
             Cli::try_parse_from(["skot", "patch", "enable", "0002-b.patch", "--json"]).unwrap();
         let ctx = Ctx {
@@ -441,7 +442,7 @@ mod tests {
         // The document itself is stdout's business, checked end to end in tests/cli.rs;
         // here the work is just that the sets after the change are what save wrote.
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
             "0001-a.patch\n0002-b.patch\n0003-c.patch\n"
         );
     }

@@ -19,6 +19,7 @@ use crate::git::sandbox;
 use crate::hints::Hints;
 use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
+use crate::report;
 
 /// What an apply did, presented by [`run`].
 ///
@@ -51,8 +52,21 @@ pub fn run(ctx: &Ctx, args: &RefArg) -> Result<Exit> {
     let applied = outcome?;
 
     if ctx.cli.json {
-        emit(&applied.report, &applied.ref_name, &applied.sha, applied.ok)?;
+        emit(
+            ctx.layout.series(),
+            &applied.report,
+            &applied.ref_name,
+            &applied.sha,
+            applied.ok,
+        )?;
     } else if applied.ok {
+        // The name and the ref together, so a reader sees which series landed and on
+        // what upstream in the same breath as the outcome.
+        report::section("apply");
+        report::field(
+            "series",
+            &format!("{} @ {}", ctx.layout.series(), applied.ref_name),
+        );
         if applied.report.patch_count == 0 {
             // The sandbox was still reset to the ref: the honest answer is what the head
             // holds, the way `pop` reports an empty stack, rather than "applied 0".
@@ -130,13 +144,17 @@ fn apply_inner(
         None => entries,
     };
 
+    // Argument, then the base the series sits on, then the configured default: the same
+    // chain every other command resolves a ref through, so `apply` after a `rebase` puts
+    // the sandbox where the rebase put the series.
     let wanted = ref_name
         .map(str::to_owned)
+        .or_else(|| layout.base_ref())
         .or_else(|| config.upstream.default_ref.clone());
     let Some(wanted) = wanted else {
         bail!(
             "no ref to apply against.\n\
-             Pass one (`{}`) or set `upstream.default-ref` in {}.",
+             Pass one (`{}`), record a base for this series, or set `upstream.default-ref` in {}.",
             skot_args("apply", "main"),
             layout.config_file().display()
         );
@@ -245,11 +263,13 @@ pub fn unapply(ctx: &Ctx) -> Result<Exit> {
     if ctx.cli.json {
         if done.sandbox {
             crate::commands::emit_json(&json!({
+                "series_name": ctx.layout.series(),
                 "sandbox": true, "ref": done.ref_name, "sha": done.sha,
                 "applied": Vec::<String>::new(),
             }))?;
         } else {
             crate::commands::emit_json(&json!({
+                "series_name": ctx.layout.series(),
                 "sandbox": false, "ref": done.ref_name, "sha": done.sha,
             }))?;
         }
@@ -278,23 +298,24 @@ fn unapply_to_upstream(layout: &Layout) -> Result<Unapplied> {
     if !sandbox::is_repository(layout) {
         return Ok(Unapplied {
             sandbox: false,
-            ref_name: state.ref_name,
-            sha: state.sha,
+            ref_name: state.ref_name(layout).map(str::to_owned),
+            sha: state.sha(layout).map(str::to_owned),
         });
     }
 
-    // The recorded ref first, not the configured default. If the sandbox was applied to a
-    // release branch and someone later changes `default-ref`, unapply must still undo the
-    // apply that happened — otherwise it resets to an unrelated commit and quietly reports
-    // success.
+    // The recorded ref first, not the base or the configured default. If the sandbox was
+    // applied to a release branch and someone later changes `default-ref`, unapply must
+    // still undo the apply that happened: otherwise it resets to an unrelated commit and
+    // quietly reports success.
     let wanted = state
-        .ref_name
-        .clone()
+        .ref_name(layout)
+        .map(str::to_owned)
+        .or_else(|| layout.base_ref())
         .or(config.upstream.default_ref.clone());
     let Some(wanted) = wanted else {
         bail!(
             "cannot tell which ref the sandbox was applied to.\n\
-             `.skot/state.json` does not record one and `upstream.default-ref` is unset.\n\
+             `.skot/state.json` records none, this series has no base, and `upstream.default-ref` is unset.\n\
              Re-apply against the ref you want, or `{}` and start over.",
             skot_args("clean", "sandbox")
         );
@@ -317,8 +338,9 @@ fn unapply_to_upstream(layout: &Layout) -> Result<Unapplied> {
 
 /// Emit the JSON document for an apply. Purely writes to stdout — the caller decides the
 /// process exit by looking at `Applied::ok`.
-fn emit(report: &check::Report, ref_name: &str, sha: &str, ok: bool) -> Result<()> {
+fn emit(series: &str, report: &check::Report, ref_name: &str, sha: &str, ok: bool) -> Result<()> {
     crate::commands::emit_json(&json!({
+        "series_name": series,
         "ref": ref_name,
         "sha": sha,
         "ok": ok,
@@ -513,7 +535,7 @@ index 3333333..4444444 100644
         assert_eq!(f.sandbox_file(), "first\n");
         let state = crate::state::State::load(&f.layout).unwrap();
         assert_eq!(
-            state.applied,
+            state.applied(&f.layout).to_vec(),
             ["0001-a.patch"],
             "the record must match the selection"
         );
@@ -540,7 +562,10 @@ index 1111111..2222222 100644
         assert!(apply_locked(&f.layout, None).unwrap().ok);
         assert_eq!(f.sandbox_file(), "first\n");
         assert_eq!(
-            crate::state::State::load(&f.layout).unwrap().applied,
+            crate::state::State::load(&f.layout)
+                .unwrap()
+                .applied(&f.layout)
+                .to_vec(),
             vec!["0001-a.patch".to_owned()]
         );
     }
@@ -561,7 +586,7 @@ index 1111111..2222222 100644
         assert!(
             crate::state::State::load(&f.layout)
                 .unwrap()
-                .applied
+                .applied(&f.layout)
                 .is_empty()
         );
     }
@@ -631,7 +656,7 @@ index 1111111..2222222 100644
         assert!(
             crate::state::State::load(&f.layout)
                 .unwrap()
-                .applied
+                .applied(&f.layout)
                 .is_empty(),
             "state must not claim patches are applied when the apply failed"
         );
@@ -688,7 +713,7 @@ index 1111111..2222222 100644
         assert!(
             crate::state::State::load(&f.layout)
                 .unwrap()
-                .applied
+                .applied(&f.layout)
                 .is_empty()
         );
         // And the patch itself is still there: unapply is not a delete.
@@ -763,8 +788,11 @@ index 1111111..2222222 100644
 
         assert!(apply_locked(&f.layout, None).unwrap().ok);
         let state = crate::state::State::load(&f.layout).unwrap();
-        assert_eq!(state.ref_name.as_deref(), Some("main"));
-        assert_eq!(state.applied, vec!["0001-a.patch".to_owned()]);
+        assert_eq!(state.ref_name(&f.layout), Some("main"));
+        assert_eq!(
+            state.applied(&f.layout).to_vec(),
+            vec!["0001-a.patch".to_owned()]
+        );
     }
 
     #[test]
@@ -792,7 +820,7 @@ index 1111111..2222222 100644
         assert!(
             crate::state::State::load(&f.layout)
                 .unwrap()
-                .applied
+                .applied(&f.layout)
                 .is_empty(),
             "a JSON apply that failed must not leave the record claiming patches are applied"
         );
@@ -836,7 +864,7 @@ index 3333333..4444444 100644
         assert!(
             crate::state::State::load(&f.layout)
                 .unwrap()
-                .applied
+                .applied(&f.layout)
                 .is_empty(),
             "the record survived a failed re-apply of the same series"
         );

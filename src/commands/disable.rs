@@ -45,7 +45,7 @@ pub fn run(ctx: &Ctx, args: &DisableArgs) -> Result<Exit> {
         // the applied set is always a subset of the enabled one.
         enabled
             .iter()
-            .filter(|n| !state.applied.contains(*n))
+            .filter(|n| !state.applied(&ctx.layout).contains(*n))
             .cloned()
             .collect()
     } else if !args.patches.is_empty() {
@@ -55,14 +55,14 @@ pub fn run(ctx: &Ctx, args: &DisableArgs) -> Result<Exit> {
         let mut targets = Vec::new();
         for want in &args.patches {
             let name = authoring::resolve_patch(&universe, &names, want)?.name(&names);
-            if state.applied.contains(&name) {
+            if state.applied(&ctx.layout).contains(&name) {
                 return Err(refuse_applied(&name));
             }
             targets.push(name);
         }
         targets
     } else if !ctx.cli.json && crate::ui::stdin_is_terminal() {
-        pick(&enabled, &state.applied)?
+        pick(&enabled, state.applied(&ctx.layout))?
     } else {
         bail!(
             "cannot ask which patch to disable here.\nName it: `{}`.",
@@ -111,7 +111,7 @@ pub fn run(ctx: &Ctx, args: &DisableArgs) -> Result<Exit> {
     if args.all {
         let kept: Vec<&String> = enabled
             .iter()
-            .filter(|n| state.applied.contains(*n))
+            .filter(|n| state.applied(&ctx.layout).contains(*n))
             .collect();
         if !kept.is_empty() {
             info!(
@@ -126,6 +126,7 @@ pub fn run(ctx: &Ctx, args: &DisableArgs) -> Result<Exit> {
     if ctx.cli.json {
         emit_json(&json!({
             "ok": true,
+            "series_name": ctx.layout.series(),
             "disabled_now": changed.names,
             "enabled": changed.enabled,
             "disabled": changed.disabled,
@@ -178,7 +179,7 @@ fn disable(layout: &Layout, wanted: &[String]) -> Result<Changed> {
 
     let mut names = Vec::new();
     for want in wanted {
-        if current.applied.contains(want) {
+        if current.applied(layout).contains(want) {
             return Err(refuse_applied(want));
         }
         if !series.disable(want) {
@@ -231,7 +232,7 @@ mod tests {
 
     #[test]
     fn disabling_comments_the_line_out_and_positions_fold_for_apply() {
-        let (tmp, layout) = three_enabled();
+        let (_tmp, layout) = three_enabled();
         let cli = Cli::try_parse_from(["skot", "patch", "disable", "0002-b.patch"]).unwrap();
         let ctx = Ctx {
             layout,
@@ -250,7 +251,7 @@ mod tests {
 
         assert_eq!(exit, Exit::Success);
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
             "0001-a.patch\n# 0002-b.patch\n0003-c.patch\n",
             "the choice is in the file, trackable"
         );
@@ -258,7 +259,7 @@ mod tests {
 
     #[test]
     fn disabling_an_already_disabled_patch_is_a_no_op() {
-        let (tmp, layout) = three_enabled();
+        let (_tmp, layout) = three_enabled();
         std::fs::write(
             layout.series_file(),
             "0001-a.patch\n# 0002-b.patch\n0003-c.patch\n",
@@ -282,7 +283,7 @@ mod tests {
 
         assert_eq!(exit, Exit::Failure);
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
             "0001-a.patch\n# 0002-b.patch\n0003-c.patch\n"
         );
     }
@@ -319,7 +320,7 @@ mod tests {
         assert!(err.contains("is applied"), "{err}");
         assert!(err.contains(&skot_args("pop", "0001-a.patch")), "{err}");
         assert!(
-            std::fs::read_to_string(tmp.path().join("series"))
+            std::fs::read_to_string(ctx.layout.series_file())
                 .unwrap()
                 .contains("0001-a.patch\n"),
             "and the line is still an entry"
@@ -328,7 +329,7 @@ mod tests {
 
     #[test]
     fn several_patches_can_be_disabled_at_once_by_prefix() {
-        let (tmp, layout) = three_enabled();
+        let (_tmp, layout) = three_enabled();
         let cli = Cli::try_parse_from(["skot", "patch", "disable", "0002", "0003"]).unwrap();
         let ctx = Ctx {
             layout,
@@ -347,14 +348,14 @@ mod tests {
 
         assert_eq!(exit, Exit::Success);
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
             "0001-a.patch\n# 0002-b.patch\n# 0003-c.patch\n"
         );
     }
 
     #[test]
     fn all_disables_every_enabled_patch_the_sandbox_is_not_holding() {
-        let (tmp, layout) = three_enabled();
+        let (_tmp, layout) = three_enabled();
         let cli = Cli::try_parse_from(["skot", "patch", "disable", "--all"]).unwrap();
         let ctx = Ctx {
             layout,
@@ -373,7 +374,7 @@ mod tests {
 
         assert_eq!(exit, Exit::Success);
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
             "# 0001-a.patch\n# 0002-b.patch\n# 0003-c.patch\n"
         );
     }
@@ -410,7 +411,7 @@ mod tests {
 
         assert_eq!(exit, Exit::Failure, "nothing could go");
         assert!(
-            std::fs::read_to_string(tmp.path().join("series"))
+            std::fs::read_to_string(ctx.layout.series_file())
                 .unwrap()
                 .contains("0001-a.patch\n"),
             "the applied line is still an entry"
@@ -450,7 +451,7 @@ mod tests {
 
         assert!(err.contains("is applied"), "{err}");
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
             "0001-a.patch\n0002-b.patch\n0003-c.patch\n",
             "the unapplied patch of the batch is untouched"
         );

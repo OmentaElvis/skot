@@ -20,21 +20,30 @@
 //! leaving every patch file exactly as it was: a series with one stale patch in it is
 //! recoverable, and a series where the earlier patches were quietly rewritten on the way to the
 //! failure is not.
+//!
+//! The rewrite is written to scratch and renamed into place, so the series on disk is either
+//! the old one or the new one, never a half-written mix. `--into` puts the result under a new
+//! name and leaves the original alone; without it the original becomes the undo entry that
+//! `series undo` trades back.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use log::{debug, error, info};
 use serde_json::json;
 
 use crate::check;
-use crate::cli::RefArg;
+use crate::cli::RebaseArgs;
+use crate::commands::apply;
 use crate::commands::authoring::{self, Stack};
+use crate::commands::series::refuse_case_clash;
 use crate::commands::{Ctx, Exit, emit_json};
 use crate::git::Sha;
 use crate::git::diff;
+use crate::git::sandbox;
 use crate::hints::Hints;
 use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
-use crate::series::{self, Series};
+use crate::series;
+use crate::seriesdir;
 use crate::state::State;
 
 /// What `rebase` did, presented by [`run`].
@@ -48,22 +57,33 @@ struct Rebased {
     rewritten: Vec<Rewritten>,
     /// The replay verdict; its patches are the failure detail in `--json`.
     report: check::Report,
+    /// Where the series as it was before this rebase was kept, on success. A failed
+    /// rebase writes nothing, so there is nothing to keep. `--into` leaves the
+    /// original alone, so there is nothing to keep either.
+    undo: Option<std::path::PathBuf>,
+    /// The name `--into` asked for, when it did.
+    into: Option<String>,
 }
 
 /// Replay the series onto `arg`'s ref, rewriting each patch to match.
-pub fn run(ctx: &Ctx, arg: &RefArg) -> Result<Exit> {
-    let rebased = rebase(&ctx.layout, arg.ref_name.as_deref())?;
+pub fn run(ctx: &Ctx, arg: &RebaseArgs) -> Result<Exit> {
+    let rebased = rebase(&ctx.layout, arg.ref_name.as_deref(), arg.into.as_deref())?;
 
     if ctx.cli.json {
         let exit = if rebased.ok {
             emit_json(&json!({
                 "ok": true,
+                "series_name": ctx.layout.series(),
+                "into": rebased.into,
                 "ref": rebased.ref_name,
                 "sha": rebased.sha.as_str(),
                 "tree": rebased
                     .tree
-                    .expect("a successful rebase always has a tree")
-                    .to_string(),
+                    .map(|tree| tree.to_string()),
+                "undo": rebased
+                    .undo
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
                 "rewritten": rebased.rewritten.iter().map(|r| json!({
                     "name": r.name,
                     "path": r.path.display().to_string(),
@@ -80,6 +100,8 @@ pub fn run(ctx: &Ctx, arg: &RefArg) -> Result<Exit> {
                 .unwrap_or_default();
             emit_json(&json!({
                 "ok": false,
+                "series_name": ctx.layout.series(),
+                "into": rebased.into,
                 "ref": rebased.ref_name,
                 "sha": rebased.sha.as_str(),
                 "failed_patch": failed,
@@ -121,6 +143,43 @@ pub fn run(ctx: &Ctx, arg: &RefArg) -> Result<Exit> {
         return Ok(Exit::Failure);
     }
 
+    if let Some(into) = &rebased.into {
+        // The original was never touched; the rewritten series stands under a new name.
+        info!(
+            target: "rebase",
+            "rebased {} onto {} ({}) as `{into}`; `{}` still holds what it did",
+            rebased.rewritten.len(),
+            rebased.ref_name,
+            rebased.sha,
+            ctx.layout.series()
+        );
+        Hints::new("next")
+            .entry(
+                skot_args("series", &format!("use {into}")),
+                "switch to the rebased copy",
+            )
+            .entry(
+                skot_args("series", &format!("drop {into}")),
+                "or throw it away",
+            )
+            .print();
+        return Ok(Exit::Success);
+    }
+
+    if rebased.rewritten.is_empty() {
+        // An empty series: the base moved and the sandbox followed, and there is no
+        // per-patch story to tell.
+        info!(
+            target: "rebase",
+            "nothing to rebase; the base is now {} ({})",
+            rebased.ref_name, rebased.sha
+        );
+        Hints::new("next")
+            .entry(skot_args("new", "<name>"), "start a patch on the new base")
+            .print();
+        return Ok(Exit::Success);
+    }
+
     info!(
         target: "rebase",
         "rebased {} onto {} ({})",
@@ -142,6 +201,11 @@ pub fn run(ctx: &Ctx, arg: &RefArg) -> Result<Exit> {
         );
     }
     debug!(target: "rebase", "  ~ rewritten,  = unchanged");
+    info!(
+        target: "rebase",
+        "the previous series is kept; `{}` puts it back",
+        skot_args("series", "undo")
+    );
     Hints::new("next")
         .entry(skot("build"), "the whole run onto the new base")
         .entry(skot("check"), "or just verify the rewritten series")
@@ -153,22 +217,20 @@ pub fn run(ctx: &Ctx, arg: &RefArg) -> Result<Exit> {
 ///
 /// Everything below [`run`] is this: no clap, no stdout, no exit verdict — a `&Layout` and
 /// scalars in, a description of the outcome out.
-fn rebase(layout: &Layout, ref_name: Option<&str>) -> Result<Rebased> {
+fn rebase(layout: &Layout, ref_name: Option<&str>, into: Option<&str>) -> Result<Rebased> {
     let (config, series) = layout.project()?;
-    // Checked before the files are resolved: rebase with nothing to rebase has no honest
-    // answer but this one, and `new` is the step the user actually needs.
+    let new_base = authoring::wanted_ref(layout, ref_name, &config, &skot("rebase"))?;
+
+    // An empty series has nothing to replay, so the rebase is the base move alone.
     if series.is_empty() {
-        bail!(
-            "the series at {} is empty, so there is nothing to rebase.\n\
-             `{}` starts a patch.",
-            series.path().display(),
-            skot_args("new", "<name>")
-        );
+        return rebase_empty(layout, &new_base, into);
     }
     let entries = series.require_resolvable(layout)?;
+    // The destination, settled before the sandbox moves or a single file is written.
+    let target = destination(layout, into)?;
 
-    let new_base = authoring::wanted_ref(layout, ref_name, &config, &skot("rebase"))?;
     let lock = layout.lock()?;
+    seriesdir::recover(layout)?;
     let (_mirror, sha) = super::sync::resolve_in_mirror(layout, &new_base)?;
 
     let repo = authoring::require_sandbox(layout)?;
@@ -183,50 +245,176 @@ fn rebase(layout: &Layout, ref_name: Option<&str>) -> Result<Rebased> {
             tree: None,
             rewritten: Vec::new(),
             report: result.report,
+            undo: None,
+            into: into.map(str::to_owned),
         });
     }
 
-    // Write each rewritten patch to its own file first, and only replace the series' files once
-    // every one of them has been produced. A half-written series is worse than an unchanged
-    // one.
     let rewritten = rewrite(&repo, &entries, &result)?;
 
-    let mut new_series = Series::parse(&layout.series_file(), "");
+    // The series file the rewrite produces: the rewritten names, in order. Comments
+    // from the old file are not carried across, which is what rebase has always done.
+    let mut series_text = String::new();
     for entry in rewritten.iter() {
-        std::fs::write(&entry.path, &entry.text)
-            .context(format!("writing {}", entry.path.display()))?;
-        if !new_series.names().contains(&entry.name.as_str()) {
-            new_series
-                .insert(&entry.name, new_series.len())
-                .context(format!("registering {} in the series", entry.name))?;
-        }
+        series_text.push_str(&entry.name);
+        series_text.push('\n');
     }
-    new_series.save(layout)?;
-
-    // The applied set follows the series onto the new base. Rewriting every patch file does
-    // not enable the ones the sandbox had disabled: they stay off, and only what was on is
-    // replayed and recorded.
-    let state = State::load(layout)?;
-    let enabled: Vec<series::Entry> = entries
+    let base_text = Layout::base_text(&new_base, Some(sha.as_str()));
+    let patches: Vec<(String, String)> = rewritten
         .iter()
-        .filter(|e| state.applied.contains(&e.name))
-        .cloned()
+        .map(|entry| (entry.name.clone(), entry.text.clone()))
         .collect();
-    let stack = Stack {
-        names: enabled.iter().map(|e| e.name.clone()).collect(),
-        entries: enabled,
+
+    let built = seriesdir::Built::build(
+        &target,
+        target.series(),
+        &series_text,
+        Some(&base_text),
+        &patches,
+    )?;
+
+    let undo = match into {
+        Some(_) => {
+            built.install(&target)?;
+            None
+        }
+        None => Some(built.replace(layout)?),
     };
-    let tree = authoring::land(layout, &new_base, &sha, &stack)?;
     drop(lock);
+
+    // The applied set follows the series onto the new base, but only when the series
+    // itself was replaced: `--into` leaves the sandbox and the pointer alone.
+    let tree = match undo {
+        Some(_) => {
+            let state = State::load(layout)?;
+            let enabled: Vec<series::Entry> = entries
+                .iter()
+                .filter(|e| state.applied(layout).contains(&e.name))
+                .cloned()
+                .collect();
+            let stack = Stack {
+                names: enabled.iter().map(|e| e.name.clone()).collect(),
+                entries: enabled,
+            };
+            Some(authoring::land(layout, &new_base, &sha, &stack)?)
+        }
+        None => None,
+    };
 
     Ok(Rebased {
         ok: true,
         ref_name: new_base,
         sha,
-        tree: Some(tree),
+        tree,
         rewritten,
         report: result.report,
+        undo,
+        into: into.map(str::to_owned),
     })
+}
+
+/// Move the base of an empty series: the same swap, with no patches in it.
+fn rebase_empty(layout: &Layout, new_base: &str, into: Option<&str>) -> Result<Rebased> {
+    // The destination, settled before the sandbox moves or a single file is written.
+    let target = destination(layout, into)?;
+
+    let lock = layout.lock()?;
+    seriesdir::recover(layout)?;
+
+    // The report the run hands back: the apply that moved the sandbox, or an empty
+    // success when `--into` took the sandbox nowhere.
+    let mut report = None;
+    let (ref_name, sha) = match into {
+        Some(_) => {
+            // `--into` on an empty series still resolves the ref, but takes the sandbox
+            // nowhere: the new series gets the base file and the original is left as is.
+            let (_mirror, sha) = super::sync::resolve_in_mirror(layout, new_base)?;
+            (new_base.to_owned(), sha)
+        }
+        None => {
+            // The sandbox follows the base onto the new ref, and the series records it
+            // in the same swap that keeps everything else consistent.
+            let applied = apply::apply_locked(layout, Some(new_base))?;
+            if !applied.ok {
+                drop(lock);
+                return Ok(Rebased {
+                    ok: false,
+                    ref_name: applied.ref_name,
+                    sha: applied.sha,
+                    tree: None,
+                    rewritten: Vec::new(),
+                    report: applied.report,
+                    undo: None,
+                    into: None,
+                });
+            }
+            report = Some(applied.report);
+            (applied.ref_name, applied.sha)
+        }
+    };
+
+    // The series file as it stands: an empty series still has a file, possibly with
+    // comments, and those comments are not rebase's to drop.
+    let series_text = std::fs::read_to_string(layout.series_file()).unwrap_or_default();
+    let base_text = Layout::base_text(&ref_name, Some(sha.as_str()));
+    let built = seriesdir::Built::build(
+        &target,
+        target.series(),
+        &series_text,
+        Some(&base_text),
+        &[],
+    )?;
+
+    let undo = match into {
+        Some(_) => {
+            built.install(&target)?;
+            None
+        }
+        None => Some(built.replace(layout)?),
+    };
+    let tree = if undo.is_some() {
+        sandbox::head_tree_oid(layout).ok().flatten()
+    } else {
+        None
+    };
+    drop(lock);
+
+    let report = report.unwrap_or_else(|| check::Report {
+        base: ref_name.clone(),
+        patch_count: 0,
+        ok: true,
+        patches: Vec::new(),
+    });
+
+    Ok(Rebased {
+        ok: true,
+        ref_name,
+        sha,
+        tree,
+        rewritten: Vec::new(),
+        report,
+        undo,
+        into: into.map(str::to_owned),
+    })
+}
+
+/// Where the rebased series lands: under `--into`'s name, otherwise the active series.
+///
+/// The name is checked here rather than at the rename, so a refusal costs no work and
+/// an invalid name never reaches `.skot/tmp`.
+fn destination(layout: &Layout, into: Option<&str>) -> Result<Layout> {
+    let Some(name) = into else {
+        return Ok(layout.clone());
+    };
+    refuse_case_clash(layout, name)?;
+    let target = layout.with_series(name)?;
+    if target.patches_dir().exists() {
+        anyhow::bail!(
+            "the series `{name}` already exists.\n`{}` switches to it.",
+            skot_args("series", &format!("use {name}"))
+        );
+    }
+    Ok(target)
 }
 
 /// A rewritten patch, ready to be written out.
@@ -334,11 +522,11 @@ mod tests {
             &["0001-a.patch", "0003-c.patch"],
         );
 
-        rebase(&layout, None).unwrap();
+        rebase(&layout, None, None).unwrap();
 
         let state = crate::state::State::load(&layout).unwrap();
         assert_eq!(
-            state.applied,
+            state.applied(&layout).to_vec(),
             ["0001-a.patch", "0003-c.patch"],
             "the hole must survive the rewrite"
         );
@@ -568,14 +756,206 @@ mod tests {
         let (_tmp, layout) = testsupport::project();
         testsupport::write_series(&layout, &[("0001-a.patch", "")]);
 
-        let err = rebase(&layout, None).unwrap_err().to_string();
+        let err = rebase(&layout, None, None).unwrap_err().to_string();
         assert!(err.contains("no ref"), "got {err}");
     }
 
     #[test]
-    fn an_empty_series_says_to_start_a_patch_rather_than_rebasing_nothing() {
-        let (_tmp, layout) = testsupport::project();
-        let err = rebase(&layout, Some("main")).unwrap_err().to_string();
-        assert!(err.contains("nothing to rebase"), "got {err}");
+    fn a_rebase_keeps_the_series_it_was_before() {
+        // The rewrite replaces every patch file; the undo entry is what makes that
+        // recoverable without the user having remembered to copy anything first.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::landed_set(
+            tmp.path(),
+            &[("0001-a.patch", testsupport::patch_one())],
+            &["0001-a.patch"],
+        );
+
+        let rebased = rebase(&layout, None, None).unwrap();
+        assert!(rebased.ok);
+
+        let undo = rebased.undo.expect("a rebase keeps the old series");
+        assert_eq!(undo, layout.undo_entry());
+        assert_eq!(
+            std::fs::read_to_string(undo.join("0001-a.patch")).unwrap(),
+            testsupport::patch_one(),
+            "the undo entry holds the patches as they were"
+        );
+        assert_eq!(
+            std::fs::read_to_string(undo.join("series")).unwrap(),
+            "0001-a.patch\n"
+        );
+        // Nothing was written to scratch and left there.
+        assert!(
+            !layout
+                .tmp_dir()
+                .join(format!("{}.new", layout.series()))
+                .exists(),
+            "the built directory must be renamed away, not left in tmp"
+        );
+    }
+
+    #[test]
+    fn a_failed_rebase_keeps_nothing_because_it_changed_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::landed_set(
+            tmp.path(),
+            &[
+                ("0001-a.patch", testsupport::patch_one()),
+                ("0002-b.patch", "not a patch\n"),
+            ],
+            &["0001-a.patch"],
+        );
+
+        let rebased = rebase(&layout, None, None).unwrap();
+        assert!(!rebased.ok);
+        assert!(rebased.undo.is_none());
+        // The failure happens in planning, before a build exists; nothing waits in tmp
+        // and nothing was handed to the undo slot.
+        let left_in_tmp = std::fs::read_dir(layout.tmp_dir())
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(left_in_tmp, 0, "scratch must be empty after a failure");
+        assert!(
+            !layout.undo_entry().exists(),
+            "a failure keeps no undo entry"
+        );
+    }
+
+    #[test]
+    fn the_undo_entry_holds_one_version_and_the_next_rebase_replaces_it() {
+        // One deep by construction: the swap hands the live directory over, so the
+        // buffer is always exactly "what this rebase replaced".
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::landed_set(
+            tmp.path(),
+            &[("0001-a.patch", testsupport::patch_one())],
+            &["0001-a.patch"],
+        );
+
+        let first = rebase(&layout, None, None).unwrap();
+        let first_undo = first.undo.unwrap();
+        let first_series = std::fs::read_to_string(first_undo.join("series")).unwrap();
+
+        let second = rebase(&layout, None, None).unwrap();
+        let second_undo = second.undo.unwrap();
+
+        assert_eq!(
+            second_undo, first_undo,
+            "the undo slot is one path, not a growing list"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second_undo.join("series")).unwrap(),
+            first_series,
+            "one successful rebase replaces the held version with its own predecessor"
+        );
+    }
+
+    #[test]
+    fn rebase_into_builds_a_new_series_and_leaves_the_original_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::landed_set(
+            tmp.path(),
+            &[("0001-a.patch", testsupport::patch_one())],
+            &["0001-a.patch"],
+        );
+        let before = std::fs::read_to_string(layout.patches_dir().join("0001-a.patch")).unwrap();
+
+        let rebased = rebase(&layout, None, Some("experiment")).unwrap();
+        assert!(rebased.ok);
+        assert!(rebased.undo.is_none(), "--into keeps no undo entry");
+
+        // The original is byte-for-byte what it was, and holds its own base.
+        assert_eq!(
+            std::fs::read_to_string(layout.patches_dir().join("0001-a.patch")).unwrap(),
+            before,
+            "the series --into was asked not to touch was touched"
+        );
+        assert!(
+            !layout.undo_entry().exists(),
+            "--into has nothing to undo: the original still stands"
+        );
+
+        // The new series holds the rebased patches and the new base, and is not active.
+        let target = layout.with_series("experiment").unwrap();
+        assert!(target.patches_dir().join("0001-a.patch").is_file());
+        assert_eq!(
+            std::fs::read_to_string(target.base_file())
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap(),
+            "main"
+        );
+        assert_eq!(layout.series(), "default", "--into does not switch");
+    }
+
+    #[test]
+    fn rebase_into_an_existing_series_is_refused_before_anything_is_built() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::landed_set(
+            tmp.path(),
+            &[("0001-a.patch", testsupport::patch_one())],
+            &["0001-a.patch"],
+        );
+        let taken = layout.with_series("taken").unwrap();
+        std::fs::create_dir_all(taken.patches_dir()).unwrap();
+        testsupport::write_series(&taken, &[("0001-a.patch", "x\n")]);
+
+        let err = rebase(&layout, None, Some("taken")).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("already exists"), "got {text}");
+        assert_eq!(
+            std::fs::read_to_string(
+                layout
+                    .with_series("taken")
+                    .unwrap()
+                    .patches_dir()
+                    .join("0001-a.patch")
+            )
+            .unwrap(),
+            "x\n",
+            "the existing series is untouched"
+        );
+        // The refusal came before the build, so scratch never held anything.
+        assert!(
+            !layout
+                .tmp_dir()
+                .join(format!("{}.new", layout.series()))
+                .exists(),
+            "nothing should be built for a refused name"
+        );
+    }
+
+    #[test]
+    fn an_empty_series_moves_the_base_and_takes_the_sandbox_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::project_with_sandbox(tmp.path());
+
+        let rebased = rebase(&layout, Some("main"), None).unwrap();
+
+        assert!(rebased.ok);
+        assert!(rebased.rewritten.is_empty());
+        assert!(
+            rebased.undo.is_some(),
+            "even a base move keeps the series as it was"
+        );
+        assert_eq!(rebased.ref_name, "main");
+        let base = std::fs::read_to_string(layout.base_file()).unwrap();
+        assert!(
+            base.starts_with("main "),
+            "the base file records the ref and the commit it moved to, got {base:?}"
+        );
+        assert_eq!(
+            rebased.sha.as_str(),
+            base.split_whitespace().nth(1).unwrap(),
+            "the recorded sha is the one the rebase landed on"
+        );
+        let state = State::load(&layout).unwrap();
+        assert_eq!(state.ref_name(&layout), Some("main"));
+        assert!(
+            state.applied(&layout).is_empty(),
+            "an empty series applies nothing"
+        );
     }
 }

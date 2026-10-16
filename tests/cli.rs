@@ -35,7 +35,9 @@ fn stderr(out: &Output) -> String {
 
 /// A project with a mirror holding one commit, a sandbox, and no patches.
 fn bare_project(root: &Path) -> Layout {
-    let layout = Layout::new(root);
+    // The scope the spawned commands resolve from config, which defaults to one tree
+    // per series: a fixture whose own Layout disagreed would read the wrong sandbox.
+    let layout = Layout::new(root).with_per_series_sandbox(true);
     std::fs::create_dir_all(layout.patches_dir()).unwrap();
     std::fs::create_dir_all(layout.mirror_dir()).unwrap();
 
@@ -467,4 +469,45 @@ fn commands_outside_a_project_fail_with_advice() {
         !message.contains("panicked"),
         "a missing project is not a bug in skot:\n{message}"
     );
+}
+
+/// SKOT_SERIES names the series when nothing else does. The unit tests share one
+/// process, so the variable can only be checked here, where the real binary gets a
+/// clean environment: no pointer, two series, and the variable as the only answer.
+#[test]
+fn skot_series_environment_variable_names_the_series() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = bare_project(tmp.path());
+    std::fs::create_dir_all(layout.series_root().join("exp")).unwrap();
+    write_series(&layout, "0001-a.patch", patch_one());
+    let exp = layout.with_series("exp").unwrap();
+    std::fs::write(exp.patches_dir().join("0002-b.patch"), patch_one()).unwrap();
+    std::fs::write(exp.series_file(), "0002-b.patch\n").unwrap();
+
+    // Without the variable this is the ambiguity refusal: several series, nothing
+    // naming the active one. Not `--json`: with the flag the logger is off, and an
+    // error before any command runs has no document to print.
+    let refused = skot(tmp.path(), &["check"]);
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "stderr: {}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("several series"),
+        "stderr: {}",
+        stderr(&refused)
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_skot"))
+        .arg("--dir")
+        .arg(tmp.path())
+        .args(["check", "--json"])
+        .env("SKOT_SERIES", "exp")
+        .output()
+        .expect("running skot");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(doc["series_name"], "exp");
 }

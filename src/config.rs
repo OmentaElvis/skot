@@ -15,6 +15,10 @@ use crate::phase::HookPoint;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Config {
+    /// The series a fresh checkout works on when nothing else names one: the fallback
+    /// under the pointer in `.skot/state.json`, committed so a clone starts on the
+    /// same line of work. `skot init` writes it.
+    pub series: Option<String>,
     #[serde(default)]
     pub upstream: Upstream,
     #[serde(default)]
@@ -94,6 +98,19 @@ pub struct Sandbox {
     /// onto a base that dropped the path, since after that there is nothing to restore from.
     #[serde(default)]
     pub keep: Vec<String>,
+    /// Give every series its own sandbox worktree under `.skot/sandbox/<name>` instead of
+    /// sharing the one slot at `.skot/sandbox/@shared`. On by default: switching series
+    /// then costs nothing but the tree each series already has, which is the point for a
+    /// project where a rebuild reinstalls dependencies. `false` shares the slot, trading
+    /// disk for the single tree.
+    #[serde(default = "default_true")]
+    pub per_series: bool,
+    /// What switching to another series does to a *shared* sandbox: rebuild it for the
+    /// series you switched to (`rebuild`, the default), or leave it until the next
+    /// `build` or `apply` (`keep`). Ignored when `per_series` is set, since each series
+    /// then has its own sandbox to switch to.
+    #[serde(default)]
+    pub on_switch: OnSwitch,
 }
 
 impl Default for Sandbox {
@@ -101,7 +118,28 @@ impl Default for Sandbox {
         Self {
             policy: SandboxPolicy::Persistent,
             keep: Vec::new(),
+            per_series: true,
+            on_switch: OnSwitch::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OnSwitch {
+    /// Apply the series you switched to as part of the switch.
+    #[default]
+    Rebuild,
+    /// Leave the sandbox alone; the next `build` or `apply` moves it.
+    Keep,
+}
+
+impl std::fmt::Display for OnSwitch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Rebuild => "rebuild",
+            Self::Keep => "keep",
+        })
     }
 }
 
@@ -206,6 +244,34 @@ mod tests {
     }
 
     #[test]
+    fn every_series_gets_its_own_tree_unless_the_config_shares_the_slot() {
+        let own = Config::parse("").unwrap();
+        assert!(own.sandbox.per_series);
+        assert_eq!(own.sandbox.on_switch, OnSwitch::Rebuild);
+
+        let shared =
+            Config::parse("[sandbox]\nper-series = false\non-switch = \"keep\"\n").unwrap();
+        assert!(!shared.sandbox.per_series);
+        assert_eq!(shared.sandbox.on_switch, OnSwitch::Keep);
+    }
+
+    #[test]
+    fn a_sandbox_section_that_says_nothing_about_the_scope_still_shares_nothing() {
+        // The default the struct and the field agree on: an explicit `[sandbox]` for
+        // `keep` alone must not silently move the scope.
+        let cfg = Config::parse("[sandbox]\nkeep = [\"node_modules\"]\n").unwrap();
+        assert!(cfg.sandbox.per_series);
+    }
+
+    #[test]
+    fn an_on_switch_value_outside_the_two_the_command_supports_is_rejected() {
+        let err = Config::parse("[sandbox]\non-switch = \"sometimes\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("on-switch"), "got {err}");
+    }
+
+    #[test]
     fn hooks_are_read_in_lifecycle_order() {
         let cfg = Config::parse(
             r#"
@@ -230,6 +296,15 @@ mod tests {
         // clearing a hook leaves behind. It must not run.
         let cfg = Config::parse("[hooks]\npre-build = \"   \"\n").unwrap();
         assert_eq!(cfg.hook(HookPoint::PreBuild), None);
+    }
+
+    #[test]
+    fn the_committed_series_default_is_read() {
+        // What `skot init` writes, and the fallback under the pointer when a clone has
+        // no `.skot/state.json` of its own yet.
+        let cfg = Config::parse("series = \"stable\"\n").unwrap();
+        assert_eq!(cfg.series.as_deref(), Some("stable"));
+        assert_eq!(Config::parse("").unwrap().series, None);
     }
 
     #[test]

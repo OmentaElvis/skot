@@ -55,6 +55,7 @@ pub fn run(ctx: &Ctx, arg: &PatchArg) -> Result<Exit> {
     if ctx.cli.json {
         emit_json(&json!({
             "ok": pushed.added.is_some(),
+            "series_name": ctx.layout.series(),
             "ref": pushed.ref_name,
             "sha": pushed.sha.as_str(),
             "applied": pushed.names,
@@ -118,7 +119,8 @@ fn push(layout: &Layout, want: Option<&str>) -> Result<Pushed> {
     // the loop.
     let (config, series) = layout.project()?;
     let state = State::load(layout)?;
-    if !state.applied.is_empty() {
+    authoring::require_holder(layout, &state)?;
+    if !state.applied(layout).is_empty() {
         drop(authoring::require_sandbox(layout)?);
     }
 
@@ -136,10 +138,10 @@ fn push(layout: &Layout, want: Option<&str>) -> Result<Pushed> {
     // no longer lists.
     let all = series.entries_lenient(layout);
     let whole_series = want.is_none()
-        && !state.applied.is_empty()
-        && state.applied.len() == all.len()
+        && !state.applied(layout).is_empty()
+        && state.applied(layout).len() == all.len()
         && state
-            .applied
+            .applied(layout)
             .iter()
             .zip(all.iter())
             .all(|(applied, entry)| applied == &entry.name);
@@ -151,7 +153,7 @@ fn push(layout: &Layout, want: Option<&str>) -> Result<Pushed> {
             added: None,
             ref_name,
             sha,
-            names: state.applied,
+            names: state.applied(layout).to_vec(),
             tree,
         });
     }
@@ -183,11 +185,12 @@ mod tests {
     use crate::commands::testsupport;
     use clap::Parser as _;
 
-    fn state_of(names: &[&str]) -> State {
-        State {
-            applied: names.iter().map(|n| (*n).to_owned()).collect(),
-            ..State::default()
-        }
+    fn state_of(layout: &Layout, names: &[&str]) -> State {
+        let mut state = State::load(layout).unwrap();
+        state
+            .set_applied(layout, names.iter().map(|n| (*n).to_owned()).collect())
+            .unwrap();
+        state
     }
 
     #[test]
@@ -235,7 +238,7 @@ mod tests {
         let stack = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&["0001-a.patch"]),
+            &state_of(&layout, &["0001-a.patch"]),
             None,
             Move::Deeper,
         )
@@ -262,7 +265,7 @@ mod tests {
         let stack = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&["0003-c.patch"]),
+            &state_of(&layout, &["0003-c.patch"]),
             None,
             Move::Deeper,
         )
@@ -320,7 +323,7 @@ mod tests {
         let err = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&["0001-a.patch"]),
+            &state_of(&layout, &["0001-a.patch"]),
             None,
             Move::Deeper,
         )
@@ -338,7 +341,7 @@ mod tests {
         let err = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&["0001-a.patch"]),
+            &state_of(&layout, &["0001-a.patch"]),
             Some("0001-a.patch"),
             Move::Deeper,
         )
@@ -394,7 +397,7 @@ mod tests {
         let stack = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&["0003-c.patch"]),
+            &state_of(&layout, &["0003-c.patch"]),
             Some("0001-a.patch"),
             Move::Deeper,
         )
@@ -413,7 +416,7 @@ mod tests {
         let err = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&["0001-a.patch", "0009-gone.patch"]),
+            &state_of(&layout, &["0001-a.patch", "0009-gone.patch"]),
             None,
             Move::Deeper,
         )
@@ -442,7 +445,7 @@ mod tests {
         let err = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&["0001-a.patch", "0002-gone.patch"]),
+            &state_of(&layout, &["0001-a.patch", "0002-gone.patch"]),
             None,
             Move::Deeper,
         )

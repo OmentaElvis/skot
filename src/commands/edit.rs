@@ -32,10 +32,11 @@ use crate::state::State;
 pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<Exit> {
     let (session, opened, discarded) =
         open(&ctx.layout, &args.patch, args.base.as_deref(), args.yes)?;
-    let dir = ctx.layout.work_patch_dir(session.dir_name())?;
+    let dir = session.dir_path(&ctx.layout)?;
 
     if ctx.cli.json {
         emit_json(&json!({
+            "series_name": ctx.layout.series(),
             "patch": session.patch,
             "worktree": dir.display().to_string(),
             "ref": session.ref_name,
@@ -85,7 +86,7 @@ fn open(
     let _lock = layout.lock()?;
     let manifest = session::reconcile(layout)?;
     let mut discarded = false;
-    if let Some(existing) = find(&manifest, patch) {
+    if let Some(existing) = find(layout, &manifest, patch) {
         if !session::unsaved(layout, existing)? {
             // Matches the patch: not a complaint, just where the user was. Return to it.
             return Ok((existing.clone(), false, false));
@@ -115,8 +116,9 @@ fn open(
     let base = match base {
         Some(base) => base.to_owned(),
         None => State::load(layout)?
-            .ref_name
-            .clone()
+            .ref_name(layout)
+            .map(str::to_owned)
+            .or_else(|| layout.base_ref())
             .or_else(|| config.upstream.default_ref.clone())
             .ok_or_else(|| {
                 // `new`'s version of this error suggests `new --base`, which would start a
@@ -137,12 +139,20 @@ fn open(
 }
 
 /// Find a work area by its patch's name, or by the file name that name ends in.
-fn find<'s>(manifest: &'s session::Manifest, patch: &str) -> Option<&'s Session> {
+///
+/// Only the layout's series: two series can hold a patch of the same name, and `edit`
+/// opens work areas in the series it is running against.
+fn find<'s>(
+    layout: &crate::layout::Layout,
+    manifest: &'s session::Manifest,
+    patch: &str,
+) -> Option<&'s Session> {
     manifest.sessions.iter().find(|s| {
-        s.patch == patch
-            || std::path::Path::new(&s.patch)
-                .file_name()
-                .is_some_and(|f| f == patch)
+        s.series_name() == layout.series()
+            && (s.patch == patch
+                || std::path::Path::new(&s.patch)
+                    .file_name()
+                    .is_some_and(|f| f == patch))
     })
 }
 

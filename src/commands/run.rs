@@ -17,11 +17,10 @@ pub fn run(ctx: &Ctx, args: &RunArgs) -> Result<Exit> {
     let env = Env {
         project_root: ctx.layout.root().to_path_buf(),
         sandbox,
-        ref_name: state.ref_name.clone().unwrap_or_default(),
-        sha: state.sha.clone().unwrap_or_default(),
+        ref_name: state.ref_name(&ctx.layout).unwrap_or_default().to_owned(),
+        sha: state.sha(&ctx.layout).unwrap_or_default().to_owned(),
         version: state
-            .ref_name
-            .as_deref()
+            .ref_name(&ctx.layout)
             .map(Env::version_from_ref)
             .unwrap_or_default(),
     };

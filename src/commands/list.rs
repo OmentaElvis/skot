@@ -34,7 +34,7 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
         .map(|e| e.name.as_str())
         .collect();
     let applied = crate::state::State::load(&ctx.layout)
-        .map(|s| s.applied)
+        .map(|s| s.applied(&ctx.layout).to_vec())
         .unwrap_or_default();
 
     if ctx.cli.json {
@@ -149,6 +149,7 @@ fn unsaved_work_areas(layout: &crate::layout::Layout) -> Vec<String> {
         .map(|m| {
             m.sessions
                 .iter()
+                .filter(|s| s.series_name() == layout.series())
                 .filter(|s| session::unsaved(layout, s).unwrap_or(false))
                 .map(|s| s.patch.clone())
                 .collect()
@@ -173,6 +174,7 @@ mod tests {
 
         session::Manifest {
             sessions: vec![session::Session {
+                series: crate::layout::DEFAULT_SERIES.to_owned(),
                 patch: "0002-b.patch".to_owned(),
                 dir: "0002-b.patch".to_owned(),
                 ref_name: "main".to_owned(),

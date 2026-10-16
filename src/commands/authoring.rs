@@ -17,7 +17,8 @@ use crate::layout::Layout;
 use crate::series::Entry;
 use crate::state::State;
 
-/// Resolve the ref a command should work against: the argument, then the configured default.
+/// Resolve the ref a command should work against: the argument, then the series' base,
+/// then the configured default.
 ///
 /// `command_line` is what the advice tells the user to run, already resolved through
 /// [`crate::invocation`] so a command that moves updates this message too. Kept as a
@@ -30,10 +31,12 @@ pub fn wanted_ref(
 ) -> Result<String> {
     ref_name
         .map(str::to_owned)
+        .or_else(|| layout.base_ref())
         .or_else(|| config.upstream.default_ref.clone())
         .context(format!(
             "no ref to work against.\n\
-             Pass one (as in `{command_line} <ref>`) or set `upstream.default-ref` in {}.",
+             Pass one (as in `{command_line} <ref>`), record a base for this series, \
+             or set `upstream.default-ref` in {}.",
             layout.config_file().display()
         ))
 }
@@ -61,6 +64,31 @@ pub fn require_sandbox(layout: &Layout) -> Result<git2::Repository> {
         );
     }
     sandbox::open(layout)
+}
+
+/// Refuse to touch a sandbox that belongs to another series.
+///
+/// One shared sandbox holds one series at a time. After a `keep` switch the tree still
+/// holds the series you left, and pushing or popping would land this series' patches on
+/// top of that series' state. `apply` is the command that takes the sandbox over; until
+/// it runs, stack commands wait.
+pub fn require_holder(layout: &Layout, state: &State) -> Result<()> {
+    if layout.per_series_sandbox() {
+        return Ok(());
+    }
+    let Some(holder) = state.sandbox_holder(layout) else {
+        return Ok(());
+    };
+    if holder == layout.series() {
+        return Ok(());
+    }
+    bail!(
+        "the sandbox holds `{}`, not `{}`.\n\
+         `{}` takes it over for the series you are on.",
+        holder,
+        layout.series(),
+        skot("apply")
+    );
 }
 
 /// The signature to stamp a brand-new patch with.
@@ -105,15 +133,18 @@ pub fn subject_from_name(name: &str) -> String {
 /// For `push` and `pop` this is the ref the sandbox is *already* on, not one from the command
 /// line: those commands take a patch name, and replaying a stack against a different ref than
 /// the one it was built on would produce a tree the user never asked for. So the recorded ref
-/// wins, with the configured default as the fallback for a sandbox that was never applied.
+/// wins, with the series' base and then the configured default as the fallbacks for a
+/// sandbox that was never applied.
 pub fn stack_ref(layout: &Layout, state: &State, config: &Config) -> Result<String> {
     state
-        .ref_name
-        .clone()
+        .ref_name(layout)
+        .map(str::to_owned)
+        .or_else(|| layout.base_ref())
         .or_else(|| config.upstream.default_ref.clone())
         .context(format!(
             "cannot tell which ref the sandbox is on.\n\
-             `.skot/state.json` records none and `upstream.default-ref` is unset in {}.\n\
+             `.skot/state.json` records none, this series has no base, and \
+             `upstream.default-ref` is unset in {}.\n\
              Run `{} <ref>` first.",
             layout.config_file().display(),
             skot("apply")
@@ -180,10 +211,10 @@ pub fn recorded_stack(
     state: &State,
 ) -> Result<Stack> {
     let all = series.entries_lenient(layout);
-    validate_set(&all, &state.applied, series)?;
+    validate_set(&all, state.applied(layout), series)?;
     let entries: Vec<Entry> = all
         .into_iter()
-        .filter(|e| state.applied.contains(&e.name))
+        .filter(|e| state.applied(layout).contains(&e.name))
         .collect();
     let names = entries.iter().map(|e| e.name.clone()).collect();
     Ok(Stack { entries, names })
@@ -285,9 +316,9 @@ pub fn resolve_stack(
     move_: Move,
 ) -> Result<Stack> {
     let all = series.entries_lenient(layout);
-    validate_set(&all, &state.applied, series)?;
+    validate_set(&all, state.applied(layout), series)?;
 
-    let applied = &state.applied;
+    let applied = state.applied(layout);
     let mut on: Vec<bool> = all.iter().map(|e| applied.contains(&e.name)).collect();
     // Everything above the top is off by construction, so `push` with no name moves to
     // exactly one patch: the next series entry after the topmost applied one.
@@ -505,10 +536,13 @@ mod tests {
             ],
         );
         let series = layout.project().unwrap().1;
-        let state = State {
-            applied: vec!["0001-a.patch".to_owned(), "0003-c.patch".to_owned()],
-            ..State::default()
-        };
+        let mut state = State::default();
+        state
+            .set_applied(
+                &layout,
+                vec!["0001-a.patch".to_owned(), "0003-c.patch".to_owned()],
+            )
+            .unwrap();
 
         let stack = recorded_stack(&layout, &series, &state).unwrap();
         assert_eq!(stack.names, ["0001-a.patch", "0003-c.patch"]);
@@ -559,5 +593,34 @@ mod tests {
         let header = header_for(Some("diff --git a/a b/a\n"), "fallback", &sig);
         assert_eq!(header.subject(), "fallback");
         assert!(header.author.is_some());
+    }
+
+    #[test]
+    fn a_stack_command_waits_until_the_sandbox_is_its_series() {
+        let (_tmp, layout) = crate::commands::testsupport::project();
+        std::fs::create_dir_all(layout.series_root().join("exp")).unwrap();
+        let mut state = State::load(&layout).unwrap();
+        state
+            .set_applied(&layout, vec!["0001-a.patch".to_owned()])
+            .unwrap();
+
+        // The holder is the series the sandbox was applied for.
+        require_holder(&layout, &state).unwrap();
+
+        // After a keep switch the tree still holds the old series, so the new one waits.
+        let exp = layout.with_series("exp").unwrap();
+        let err = require_holder(&exp, &state).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("the sandbox holds `default`, not `exp`"),
+            "got {text}"
+        );
+        assert!(text.contains(&skot("apply")), "got {text}");
+
+        // Per-series mode: every series owns its tree, so there is nothing to wait for.
+        let per = layout.with_per_series_sandbox(true);
+        require_holder(&per, &state).unwrap();
+        let per_exp = exp.with_per_series_sandbox(true);
+        require_holder(&per_exp, &state).unwrap();
     }
 }

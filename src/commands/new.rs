@@ -59,6 +59,7 @@ pub fn run(ctx: &Ctx, args: &NewArgs) -> Result<Exit> {
 
     if ctx.cli.json {
         emit_json(&json!({
+            "series_name": ctx.layout.series(),
             "patch": created.name,
             "path": created.path.display().to_string(),
             "work_area": created.work_area.display().to_string(),
@@ -102,8 +103,9 @@ fn create(layout: &Layout, name: &str, base: Option<&str>, at: Option<&str>) -> 
     let base = match base {
         Some(base) => base.to_owned(),
         None => state
-            .ref_name
-            .clone()
+            .ref_name(layout)
+            .map(str::to_owned)
+            .or_else(|| layout.base_ref())
             .or_else(|| config.upstream.default_ref.clone())
             .ok_or_else(|| {
                 // `apply`'s version of this error says "run `skot patch apply <ref>`", which is the
@@ -155,7 +157,7 @@ fn create(layout: &Layout, name: &str, base: Option<&str>, at: Option<&str>) -> 
     // `edit-save` in charge of work that was never done.
     state.follow_renames(layout, &renames)?;
     let mut sessions = session::Manifest::load(layout)?;
-    sessions.follow_renames(&renames);
+    sessions.follow_renames(layout, &renames);
     sessions.save(layout)?;
 
     // Last of all the work area: a worktree with no manifest entry is recognised as a husk
@@ -268,12 +270,16 @@ mod tests {
         create(&layout, "third", None, None).unwrap();
 
         let mut state = State::load(&layout).unwrap();
-        state.applied = vec![
-            "0001-first.patch".to_owned(),
-            "0002-second.patch".to_owned(),
-            "0003-third.patch".to_owned(),
-        ];
-        state.save(&layout).unwrap();
+        state
+            .set_applied(
+                &layout,
+                vec![
+                    "0001-first.patch".to_owned(),
+                    "0002-second.patch".to_owned(),
+                    "0003-third.patch".to_owned(),
+                ],
+            )
+            .unwrap();
 
         let created = create(&layout, "middle", None, Some("2")).unwrap();
 
@@ -288,7 +294,7 @@ mod tests {
         assert!(!layout.patches_dir().join("0002-second.patch").exists());
         let state = State::load(&layout).unwrap();
         assert_eq!(
-            state.applied,
+            state.applied(&layout).to_vec(),
             ["0001-first.patch", "0003-second.patch", "0004-third.patch"],
             "the applied set follows the renumbered tail, and gains no new patch"
         );
@@ -360,7 +366,10 @@ mod tests {
         // fail loudly and leave the recorded base alone. After the fetch has had its
         // chance, the answer names the ref the upstream does not have.
         let (_tmp, layout) = project();
-        let before = crate::state::State::load(&layout).unwrap().ref_name;
+        let before = crate::state::State::load(&layout)
+            .unwrap()
+            .ref_name(&layout)
+            .map(str::to_owned);
         let up = _tmp.path().join("upstream.git");
         let repo = git2::Repository::init_bare(&up).unwrap();
         let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
@@ -390,7 +399,10 @@ mod tests {
             "no patch should be created"
         );
         assert_eq!(
-            crate::state::State::load(&layout).unwrap().ref_name,
+            crate::state::State::load(&layout)
+                .unwrap()
+                .ref_name(&layout)
+                .map(str::to_owned),
             before,
             "the recorded base must be unchanged by a failed run"
         );

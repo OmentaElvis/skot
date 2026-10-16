@@ -32,6 +32,11 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     pub dir: Option<PathBuf>,
 
+    /// Series to work on for this run: one shot, the active one stays put. Also read
+    /// from the SKOT_SERIES environment variable, which the flag beats.
+    #[arg(long, global = true, value_name = "NAME", env = "SKOT_SERIES")]
+    pub series: Option<String>,
+
     /// Machine-readable output on stdout.
     #[arg(long, global = true)]
     pub json: bool,
@@ -67,11 +72,21 @@ pub enum Command {
     #[command(subcommand)]
     Patch(PatchCommand),
 
+    /// List, create, switch and copy series.
+    ///
+    /// A bare `skot series` lists, the way a bare `git branch` lists.
+    Series(SeriesArgs),
+
     /// Check whether the series applies to a ref, without building anything.
     Check(CheckArgs),
 
     /// Replay the series onto a different ref.
-    Rebase(RefArg),
+    ///
+    /// The series is rebuilt in full and put in place with a rename, so a failure
+    /// leaves it untouched. Without `--into` the rebase replaces the series and the
+    /// version it replaced is kept for `series undo`; with `--into` the rewritten
+    /// series lands under a new name and this one is left alone.
+    Rebase(RebaseArgs),
 
     /// Mirror a remote and keep its refs current.
     Sync(SyncArgs),
@@ -137,6 +152,119 @@ pub enum PatchCommand {
     /// Asks before deleting; `--yes` says so in advance.
     #[command(visible_alias = "rm")]
     Drop(DropArgs),
+
+    /// Copy a patch file from another series into this one.
+    ///
+    /// The patch keeps its name and lands at the end of the series, or wherever `--at`
+    /// puts it. What it does on this series' base is `skot check`'s answer to give.
+    Copy(PatchCopyArgs),
+}
+
+/// Series management, under `skot series`.
+#[derive(Debug, Clone, Args)]
+pub struct SeriesArgs {
+    /// What to do. A bare `skot series` lists, the way a bare `git branch` lists.
+    #[command(subcommand)]
+    pub command: Option<SeriesCommand>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum SeriesCommand {
+    /// Create a series and switch to it.
+    ///
+    /// The word is `create` because `new` is already `patch new`: the two would both
+    /// answer to a bare `skot new` in advice text, and an ambiguous remedy is worse
+    /// than none.
+    Create(SeriesCreateArgs),
+
+    /// Switch to an existing series.
+    Use(SeriesUseArgs),
+
+    /// Copy a series to a new name, leaving the active one alone.
+    ///
+    /// A snapshot: every patch file, the list and the base, under a new name, so an
+    /// experiment can be split off or a series kept as it stands. The switch is a
+    /// separate decision (`skot series use <name>`).
+    Copy(SeriesCopyArgs),
+
+    /// Swap the active series with the version the last successful rebase replaced.
+    ///
+    /// A rebase keeps one version of the series it replaced, at `.skot/undo/<name>`.
+    /// This trades the two, so a second undo puts back what the first one took away.
+    /// The sandbox is rebuilt for whichever version ends up active.
+    Undo(SeriesUndoArgs),
+
+    /// Remove a series for good: its patches, its list and its base.
+    ///
+    /// Refuses the active series and any series holding unsaved work. Asks first;
+    /// `--yes` says so in advance.
+    Drop(SeriesDropArgs),
+
+    /// Rename the active series, pointer, work areas and all.
+    ///
+    /// A series' sandbox tree is derived state and is rebuilt by the next apply; open
+    /// work areas follow the rename, but only ones holding nothing their patch lacks.
+    Rename(SeriesRenameArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SeriesCreateArgs {
+    /// Name for the new series.
+    pub name: String,
+
+    /// Seed the new series from this one instead of the active one.
+    #[arg(long, value_name = "NAME")]
+    pub from: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SeriesUseArgs {
+    /// Series to switch to.
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SeriesCopyArgs {
+    /// Name for the copy.
+    pub name: String,
+
+    /// Series to copy from, instead of the active one.
+    #[arg(long, value_name = "NAME")]
+    pub from: Option<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SeriesUndoArgs {
+    /// Put the previous series back without asking.
+    #[arg(long)]
+    pub yes: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SeriesDropArgs {
+    /// Series to remove.
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct SeriesRenameArgs {
+    /// New name for the active series.
+    pub name: String,
+}
+
+/// `skot patch copy <patch> --from <series>`.
+#[derive(Debug, Clone, Args)]
+pub struct PatchCopyArgs {
+    /// Patch to copy, named as it is in the source series.
+    pub patch: String,
+
+    /// Series to copy the patch from.
+    #[arg(long, value_name = "NAME")]
+    pub from: String,
+
+    /// Where to put it: a position in the series, counting from 1. The end, by default.
+    #[arg(long, value_name = "N")]
+    pub at: Option<usize>,
 }
 
 // ----- grouped help ------------------------------------------------------------
@@ -159,6 +287,7 @@ const LITERAL: Style = Style::new().bold();
 const ROOT_GROUPS: &[(&str, &[&str])] = &[
     ("Start here", &["init", "build", "status"]),
     ("Patches", &["patch"]),
+    ("Series", &["series"]),
     ("Upstream", &["check", "rebase", "sync"]),
     ("Housekeeping", &["clean", "hooks", "run"]),
 ];
@@ -166,7 +295,7 @@ const ROOT_GROUPS: &[(&str, &[&str])] = &[
 /// `skot patch --help`'s groups, same shape as [`ROOT_GROUPS`].
 const PATCH_GROUPS: &[(&str, &[&str])] = &[
     ("Author", &["new", "edit", "edit-save", "import"]),
-    ("Arrange", &["enable", "disable", "move", "drop"]),
+    ("Arrange", &["enable", "disable", "move", "drop", "copy"]),
     ("Apply", &["apply", "unapply", "push", "pop"]),
     ("Inspect", &["list"]),
 ];
@@ -423,6 +552,22 @@ pub struct RefArg {
     pub ref_name: Option<String>,
 }
 
+/// `skot rebase [REF] [--into NAME]`.
+#[derive(Debug, Clone, Args)]
+pub struct RebaseArgs {
+    /// Ref: a tag, a branch, or a commit.
+    #[arg(value_name = "REF")]
+    pub ref_name: Option<String>,
+
+    /// Put the rebased series under this name instead of replacing the active one.
+    ///
+    /// The series named by `--series` stays exactly as it is: the rewritten series is
+    /// built and installed as a new one, so a rebase can be tried without risking the
+    /// series it started from. The new series is not switched to; `series use` does that.
+    #[arg(long, value_name = "NAME")]
+    pub into: Option<String>,
+}
+
 /// Deliberately not [`RefArg`]: `skot sync --refresh` contacts the upstream even when the
 /// mirror already has the ref, and putting that flag on the shared type would hand it to
 /// `skot patch apply --refresh` too, where it could only mean something the apply path does
@@ -622,6 +767,70 @@ mod tests {
         assert!(cli.json);
         let cli = Cli::try_parse_from(["skot", "--json", "patch", "list"]).unwrap();
         assert!(cli.json);
+        let cli = Cli::try_parse_from(["skot", "patch", "list", "--series", "exp"]).unwrap();
+        assert_eq!(cli.series.as_deref(), Some("exp"));
+        let cli = Cli::try_parse_from(["skot", "--series", "exp", "status"]).unwrap();
+        assert_eq!(cli.series.as_deref(), Some("exp"));
+    }
+
+    #[test]
+    fn the_series_command_creates_switches_and_copies_and_a_bare_one_lists() {
+        // A bare `skot series` is the list, the way a bare `git branch` is. There is
+        // no `series list` or `series new`: those names belong to `skot patch`, and
+        // skot refuses two commands that share a name.
+        let cli = Cli::try_parse_from(["skot", "series"]).unwrap();
+        let Command::Series(args) = cli.command else {
+            panic!("expected series");
+        };
+        assert!(args.command.is_none(), "bare `series` is the list");
+
+        let cli = Cli::try_parse_from(["skot", "series", "create", "exp"]).unwrap();
+        let Command::Series(args) = cli.command else {
+            panic!("expected series");
+        };
+        let Some(SeriesCommand::Create(create)) = args.command else {
+            panic!("expected series create");
+        };
+        assert_eq!(create.name, "exp");
+
+        let cli = Cli::try_parse_from(["skot", "series", "use", "exp"]).unwrap();
+        let Command::Series(args) = cli.command else {
+            panic!("expected series");
+        };
+        let Some(SeriesCommand::Use(use_)) = args.command else {
+            panic!("expected series use");
+        };
+        assert_eq!(use_.name, "exp");
+
+        let cli = Cli::try_parse_from(["skot", "series", "copy", "checkpoint"]).unwrap();
+        let Command::Series(args) = cli.command else {
+            panic!("expected series");
+        };
+        let Some(SeriesCommand::Copy(copy)) = args.command else {
+            panic!("expected series copy");
+        };
+        assert_eq!(copy.name, "checkpoint");
+
+        for rejected in [
+            ["skot", "series", "list"].as_slice(),
+            ["skot", "series", "new", "exp"].as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(rejected).is_err(),
+                "{rejected:?} is a patch-level spelling, not a series one"
+            );
+        }
+
+        for missing in [
+            ["skot", "series", "create"],
+            ["skot", "series", "use"],
+            ["skot", "series", "copy"],
+        ] {
+            assert!(
+                Cli::try_parse_from(missing).is_err(),
+                "{missing:?} needs a name"
+            );
+        }
     }
 
     #[test]

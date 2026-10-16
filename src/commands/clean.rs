@@ -38,7 +38,10 @@ impl Plan {
     pub fn for_level(layout: &Layout, level: CleanLevel, with_sessions: bool) -> Self {
         let mut paths = Vec::new();
         let mut sessions = Vec::new();
-        let sandbox = layout.sandbox_dir();
+        // The root, not the active series' tree: `clean sandbox` frees every tree in it,
+        // and that includes whichever slot a mode flip has just left behind, shared or
+        // per-series, without the plan having to know which one is current.
+        let sandbox = layout.sandbox_root();
         if sandbox.exists() {
             paths.push(("the sandbox".to_owned(), sandbox));
         }
@@ -120,12 +123,7 @@ fn saved_work_areas(layout: &Layout) -> Vec<(String, std::path::PathBuf)> {
             m.sessions
                 .iter()
                 .filter(|s| matches!(session::unsaved(layout, s), Ok(false)))
-                .filter_map(|s| {
-                    layout
-                        .work_patch_dir(s.dir_name())
-                        .ok()
-                        .map(|dir| (s.patch.clone(), dir))
-                })
+                .filter_map(|s| s.dir_path(layout).ok().map(|dir| (s.patch.clone(), dir)))
                 .collect()
         })
         .unwrap_or_default()
@@ -156,6 +154,7 @@ pub fn run(ctx: &Ctx, args: &CleanArgs) -> Result<Exit> {
 
     if ctx.cli.json {
         emit_json(&serde_json::json!({
+            "series_name": ctx.layout.series(),
             "level": format!("{:?}", plan.level).to_lowercase(),
             "would_remove": plan.paths.iter().map(|(label, p)| serde_json::json!({
                 "what": label,
@@ -207,13 +206,13 @@ pub fn run(ctx: &Ctx, args: &CleanArgs) -> Result<Exit> {
         report::line(&format!("{} {}", report::ok("removed"), path.display()));
     }
 
-    // The record must not outlive the tree it describes. `ref_name` and `sha` are left
-    // alone: they are the last known apply target, which is what `unapply` needs if a
-    // mirror happens to still be there, and the sandbox is gone either way. Nothing is
-    // cleared when the plan held only work areas: a work area is not an apply, and
-    // the set it left behind is exactly what the next run should still see.
+    // The records must not outlive the trees they describe. The whole sandbox root goes,
+    // every series' tree in it included, so every record goes with it: one shared record,
+    // or one per series. Nothing is cleared when the plan held only work areas: a work
+    // area is not an apply, and the set it left behind is exactly what the next run
+    // should still see.
     if args.level >= CleanLevel::Sandbox {
-        crate::state::State::load(&ctx.layout)?.clear_applied(&ctx.layout)?;
+        crate::state::State::load(&ctx.layout)?.clear_sandboxes(&ctx.layout)?;
     }
 
     drop(lock);
@@ -250,16 +249,12 @@ fn remove_one(layout: &Layout, label: &str, path: &std::path::Path) -> Result<()
         return Ok(());
     }
     if label.ends_with(" (saved)") {
-        let patch = label.trim_end_matches(" (saved)");
+        // By directory, not by patch name: two series can hold a patch of the same name,
+        // and the plan paired this session with this path.
         if let Some(s) = session::Manifest::load(layout)?
             .sessions
             .into_iter()
-            .find(|s| {
-                s.patch == patch
-                    || std::path::Path::new(&s.patch)
-                        .file_name()
-                        .is_some_and(|f| f == patch)
-            })
+            .find(|s| s.dir_path(layout).ok().as_deref() == Some(path))
         {
             session::end(layout, &s)?;
         }
@@ -275,7 +270,9 @@ fn label(level: CleanLevel) -> &'static str {
         CleanLevel::Sandbox => "sandbox (the worktree; next build reinstalls dependencies)",
         CleanLevel::Out => "out (also the generated out directory)",
         CleanLevel::Mirror => "mirror (also the bare mirror; next run re-clones)",
-        CleanLevel::All => "all (everything under .skot; next run re-clones and reinstalls)",
+        CleanLevel::All => {
+            "all (everything under .skot but the series pointer; next run re-clones and reinstalls)"
+        }
     }
 }
 
@@ -299,7 +296,24 @@ mod tests {
 
         let plan = Plan::for_level(&l, CleanLevel::Sandbox, false);
         assert_eq!(plan.paths.len(), 1);
-        assert_eq!(plan.paths[0].1, l.sandbox_dir());
+        // The root, so the shared slot and every per-series tree go together.
+        assert_eq!(plan.paths[0].1, l.sandbox_root());
+    }
+
+    #[test]
+    fn clean_sandbox_sees_a_leftover_shared_sandbox_after_a_mode_flip() {
+        // The shared slot sits *under* the root at `@shared`, beside the per-series
+        // trees. Planning the active series' own dir would list only that tree and
+        // leave the slot from the other scope behind.
+        let (_tmp, l) = layout();
+        let per = l.with_per_series_sandbox(true);
+        std::fs::create_dir_all(l.sandbox_dir()).unwrap();
+        assert!(l.sandbox_dir().ends_with("@shared"));
+
+        let plan = Plan::for_level(&per, CleanLevel::Sandbox, false);
+        assert_eq!(plan.paths.len(), 1);
+        assert_eq!(plan.paths[0].1, per.sandbox_root());
+        assert!(plan.paths[0].1.join("@shared").exists());
     }
 
     #[test]
@@ -667,5 +681,44 @@ mod tests {
         assert!(!l.mirror_dir().exists());
         assert!(!l.work_dir().exists());
         assert!(!l.sandbox_dir().exists());
+    }
+
+    #[test]
+    fn clean_never_takes_the_series_pointer() {
+        // The pointer is the one thing under .skot that is not derived state: it is
+        // the user's answer to "which series is active", and a clean that erased it
+        // would leave the next command guessing between several lines of work.
+        let (_tmp, l) = layout();
+        std::fs::create_dir_all(l.series_root().join("exp")).unwrap();
+        crate::state::State::load(&l)
+            .unwrap()
+            .set_active_series(&l, "exp")
+            .unwrap();
+        std::fs::create_dir_all(l.sandbox_root()).unwrap();
+        std::fs::write(l.sandbox_root().join("scratch"), "x").unwrap();
+        std::fs::write(l.out_dir().join("artifact"), "x").unwrap();
+
+        let ctx = Ctx {
+            layout: l.clone(),
+            cli: crate::cli::Cli::try_parse_from(["skot", "clean", "all", "--sessions"]).unwrap(),
+            yes: true,
+        };
+        run(
+            &ctx,
+            &CleanArgs {
+                level: CleanLevel::All,
+                sessions: true,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            l.state_file().is_file(),
+            "the pointer survives a full clean"
+        );
+        assert_eq!(
+            crate::state::State::load(&l).unwrap().active_series(),
+            Some("exp")
+        );
     }
 }

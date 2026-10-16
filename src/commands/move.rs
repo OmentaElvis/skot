@@ -59,7 +59,7 @@ pub fn run(ctx: &Ctx, args: &MoveArgs) -> Result<Exit> {
 
     let want = match &args.patch {
         Some(want) => want.clone(),
-        None if interactive => pick_patch(&names, &state)?,
+        None if interactive => pick_patch(&names, state.applied(&ctx.layout))?,
         None => bail!(
             "cannot ask which patch to move here.\n\
              Name both ends: `{}`.",
@@ -96,6 +96,7 @@ pub fn run(ctx: &Ctx, args: &MoveArgs) -> Result<Exit> {
     if ctx.cli.json {
         emit_json(&json!({
             "ok": true,
+            "series_name": ctx.layout.series(),
             "patch": moved.name,
             "from": moved.from,
             "to": moved.to,
@@ -135,7 +136,7 @@ fn relocate(layout: &Layout, name: &str, to: usize) -> Result<Moved> {
     let (_config, mut series) = layout.project()?;
     let mut state = State::load(layout)?;
 
-    if state.applied.contains(&name.to_owned()) {
+    if state.applied(layout).contains(&name.to_owned()) {
         bail!(
             "`{name}` is applied, so moving it would reorder what the sandbox is holding.\n\
              `{}` takes it off (and the patches above it); `{}` puts the set back afterwards.",
@@ -150,7 +151,7 @@ fn relocate(layout: &Layout, name: &str, to: usize) -> Result<Moved> {
     // A patch with a work area keeps its worktree; only the name it answers to in the
     // series moves, and the session record follows that name.
     let mut sessions = crate::session::Manifest::load(layout)?;
-    sessions.follow_renames(&moved.renames);
+    sessions.follow_renames(layout, &moved.renames);
     sessions.save(layout)?;
     drop(lock);
 
@@ -211,11 +212,11 @@ fn resolve_destination(names: &[String], at: &str, moving: &str) -> Result<usize
 /// Ask an interactive session which patch to move. Only unapplied patches are offered:
 /// the others cannot move, and offering them would only produce the refusal afterwards.
 /// The labels carry the series position, the same numbers `ls` shows.
-fn pick_patch(names: &[String], state: &State) -> Result<String> {
+fn pick_patch(names: &[String], applied: &[String]) -> Result<String> {
     let options: Vec<(String, String)> = names
         .iter()
         .enumerate()
-        .filter(|(_, n)| !state.applied.contains(*n))
+        .filter(|(_, n)| !applied.contains(*n))
         .map(|(i, n)| (format!("{:>3}  {n}", i + 1), n.clone()))
         .collect();
     if options.is_empty() {
@@ -388,7 +389,7 @@ mod tests {
 
         let state = State::load(&layout).unwrap();
         assert_eq!(
-            state.applied,
+            state.applied(&layout).to_vec(),
             vec!["0001-b.patch".to_owned(), "0002-c.patch".to_owned()],
             "the same patches, under their new names, still in series order"
         );

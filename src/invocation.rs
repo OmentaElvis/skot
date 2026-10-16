@@ -37,8 +37,11 @@ pub fn skot_args(name: &str, args: &str) -> String {
 /// Every subcommand name (and alias) to the path from the binary to it.
 ///
 /// Walked from [`Cli::command`], the derive that parsing itself uses, once per process.
-/// Two commands sharing a name would resolve to one of them, so the walk refuses to
-/// build rather than pick.
+/// clap only requires a name to be unique among its siblings, so two commands under
+/// different parents may share one (`series drop` next to `patch drop`). The bare-name
+/// map cannot hold both, so the first registration in command-tree order wins and stays
+/// deterministic; a hint that needs the other one passes the parent (`skot_args("series",
+/// "drop <name>")`), which walks this same tree and cannot go stale.
 fn paths() -> &'static HashMap<String, Vec<String>> {
     static PATHS: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
     PATHS.get_or_init(|| {
@@ -49,6 +52,22 @@ fn paths() -> &'static HashMap<String, Vec<String>> {
 }
 
 fn walk(cmd: &clap::Command, prefix: &[String], map: &mut HashMap<String, Vec<String>>) {
+    // clap's own rule: a name is free as long as no *sibling* holds it. The assertion
+    // here is what turns a future collision into an immediate failure rather than a
+    // parse error a user hits.
+    let mut siblings = std::collections::HashSet::new();
+    for sub in cmd.get_subcommands() {
+        if sub.is_hide_set() {
+            continue;
+        }
+        for key in std::iter::once(sub.get_name()).chain(sub.get_all_aliases()) {
+            assert!(
+                siblings.insert(key.to_string()),
+                "two commands under `{}` are both called `{key}`",
+                prefix.join(" ")
+            );
+        }
+    }
     for sub in cmd.get_subcommands() {
         if sub.is_hide_set() {
             continue;
@@ -57,11 +76,7 @@ fn walk(cmd: &clap::Command, prefix: &[String], map: &mut HashMap<String, Vec<St
         path.push(sub.get_name().to_string());
         for key in std::iter::once(sub.get_name()).chain(sub.get_all_aliases()) {
             let key = key.to_string();
-            let previous = map.insert(key.clone(), path.clone());
-            assert!(
-                previous.is_none(),
-                "two skot commands are both called `{key}`"
-            );
+            map.entry(key).or_insert_with(|| path.clone());
         }
         walk(sub, &path, map);
     }

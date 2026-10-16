@@ -6,6 +6,7 @@ use crate::commands::{Ctx, Exit, authoring, emit_json};
 use crate::git;
 use crate::hints::Hints;
 use crate::invocation::{skot, skot_args};
+use crate::layout::Layout;
 use crate::report;
 use crate::state::State;
 
@@ -18,65 +19,24 @@ use crate::state::State;
 /// would land, which is what makes it the question to ask after toggling patches:
 /// the full series is the default because "the whole thing still applies" is the
 /// strongest statement, but a set with holes in it has its own answer.
+///
+/// `--series all` asks the whole question of every series at once, each against its
+/// own base; the exit code is the worst answer any of them gave.
 pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
-    let (config, series) = ctx.project()?;
-    let all = series.require_resolvable(&ctx.layout)?;
-    let entries = if args.applied {
-        let state = State::load(&ctx.layout)?;
-        authoring::recorded_stack(&ctx.layout, &series, &state)?.entries
-    } else {
-        all
-    };
+    if ctx.cli.series.as_deref() == Some("all") {
+        return run_all(ctx, args);
+    }
+    let report = check_one(args, &ctx.layout)?;
     let set = if args.applied { "applied" } else { "series" };
-
-    let wanted = args
-        .ref_name
-        .clone()
-        .or_else(|| config.upstream.default_ref.clone())
-        .or_else(|| git::sandbox::current_ref(&ctx.layout));
-
-    let report = match wanted {
-        Some(name) => {
-            // The same choke point as `apply`: make sure the mirror can serve this ref
-            // (fetching only if it cannot), then read it. `check` does not need a
-            // sandbox (the entries are applied to the commit's tree in the mirror), so a
-            // ref the mirror lacks is fetched, not deferred to a `skot sync` round trip.
-            let (mirror, sha) = super::sync::resolve_in_mirror(&ctx.layout, &name)?;
-            crate::check::check_series(mirror.repo(), &sha, &entries).context(format!(
-                "checking {} against {name} ({sha})",
-                if args.applied {
-                    "the applied set"
-                } else {
-                    "the series"
-                }
-            ))?
-        }
-        None => {
-            if !git::sandbox::is_repository(&ctx.layout) {
-                anyhow::bail!(
-                    "nothing to check against.\n\
-                     No ref was given, `upstream.default-ref` is unset, and there is no \
-                     sandbox yet.\n\
-                     Pass one (`{}`), set `upstream.default-ref` in {}, or \
-                     run `{}` first.",
-                    skot_args("check", "main"),
-                    ctx.layout.config_file().display(),
-                    skot("build")
-                );
-            }
-            let repo = git::sandbox::open(&ctx.layout)?;
-            let sha = git::sandbox::head_sha(&repo).context(format!(
-                "reading the sandbox HEAD at {}",
-                ctx.layout.sandbox_dir().display()
-            ))?;
-            crate::check::check_series(&repo, &sha, &entries)?
-        }
-    };
 
     if ctx.cli.json {
         let mut doc = serde_json::to_value(&report)?;
         if let Some(object) = doc.as_object_mut() {
             object.insert("set".to_owned(), serde_json::json!(set));
+            object.insert(
+                "series_name".to_owned(),
+                serde_json::json!(ctx.layout.series()),
+            );
         }
         emit_json(&doc)?;
         return Ok(if report.ok {
@@ -88,6 +48,7 @@ pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
 
     report::section("check");
     report::field("against", &report.base);
+    report::field("series", ctx.layout.series());
     if args.applied {
         report::field("set", "the applied set (what `build` lands)");
     }
@@ -146,6 +107,125 @@ pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
         skot("edit-save")
     ));
     Ok(Exit::Failure)
+}
+
+/// `check --series all`: every series, each against its own base.
+fn run_all(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
+    if args.applied {
+        anyhow::bail!(
+            "`--series all` and `--applied` do not go together.\n\
+             The applied set is the active series' own answer; check it per series."
+        );
+    }
+    let names = ctx.layout.series_names();
+    if names.is_empty() {
+        anyhow::bail!(
+            "there are no series under {} to check.\n`{}` creates one.",
+            ctx.layout.series_root().display(),
+            skot_args("series", "create <name>")
+        );
+    }
+
+    let mut checks = Vec::new();
+    let mut all_ok = true;
+    for name in &names {
+        let layout = ctx.layout.with_series(name)?;
+        let report = check_one(args, &layout).context(format!("checking the series `{name}`"))?;
+        all_ok &= report.ok;
+        checks.push((name.clone(), report));
+    }
+
+    if ctx.cli.json {
+        emit_json(&serde_json::json!({
+            "ok": all_ok,
+            "series_count": checks.len(),
+            "checks": checks
+                .iter()
+                .map(|(name, report)| serde_json::json!({
+                    "series_name": name,
+                    "report": serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+                }))
+                .collect::<Vec<_>>(),
+        }))?;
+        return Ok(if all_ok { Exit::Success } else { Exit::Failure });
+    }
+
+    for (name, report) in &checks {
+        report::section(&format!("check {name}"));
+        report::field("against", &report.base);
+        if report.ok {
+            report::line(&report::ok(&format!(
+                "all {} apply",
+                count(report.patch_count, "patch", "patches")
+            )));
+        } else {
+            for patch in report.patches.iter().filter(|p| !p.ok) {
+                print_patch(patch);
+            }
+        }
+    }
+    Ok(if all_ok { Exit::Success } else { Exit::Failure })
+}
+
+/// The report behind both entries: resolve, select the entries, check them.
+///
+/// The ref chain is the one everywhere else in skot: the argument, then the series'
+/// own base, then `upstream.default-ref`, then what the sandbox holds.
+fn check_one(args: &CheckArgs, layout: &Layout) -> Result<crate::check::Report> {
+    let (config, series) = layout.project()?;
+    let all = series.require_resolvable(layout)?;
+    let entries = if args.applied {
+        let state = State::load(layout)?;
+        authoring::recorded_stack(layout, &series, &state)?.entries
+    } else {
+        all
+    };
+
+    let wanted = args
+        .ref_name
+        .clone()
+        .or_else(|| layout.base_ref())
+        .or_else(|| config.upstream.default_ref.clone())
+        .or_else(|| git::sandbox::current_ref(layout));
+
+    match wanted {
+        Some(name) => {
+            // The same choke point as `apply`: make sure the mirror can serve this ref
+            // (fetching only if it cannot), then read it. `check` does not need a
+            // sandbox (the entries are applied to the commit's tree in the mirror), so a
+            // ref the mirror lacks is fetched, not deferred to a `skot sync` round trip.
+            let (mirror, sha) = super::sync::resolve_in_mirror(layout, &name)?;
+            crate::check::check_series(mirror.repo(), &sha, &entries).context(format!(
+                "checking {} against {name} ({sha})",
+                if args.applied {
+                    "the applied set"
+                } else {
+                    "the series"
+                }
+            ))
+        }
+        None => {
+            if !git::sandbox::is_repository(layout) {
+                anyhow::bail!(
+                    "nothing to check against.\n\
+                     No ref was given, the series has no base, `upstream.default-ref` is \
+                     unset, and there is no sandbox yet.\n\
+                     Pass one (`{}`), record one with `{}`, set `upstream.default-ref` \
+                     in {}, or run `{}` first.",
+                    skot_args("check", "main"),
+                    skot_args("rebase", "main"),
+                    layout.config_file().display(),
+                    skot("build")
+                );
+            }
+            let repo = git::sandbox::open(layout)?;
+            let sha = git::sandbox::head_sha(&repo).context(format!(
+                "reading the sandbox HEAD at {}",
+                layout.sandbox_dir().display()
+            ))?;
+            crate::check::check_series(&repo, &sha, &entries)
+        }
+    }
 }
 
 /// A count with a verb that agrees with it.
@@ -248,6 +328,60 @@ mod tests {
         let exit = run(&ctx_for(&layout), &args(true)).unwrap();
 
         assert_eq!(exit, Exit::Success);
+    }
+
+    #[test]
+    fn series_all_asks_every_series_and_takes_the_worst_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::mirror_with_one_commit(tmp.path());
+        std::fs::write(
+            layout.config_file(),
+            "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
+        )
+        .unwrap();
+        testsupport::write_series(&layout, &[("0001-a.patch", testsupport::patch_one())]);
+        std::fs::create_dir_all(layout.series_root().join("exp")).unwrap();
+
+        let cli = Cli::try_parse_from(["skot", "--series", "all", "check"]).unwrap();
+        let ctx = Ctx {
+            layout: layout.clone(),
+            cli,
+            yes: false,
+        };
+
+        // A series whose patch cannot apply makes the whole run a failure...
+        testsupport::write_series(
+            &layout.with_series("exp").unwrap(),
+            &[("0001-x.patch", "not a patch at all\n")],
+        );
+        assert_eq!(run(&ctx, &args(false)).unwrap(), Exit::Failure);
+
+        // ...and once every series lands, the run succeeds.
+        testsupport::write_series(
+            &layout.with_series("exp").unwrap(),
+            &[("0001-x.patch", testsupport::patch_one())],
+        );
+        assert_eq!(run(&ctx, &args(false)).unwrap(), Exit::Success);
+    }
+
+    #[test]
+    fn series_all_and_applied_do_not_go_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::mirror_with_one_commit(tmp.path());
+        std::fs::write(
+            layout.config_file(),
+            "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from(["skot", "--series", "all", "check", "--applied"]).unwrap();
+        let ctx = Ctx {
+            layout: layout.clone(),
+            cli,
+            yes: false,
+        };
+
+        let err = run(&ctx, &args(true)).unwrap_err().to_string();
+        assert!(err.contains("do not go together"), "{err}");
     }
 
     #[test]

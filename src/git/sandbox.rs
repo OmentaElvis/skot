@@ -31,12 +31,66 @@ use crate::git::Sha;
 use crate::git::mirror::Mirror;
 use crate::layout::Layout;
 
-/// The name the sandbox's worktree is registered under in the mirror.
+/// The name the shared sandbox's worktree is registered under in the mirror.
 const WORKTREE_NAME: &str = "sandbox";
 
+/// Percent-encode everything git would refuse in a worktree name.
+///
+/// A worktree registration name has to survive as a ref-adjacent identifier and as a
+/// directory under the mirror's `worktrees/`. Spaces and `/` fail outright, and `~` is
+/// refused too, so anything outside `[A-Za-z0-9._-]` becomes `%XX`. The output may
+/// contain `%` (git allows it; the probe in the design notes proved the whole scheme
+/// against libgit2 directly).
+pub fn pct(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// The registration name for a session worktree: unique across series.
+///
+/// Two series can hold patches of the same name, and their work areas are different
+/// directories that must be different registrations, so the series goes into the name.
+pub fn session_worktree_name(series: &str, dir: &str) -> String {
+    format!("{}@{}", pct(series), pct(dir))
+}
+
+/// The registration name for the sandbox this layout uses.
+///
+/// Shared mode registers the one tree as `sandbox`, the name it has always had;
+/// per-series mode puts the series in the name so every series' tree can coexist in
+/// one mirror. The names differ so the two can never both claim the same registration,
+/// which is what lets a mode flip land on top of the other mode's leftover instead of
+/// failing. Note the shared *path* is `@shared` but the shared *name* is not
+/// `sandbox@shared`: a series really could be called `shared`, and it would then own
+/// that registration.
+pub fn sandbox_worktree_name(layout: &Layout) -> String {
+    if layout.per_series_sandbox() {
+        format!("{}@{}", WORKTREE_NAME, pct(layout.series()))
+    } else {
+        WORKTREE_NAME.to_owned()
+    }
+}
+
+/// Whether a registration name is a sandbox rather than a session worktree.
+fn is_sandbox_name(name: &str) -> bool {
+    name == WORKTREE_NAME || name.starts_with(&format!("{WORKTREE_NAME}@"))
+}
+
 /// Whether the sandbox is a worktree skot created.
+///
+/// The `.git` marker, not the directory: a leftover directory that is not a worktree is
+/// exactly the wreckage `create` must refuse to pretend is a sandbox, and the message
+/// `add` gives for it is the one about an interrupted run.
 pub fn is_repository(layout: &Layout) -> bool {
-    layout.sandbox_dir().exists()
+    layout.sandbox_dir().join(".git").exists()
 }
 
 /// Create the sandbox if it is not already there, pointing it at `mirror`.
@@ -48,9 +102,13 @@ pub fn create(layout: &Layout, mirror: &Mirror) -> Result<()> {
     if is_repository(layout) {
         return Ok(());
     }
+    // No mode-flip guard: the shared slot and each series' tree are siblings under the
+    // sandbox root, so one never sits inside the other and a leftover from the other
+    // mode cannot block this create. `clean sandbox` reaps a slot the current mode no
+    // longer uses.
     add(
         mirror,
-        WORKTREE_NAME,
+        &sandbox_worktree_name(layout),
         &layout.sandbox_dir(),
         &crate::invocation::skot_args("clean", "sandbox"),
     )
@@ -163,7 +221,7 @@ pub fn open(layout: &Layout) -> Result<git2::Repository> {
     let mirror = Mirror::open(layout)?;
     open_named(
         &mirror,
-        WORKTREE_NAME,
+        &sandbox_worktree_name(layout),
         &layout.sandbox_dir(),
         &format!("Run `{}` to create one.", crate::invocation::skot("apply")),
     )
@@ -203,7 +261,10 @@ pub fn current_ref(layout: &Layout) -> Option<String> {
     // reset produces — is not a ref name, so it reads as no ref and the caller falls back
     // to the configured default.
     let mirror = Mirror::open(layout).ok()?;
-    let worktree = mirror.repo().find_worktree(WORKTREE_NAME).ok()?;
+    let worktree = mirror
+        .repo()
+        .find_worktree(&sandbox_worktree_name(layout))
+        .ok()?;
     let text = std::fs::read_to_string(worktree.path().join("HEAD")).ok()?;
     text.strip_prefix("ref: ").map(|r| r.trim().to_owned())
 }
@@ -290,7 +351,7 @@ pub fn reset_to(layout: &Layout, sha: &Sha, keep: &[String]) -> Result<()> {
     }
 
     let repo = open(layout)?;
-    reset_at(&repo, WORKTREE_NAME, &dir, sha, keep)
+    reset_at(&repo, &sandbox_worktree_name(layout), &dir, sha, keep)
 }
 
 /// Check out `sha` into a worktree, leaving the working tree clean.
@@ -427,16 +488,17 @@ pub fn verify_objects(layout: &Layout, mirror: &Mirror, sha: &Sha) -> Result<()>
         ))
     })?;
 
-    if repo.find_worktree(WORKTREE_NAME).is_err() {
+    let name = sandbox_worktree_name(layout);
+    if repo.find_worktree(&name).is_err() {
         return Err(broken(format!(
-            "the mirror at {} has no `{WORKTREE_NAME}` worktree registered, so the sandbox \
+            "the mirror at {} has no `{name}` worktree registered, so the sandbox \
              at {} is not a worktree of it.",
             mirror.path().display(),
             layout.sandbox_dir().display()
         )));
     }
 
-    let worktree = repo.find_worktree(WORKTREE_NAME).expect("just checked");
+    let worktree = repo.find_worktree(&name).expect("just checked");
     let sandbox = git2::Repository::open_from_worktree(&worktree).map_err(|e| {
         broken(format!(
             "the sandbox at {} cannot be opened through the mirror: {e}",
@@ -452,22 +514,35 @@ pub fn verify_objects(layout: &Layout, mirror: &Mirror, sha: &Sha) -> Result<()>
     })
 }
 
-/// Remove the sandbox, unregistering the worktree from the mirror.
+/// Remove the sandbox, unregistering every sandbox worktree from the mirror.
 ///
-/// The worktree has to be pruned from the mirror, not just deleted from disk: a stale
-/// registration is what makes a later `skot patch apply` fail with a confusing "worktree already
-/// exists" instead of creating one.
+/// Every mode's registration goes: the shared `sandbox`, and each per-series
+/// `sandbox@<series>`, because `clean sandbox` frees the whole root and a registration
+/// left behind is what makes a later create fail with "worktree already exists".
 pub fn remove(layout: &Layout) -> Result<()> {
-    let dir = layout.sandbox_dir();
-    if !dir.exists() {
-        return Ok(());
-    }
-    // A mirror that will not open cannot hold a registration, and the directory is still
-    // skot's to clear: `clean sandbox` must work on the wreckage it is meant to repair.
+    let root = layout.sandbox_root();
     if let Ok(mirror) = Mirror::open(layout) {
-        return prune(&mirror, WORKTREE_NAME, &dir);
+        let names: Vec<String> = mirror
+            .repo()
+            .worktrees()
+            .map(|all| {
+                all.iter()
+                    .filter_map(|n| n.ok().flatten().map(str::to_owned))
+                    .filter(|n| is_sandbox_name(n))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for name in names {
+            // The directory argument is only for the message and for the remove that
+            // follows the unregister: clean frees the whole root, and libgit2's prune
+            // treats a missing working tree as fine rather than as an error.
+            prune(&mirror, &name, &root)?;
+        }
     }
-    std::fs::remove_dir_all(&dir).context(format!("removing the sandbox at {}", dir.display()))?;
+    if root.exists() {
+        std::fs::remove_dir_all(&root)
+            .context(format!("removing the sandbox at {}", root.display()))?;
+    }
     Ok(())
 }
 
@@ -498,8 +573,7 @@ pub fn prune(mirror: &Mirror, name: &str, dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::Layout;
-    use std::path::Path;
+    use crate::layout::{DEFAULT_SERIES, Layout};
 
     /// A bare mirror containing `files`, plus the commit id of `HEAD`.
     ///
@@ -961,5 +1035,53 @@ mod tests {
             err.contains(&remedy),
             "the caller's remedy must appear: {err}"
         );
+    }
+
+    #[test]
+    fn worktree_names_survive_the_characters_series_names_allow() {
+        // Proved against libgit2 directly before it was written here: spaces and `/`
+        // fail as registration names, so anything outside `[A-Za-z0-9._-]` is encoded.
+        assert_eq!(pct("plain"), "plain");
+        assert_eq!(pct("my series"), "my%20series");
+        assert_eq!(pct("a/b"), "a%2Fb");
+        assert_eq!(
+            session_worktree_name("my series", "sub/0001-a.patch"),
+            "my%20series@sub%2F0001-a.patch"
+        );
+        assert_eq!(sandbox_worktree_name(&Layout::new(".")), "sandbox");
+        let per = Layout::new(".").with_per_series_sandbox(true);
+        assert_eq!(
+            sandbox_worktree_name(&per.with_series("exp").unwrap()),
+            "sandbox@exp"
+        );
+    }
+
+    #[test]
+    fn a_per_series_sandbox_coexists_with_the_shared_slot() {
+        // The two scopes are siblings under the root: a slot left by the other mode
+        // neither sits inside the new tree's path nor claims its registration name, so
+        // the create goes through and `clean sandbox` reaps what the mode no longer uses.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = mirror_with_one_commit(tmp.path());
+        let mirror = Mirror::open(&layout).unwrap();
+        create(&layout, &mirror).unwrap();
+        assert!(layout.sandbox_dir().ends_with("@shared"));
+
+        let per = layout.with_per_series_sandbox(true);
+        create(&per, &mirror).unwrap();
+        assert!(per.sandbox_dir().ends_with(DEFAULT_SERIES));
+        assert!(per.sandbox_dir().exists());
+        // The slot survives the other scope's create.
+        assert!(layout.sandbox_dir().exists());
+
+        let names: Vec<String> = mirror
+            .repo()
+            .worktrees()
+            .unwrap()
+            .iter()
+            .filter_map(|n| n.ok().flatten().map(str::to_owned))
+            .filter(|n| is_sandbox_name(n))
+            .collect();
+        assert_eq!(names.len(), 2, "got {names:?}");
     }
 }

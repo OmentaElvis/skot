@@ -64,6 +64,7 @@ pub fn run(ctx: &Ctx, args: &EditSaveArgs) -> Result<Exit> {
     if ctx.cli.json {
         if done.changed {
             emit_json(&json!({
+                "series_name": ctx.layout.series(),
                 "patch": done.name,
                 "path": done.path.display().to_string(),
                 "worktree": done.session.display().to_string(),
@@ -74,6 +75,7 @@ pub fn run(ctx: &Ctx, args: &EditSaveArgs) -> Result<Exit> {
             }))?;
         } else {
             emit_json(&json!({
+                "series_name": ctx.layout.series(),
                 "patch": done.name,
                 "path": done.path.display().to_string(),
                 "worktree": done.session.display().to_string(),
@@ -234,7 +236,7 @@ fn save(
         // A work area on a patch the insertion renumbered keeps its worktree and follows
         // the new name, the same way the applied set does.
         let mut sessions = crate::session::Manifest::load(layout)?;
-        sessions.follow_renames(&renames);
+        sessions.follow_renames(layout, &renames);
         sessions.save(layout)?;
         true
     };
@@ -273,10 +275,11 @@ fn choose(
 
     let session = if let Some(name) = name {
         let found = manifest.sessions.iter().find(|s| {
-            s.patch == name
-                || std::path::Path::new(&s.patch)
-                    .file_name()
-                    .is_some_and(|f| f == name)
+            s.series_name() == layout.series()
+                && (s.patch == name
+                    || std::path::Path::new(&s.patch)
+                        .file_name()
+                        .is_some_and(|f| f == name))
         });
         match found {
             Some(session) => session.clone(),
@@ -284,6 +287,7 @@ fn choose(
                 let unsaved = manifest
                     .sessions
                     .iter()
+                    .filter(|s| s.series_name() == layout.series())
                     .filter(|s| crate::session::unsaved(layout, s).unwrap_or(true))
                     .map(|s| s.patch.as_str())
                     .collect::<Vec<_>>()
@@ -413,6 +417,7 @@ mod tests {
 
     fn record(patch: &str) -> Session {
         Session {
+            series: crate::layout::DEFAULT_SERIES.to_owned(),
             patch: patch.to_owned(),
             dir: patch.to_owned(),
             ref_name: "main".into(),

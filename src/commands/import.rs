@@ -123,6 +123,7 @@ pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<Exit> {
 
     if ctx.cli.json {
         emit_json(&json!({
+            "series_name": ctx.layout.series(),
             "patch": done.patch,
             "path": done.path.display().to_string(),
             "series_line": done.series_line,
@@ -576,7 +577,7 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         // Sessions opened on a renamed patch keep their worktree and follow the new name,
         // the same way the applied set does.
         let mut sessions = crate::session::Manifest::load(layout)?;
-        sessions.follow_renames(&renames);
+        sessions.follow_renames(layout, &renames);
         sessions.save(layout)?;
         Some(line)
     };

@@ -17,6 +17,7 @@ pub fn run(ctx: &Ctx, _args: &StatusArgs) -> Result<Exit> {
 
     if ctx.cli.json {
         emit_json(&serde_json::json!({
+            "series_name": layout.series(),
             "root": layout.root().display().to_string(),
             "mirror": path_state(&layout.mirror_dir()),
             "sandbox": path_state(&layout.sandbox_dir()),
@@ -28,9 +29,9 @@ pub fn run(ctx: &Ctx, _args: &StatusArgs) -> Result<Exit> {
                     .map(|e| e.name)
                     .collect::<Vec<_>>()
             }),
-            "ref": state.ref_name,
-            "sha": state.sha,
-            "applied": state.applied,
+            "ref": state.ref_name(layout),
+            "sha": state.sha(layout),
+            "applied": state.applied(layout),
             "in_flight": state.in_flight.map(|p| p.name().to_owned()),
         }))?;
         return Ok(Exit::Success);
@@ -48,7 +49,7 @@ pub fn run(ctx: &Ctx, _args: &StatusArgs) -> Result<Exit> {
 
     layout::print_inventory(layout);
     print_layout(layout);
-    print_series(layout, series.as_ref(), &state.applied);
+    print_series(layout, series.as_ref(), state.applied(layout));
     print_mirror(layout);
     print_sandbox(layout, series.as_ref(), &state);
     print_config(config.as_ref(), layout);
@@ -84,7 +85,14 @@ fn print_series(layout: &Layout, series: Option<&crate::series::Series>, applied
         return;
     };
     let entries = series.entries_lenient(layout);
-    report::section(&format!("series ({})", entries.len()));
+    // The name and base, so the answer to "what am I on, and where does it sit" is on
+    // the same screen as the patches. The base is the series' own record, not the
+    // sandbox's ref: those can differ, and both answers matter.
+    report::section(&format!("series {} ({})", layout.series(), entries.len()));
+    report::field(
+        "base",
+        layout.base_ref().as_deref().unwrap_or("(not recorded)"),
+    );
     for (i, entry) in entries.iter().enumerate() {
         // `!` (not on disk) outranks `[x]`: a patch cannot be on if its file is gone. The
         // `[x]`/`[ ]` pair is what makes a hole visible: the count in the sandbox section
@@ -172,7 +180,7 @@ fn print_sandbox(layout: &Layout, series: Option<&crate::series::Series>, state:
         )),
     }
 
-    let count = state.applied.len();
+    let count = state.applied(layout).len();
     let total = series.map_or(0, |s| s.len());
     report::field(
         "applied",
@@ -190,7 +198,7 @@ fn print_sandbox(layout: &Layout, series: Option<&crate::series::Series>, state:
         let entries = series.entries_lenient(layout);
         let disabled: Vec<&str> = entries
             .iter()
-            .filter(|e| !state.applied.contains(&e.name))
+            .filter(|e| !state.applied(layout).contains(&e.name))
             .map(|e| e.name.as_str())
             .collect();
         if !disabled.is_empty() {

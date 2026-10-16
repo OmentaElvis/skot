@@ -6,13 +6,15 @@ use crate::commands::{Ctx, Exit};
 use crate::config::SandboxPolicy;
 use crate::hints::Hints;
 use crate::invocation::{skot, skot_args};
-use crate::layout::{self, Layout};
+use crate::layout::{self, DEFAULT_SERIES, Layout};
 use crate::phase::HookPoint;
+use crate::state::State;
 
 const PLACEHOLDER_URL: &str = "url = \"https://github.com/example/project\"";
 const PLACEHOLDER_REF: &str = "default-ref = \"v1.0.0\"";
 const PLACEHOLDER_POLICY: &str = "policy = \"persistent\"";
 const PLACEHOLDER_KEEP: &str = "keep = [\"node_modules\", \"target\"]";
+const PLACEHOLDER_SERIES: &str = "series = \"default\"";
 
 /// The keys of the `[hooks]` section, which is what `--hook` may name.
 const HOOK_KEYS: [&str; 7] = [
@@ -146,6 +148,9 @@ fn scaffold(layout: &Layout, plan: &Plan) -> Result<()> {
         .context(format!("creating {}", layout.root().display()))?;
 
     let mut template = crate::config::Config::template();
+    // The committed default, always written: a clone has no pointer yet, and the
+    // series init just named is the one it should build.
+    template = template.replace(PLACEHOLDER_SERIES, &toml_line("series", layout.series()));
     match plan.url.as_deref() {
         Some(url) => template = template.replace(PLACEHOLDER_URL, &toml_line("url", url)),
         None => template = template.replace(PLACEHOLDER_URL, &format!("# {PLACEHOLDER_URL}")),
@@ -239,8 +244,9 @@ fn todo_notes(layout: &Layout, plan: &Plan) -> Vec<String> {
 /// `skot init`: ask for what is missing, scaffold, then carry the user to the next step.
 ///
 /// Every question has a flag (`--url`, `--default-ref`, `--policy`, `--keep`, `--hook`,
-/// `--sync`) and a value passed on the command line skips its question, so nothing here
-/// is unavailable to a script. Hooks sit behind one yes/no: a yes opens the `[hooks]`
+/// `--sync`, and the global `--series` for the first series' name) and a value passed on
+/// the command line skips its question, so nothing here is unavailable to a script.
+/// Hooks sit behind one yes/no: a yes opens the `[hooks]`
 /// menu, where a stage is picked, answered, and returned to until `done`; a no finishes
 /// with the empty table the template documents. Without a TTY (or under `--json`) it
 /// asks nothing at all.
@@ -262,6 +268,32 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
         );
     }
 
+    let ask = !ctx.cli.json && crate::ui::stdin_is_terminal();
+
+    // The first series: a flag or a question decide its name, and the layout points at
+    // it from here on, so every file init writes lands in that series' directory. A
+    // name that is not a single path component is refused now, before anything is made.
+    let series = match &ctx.cli.series {
+        Some(name) => name.clone(),
+        None if ask => {
+            let answer = inquire::Text::new("First series name")
+                .with_help_message(
+                    "Where your patches live: a directory under patches/. \
+                     Leave empty for the default series.",
+                )
+                .with_placeholder(DEFAULT_SERIES)
+                .prompt()
+                .context("asking for the first series name")?;
+            non_empty(answer).unwrap_or_else(|| DEFAULT_SERIES.to_owned())
+        }
+        None => DEFAULT_SERIES.to_owned(),
+    };
+    let layout = layout.with_series(&series)?;
+    // Init writes the template, and the template declares the default scope, so the
+    // state it stamps here has to carry that same scope rather than the one a layout
+    // built before any config exists happens to start with.
+    let layout = layout.with_per_series_sandbox(crate::config::Sandbox::default().per_series);
+
     let mut hooks: Vec<(String, String)> = Vec::new();
     for spec in &args.hook {
         let (name, cmd) = parse_hook(spec)?;
@@ -270,8 +302,6 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
         }
         hooks.push((name, cmd));
     }
-
-    let ask = !ctx.cli.json && crate::ui::stdin_is_terminal();
 
     let url = match &args.url {
         Some(url) => Some(url.clone()),
@@ -414,6 +444,10 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
 
     scaffold(&layout, &plan)?;
 
+    // The pointer follows the scaffold: an init with `--series exp` leaves the project
+    // already pointed at exp, so the next command does not have to be told.
+    State::load(&layout)?.set_active_series(&layout, &series)?;
+
     if !ctx.cli.json {
         info!(target: "init", "wrote {}", layout.config_file().display());
         info!(target: "init", "wrote {}", layout.series_file().display());
@@ -522,6 +556,20 @@ mod tests {
             !written.contains(PLACEHOLDER_URL),
             "the placeholder survived, so the user cannot tell what is real"
         );
+    }
+
+    #[test]
+    fn the_first_series_becomes_the_committed_default() {
+        // A clone has no pointer to read, so the name init prompted for has to reach
+        // the config: that line is what makes `skot build` in a fresh checkout land on
+        // the same series the author was on.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(tmp.path()).with_series("exp").unwrap();
+        scaffold(&layout, &plan("https://example.invalid/proj")).unwrap();
+
+        let written = read(&layout);
+        assert!(written.contains(&toml_line("series", "exp")), "{written}");
+        assert!(!written.contains(PLACEHOLDER_SERIES), "{written}");
     }
 
     #[test]

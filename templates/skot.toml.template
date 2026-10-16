@@ -15,6 +15,11 @@
 #
 # A non-zero exit aborts the run.
 
+# The series a fresh checkout works on when nothing else names one. `skot init`
+# writes the name you gave as the first series, and keeping this line in version
+# control is what makes a clone start on the same series you do.
+series = "default"
+
 [upstream]
 # Repository to mirror and patch against.
 url = "https://github.com/example/project"
@@ -39,6 +44,21 @@ policy = "persistent"
 # a way around that. It also restores from whatever the sandbox held before, so it covers the
 # one transition onto a base that dropped the path, not every reset after that.
 keep = ["node_modules", "target"]
+
+# One sandbox per series, or one shared slot for the project.
+#
+# true (the default) gives each series its own tree under `.skot/sandbox/<name>`, so
+# switching is instant and costs only the disk. false shares one slot at
+# `.skot/sandbox/@shared`: one tree on disk, and switching series rebuilds it for the
+# series you switched to.
+per-series = true
+
+# What switching series does to the shared slot.
+#
+# rebuild (the default)  apply the series you switched to as part of the switch.
+# keep                   leave the slot alone; the next build or apply moves it.
+# Ignored when per-series is true: each series then has its own sandbox to switch to.
+on-switch = "rebuild"
 
 # Environment added to every hook, on top of the SKOT_* variables above.
 [env]

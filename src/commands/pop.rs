@@ -55,6 +55,7 @@ pub fn run(ctx: &Ctx, arg: &PatchArg) -> Result<Exit> {
     if ctx.cli.json {
         emit_json(&json!({
             "ok": popped.removed.is_some(),
+            "series_name": ctx.layout.series(),
             "ref": popped.ref_name,
             "sha": popped.sha.as_str(),
             "removed": popped.removed,
@@ -98,7 +99,8 @@ pub(super) fn pop(layout: &Layout, want: Option<&str>) -> Result<Popped> {
     // and with nothing applied `pop` owes the ordinary negative answer, not an error.
     let (config, series) = layout.project()?;
     let state = State::load(layout)?;
-    if !state.applied.is_empty() {
+    authoring::require_holder(layout, &state)?;
+    if !state.applied(layout).is_empty() {
         drop(authoring::require_sandbox(layout)?);
     }
 
@@ -106,7 +108,7 @@ pub(super) fn pop(layout: &Layout, want: Option<&str>) -> Result<Popped> {
     // is no top to name.
     let removed = match want {
         Some(name) => Some(name.to_owned()),
-        None => state.applied.last().cloned(),
+        None => state.applied(layout).last().cloned(),
     };
 
     let ref_name = authoring::stack_ref(layout, &state, &config)?;
@@ -131,7 +133,7 @@ pub(super) fn pop(layout: &Layout, want: Option<&str>) -> Result<Popped> {
             removed: None,
             ref_name,
             sha,
-            names: state.applied,
+            names: state.applied(layout).to_vec(),
             tree,
         });
     };
@@ -157,11 +159,12 @@ mod tests {
     use crate::layout::Layout;
     use clap::Parser as _;
 
-    fn state_of(names: &[&str]) -> State {
-        State {
-            applied: names.iter().map(|n| (*n).to_owned()).collect(),
-            ..State::default()
-        }
+    fn state_of(layout: &Layout, names: &[&str]) -> State {
+        let mut state = State::load(layout).unwrap();
+        state
+            .set_applied(layout, names.iter().map(|n| (*n).to_owned()).collect())
+            .unwrap();
+        state
     }
 
     /// A sandbox on `main` with nothing applied and a series to be on.
@@ -201,7 +204,7 @@ mod tests {
         let names = stack_names(
             &layout,
             &series,
-            &state_of(&["0001-a.patch", "0002-b.patch"]),
+            &state_of(&layout, &["0001-a.patch", "0002-b.patch"]),
             None,
         )
         .unwrap();
@@ -224,7 +227,7 @@ mod tests {
         let names = stack_names(
             &layout,
             &series,
-            &state_of(&["0001-a.patch", "0003-c.patch"]),
+            &state_of(&layout, &["0001-a.patch", "0003-c.patch"]),
             None,
         )
         .unwrap();
@@ -250,7 +253,7 @@ mod tests {
         let names = stack_names(
             &layout,
             &series,
-            &state_of(&["0001-a.patch", "0002-b.patch", "0003-c.patch"]),
+            &state_of(&layout, &["0001-a.patch", "0002-b.patch", "0003-c.patch"]),
             Some("0002-b.patch"),
         )
         .unwrap();
@@ -264,9 +267,14 @@ mod tests {
         let series = layout.project().unwrap().1;
 
         assert!(
-            stack_names(&layout, &series, &state_of(&["0001-a.patch"]), None)
-                .unwrap()
-                .is_empty()
+            stack_names(
+                &layout,
+                &series,
+                &state_of(&layout, &["0001-a.patch"]),
+                None
+            )
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -292,7 +300,7 @@ mod tests {
             stack_names(
                 &layout,
                 &series,
-                &state_of(&["0001-a.patch", "0002-b.patch"]),
+                &state_of(&layout, &["0001-a.patch", "0002-b.patch"]),
                 Some("0001-a.patch")
             )
             .unwrap()
@@ -310,7 +318,7 @@ mod tests {
         let err = stack_names(
             &layout,
             &series,
-            &state_of(&["0001-a.patch"]),
+            &state_of(&layout, &["0001-a.patch"]),
             Some("0002-b.patch"),
         )
         .unwrap_err()
@@ -324,13 +332,15 @@ mod tests {
         // remedy is still `apply`. Checked before the mirror: answering "no such ref"
         // first would send the user looking in the wrong place.
         let (_tmp, layout) = testsupport::project();
-        let state = State {
-            ref_name: Some("main".to_owned()),
-            sha: None,
-            applied: vec!["0001-a.patch".to_owned()],
-            in_flight: None,
-            in_flight_command: None,
-        };
+        let mut state = State::default();
+        state.sandboxes.insert(
+            layout.series().to_owned(),
+            crate::state::SandboxState {
+                ref_name: Some("main".to_owned()),
+                applied: vec!["0001-a.patch".to_owned()],
+                ..Default::default()
+            },
+        );
         state.save(&layout).unwrap();
         let err = pop(&layout, None).unwrap_err().to_string();
         assert!(err.contains("no sandbox"), "got {err}");

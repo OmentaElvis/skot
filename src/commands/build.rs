@@ -37,6 +37,7 @@ use crate::hooks::{self, Env};
 use crate::invocation::skot_args;
 use crate::layout::Layout;
 use crate::phase::{HookPoint, Phase, Selection};
+use crate::report;
 use crate::state::State;
 
 /// Run the lifecycle.
@@ -96,6 +97,7 @@ pub fn run(ctx: &Ctx, args: &BuildArgs) -> Result<Exit> {
             // partial progress out of `drive`. The error itself names the phase that stopped it.
             emit_json(&json!({
                 "ok": false,
+                "series_name": ctx.layout.series(),
                 "ref": ref_name,
                 "selected_phases": phases.iter().map(|p| p.name()).collect::<Vec<_>>(),
                 "error": format!("{e:#}"),
@@ -108,11 +110,16 @@ pub fn run(ctx: &Ctx, args: &BuildArgs) -> Result<Exit> {
     if ctx.cli.json {
         emit_json(&json!({
             "ok": true,
+            "series_name": ctx.layout.series(),
             "ref": ref_name,
             "phases": ran,
             "sandbox": ctx.layout.sandbox_dir().display().to_string(),
         }))?;
     } else {
+        // The name and the ref together, since a build is the answer to "what did I
+        // just build": the series, and the upstream it was built on.
+        report::section("build");
+        report::field("series", &format!("{} @ {}", ctx.layout.series(), ref_name));
         info!(
             target: "build",
             "complete; the sandbox at {} is ready.",
@@ -131,13 +138,17 @@ fn the_ref(layout: &Layout, config: &Config, ref_name: Option<&str>) -> Result<S
         debug!(target: "build", "ref from the argument: {name}");
         return Ok(name.to_owned());
     }
+    if let Some(base) = layout.base_ref() {
+        debug!(target: "build", "ref from the series base: {base}");
+        return Ok(base);
+    }
     debug!(
         target: "build",
-        "no ref argument; consulting `upstream.default-ref`"
+        "no ref argument and no base; consulting `upstream.default-ref`"
     );
     config.upstream.default_ref.clone().context(format!(
         "no ref to build.\n\
-             Pass one (`{}`) or set `upstream.default-ref` in {}.",
+             Pass one (`{}`), record a base for this series, or set `upstream.default-ref` in {}.",
         skot_args("build", "v1.2.0"),
         layout.config_file().display()
     ))
@@ -232,7 +243,7 @@ fn apply_phase(
     let (_, series) = layout.project()?;
     let total = series.entries_lenient(layout).len();
     let state = State::load(layout)?;
-    let stack = if state.ref_name.is_none() {
+    let stack = if state.ref_name(layout).is_none() {
         None
     } else {
         Some(authoring::recorded_stack(layout, &series, &state)?)
@@ -374,7 +385,7 @@ pub(crate) fn unique_points(phase: Phase) -> Vec<HookPoint> {
 fn current_sha(layout: &Layout) -> String {
     State::load(layout)
         .ok()
-        .and_then(|s| s.sha)
+        .and_then(|s| s.sha(layout).map(str::to_owned))
         .unwrap_or_default()
 }
 
@@ -589,7 +600,7 @@ mod tests {
         assert_eq!(ran, vec!["apply"]);
         let state = State::load(&layout).unwrap();
         assert_eq!(
-            state.applied,
+            state.applied(&layout).to_vec(),
             ["0001-a.patch"],
             "the popped patch must stay popped"
         );
@@ -611,9 +622,9 @@ mod tests {
 
         let state = State::load(&layout).unwrap();
         assert!(
-            state.applied.is_empty(),
+            state.applied(&layout).is_empty(),
             "nothing pushed, nothing applied: {:?}",
-            state.applied
+            state.applied(&layout)
         );
         assert_eq!(
             std::fs::read_to_string(layout.sandbox_dir().join("f.txt")).unwrap(),
@@ -660,7 +671,7 @@ mod tests {
         );
         let state = State::load(&layout).unwrap();
         assert_eq!(
-            state.applied,
+            state.applied(&layout).to_vec(),
             ["0001-a.patch", "0003-c.patch"],
             "the hole must survive the build"
         );
@@ -711,9 +722,9 @@ mod tests {
         run(&ctx, &args).unwrap();
 
         let state = State::load(&ctx.layout).unwrap();
-        assert_eq!(state.ref_name.as_deref(), Some("main"));
-        assert_eq!(state.applied, ["0001-a.patch"]);
-        assert!(state.sha.as_deref().is_some_and(|s| s.len() == 40));
+        assert_eq!(state.ref_name(&ctx.layout), Some("main"));
+        assert_eq!(state.applied(&ctx.layout), ["0001-a.patch"]);
+        assert!(state.sha(&ctx.layout).is_some_and(|s| s.len() == 40));
         assert!(
             state.in_flight.is_none() && state.in_flight_command.is_none(),
             "the run finished, so nothing is in flight"

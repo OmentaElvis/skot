@@ -64,14 +64,14 @@ pub fn run(ctx: &Ctx, args: &DropArgs) -> Result<Exit> {
     universe.extend(disabled.iter().map(String::as_str));
     let name = authoring::resolve_patch(&universe, &names, &args.patch)?.name(&names);
     let state = State::load(&ctx.layout).unwrap_or_default();
-    if state.applied.contains(&name) {
+    if state.applied(&ctx.layout).contains(&name) {
         return Err(refuse_applied(&name));
     }
     // An open work area is work the patch holds outside `patches/`, so it goes with the
     // patch rather than being left behind as a husk. Saying so before the question keeps
     // the two from being two decisions.
     let work_area = session::Manifest::load(&ctx.layout)
-        .map(|m| m.get(&name).cloned())
+        .map(|m| m.get(&ctx.layout, &name).cloned())
         .unwrap_or(None);
     if !confirmed(ctx, &name, work_area.as_ref())? {
         info!(target: "drop", "kept {name}; nothing was removed");
@@ -97,6 +97,7 @@ pub fn run(ctx: &Ctx, args: &DropArgs) -> Result<Exit> {
     if ctx.cli.json {
         emit_json(&json!({
             "ok": true,
+            "series_name": ctx.layout.series(),
             "name": removed.name,
             "position": removed.position,
             "renamed": removed
@@ -161,7 +162,7 @@ fn remove(layout: &Layout, want: &str) -> Result<Removed> {
     let index = position_of(&names, want)?;
     let name = names[index].to_owned();
 
-    if state.applied.contains(&name) {
+    if state.applied(layout).contains(&name) {
         return Err(refuse_applied(&name));
     }
 
@@ -172,7 +173,7 @@ fn remove(layout: &Layout, want: &str) -> Result<Removed> {
     // the new name, the same way the applied set does. The dropped patch's own work area is
     // not this function's business: `run` retires it, having already resolved it.
     let mut sessions = session::Manifest::load(layout)?;
-    sessions.follow_renames(&removal.renames);
+    sessions.follow_renames(layout, &removal.renames);
     sessions.save(layout)?;
     drop(lock);
 
@@ -416,7 +417,7 @@ mod tests {
 
         let state = State::load(&layout).unwrap();
         assert_eq!(
-            state.applied,
+            state.applied(&layout).to_vec(),
             ["0001-b.patch"],
             "the applied patch followed its rename"
         );
@@ -462,7 +463,20 @@ mod tests {
             err.contains("0001-a.patch, 0002-b.patch, 0003-c.patch"),
             "{err}"
         );
-        assert_eq!(layout.patches_dir().read_dir().unwrap().count(), 3);
+        assert_eq!(
+            layout
+                .patches_dir()
+                .read_dir()
+                .unwrap()
+                .filter(|e| e
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "patch"))
+                .count(),
+            3
+        );
     }
 
     #[test]
@@ -508,7 +522,20 @@ mod tests {
 
         assert_eq!(removed.left, 0);
         assert_eq!(std::fs::read_to_string(layout.series_file()).unwrap(), "");
-        assert_eq!(layout.patches_dir().read_dir().unwrap().count(), 0);
+        assert_eq!(
+            layout
+                .patches_dir()
+                .read_dir()
+                .unwrap()
+                .filter(|e| e
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "patch"))
+                .count(),
+            0
+        );
         drop(tmp);
     }
 
@@ -557,11 +584,11 @@ mod tests {
         assert!(err.contains("cannot ask"), "{err}");
         assert!(err.contains("--yes"), "{err}");
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
             "0001-a.patch\n0002-b.patch\n0003-c.patch\n",
             "nothing was removed"
         );
-        assert!(tmp.path().join("patches").join("0003-c.patch").is_file());
+        assert!(ctx.layout.patches_dir().join("0003-c.patch").is_file());
         drop(tmp);
     }
 
@@ -585,7 +612,7 @@ mod tests {
         .to_string();
 
         assert!(err.contains("cannot ask"), "{err}");
-        assert!(tmp.path().join("patches").join("0003-c.patch").is_file());
+        assert!(ctx.layout.patches_dir().join("0003-c.patch").is_file());
         drop(tmp);
     }
 
@@ -593,7 +620,7 @@ mod tests {
     fn a_serial_prefix_drops_that_patch() {
         // The shared `[PATCH]` reading: `0002` names the patch whose file starts with
         // it, without the full name typed out.
-        let (tmp, layout) = three_patches();
+        let (_tmp, layout) = three_patches();
         let cli = Cli::try_parse_from(["skot", "patch", "drop", "0002", "--yes"]).unwrap();
         let ctx = Ctx {
             layout,
@@ -611,12 +638,12 @@ mod tests {
 
         assert_eq!(exit, Exit::Success);
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("series")).unwrap(),
+            std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
             "0001-a.patch\n0002-c.patch\n",
             "0002-b.patch is gone and the tail renumbered down"
         );
-        assert!(!tmp.path().join("patches").join("0002-b.patch").exists());
-        assert!(tmp.path().join("patches").join("0002-c.patch").is_file());
+        assert!(!ctx.layout.patches_dir().join("0002-b.patch").exists());
+        assert!(ctx.layout.patches_dir().join("0002-c.patch").is_file());
     }
 
     /// A two-patch series on a mirror that serves `main`, with no sessions open: the state
@@ -665,13 +692,13 @@ mod tests {
 
         assert_eq!(exit, Exit::Success);
         assert!(
-            !layout.work_dir().join("0002-b.patch").exists(),
+            !layout.work_patch_dir("0002-b.patch").unwrap().exists(),
             "the work area went with the patch"
         );
         assert!(
             crate::session::Manifest::load(&layout)
                 .unwrap()
-                .get("0002-b.patch")
+                .get(&layout, "0002-b.patch")
                 .is_none(),
             "the manifest forgets it"
         );
@@ -706,13 +733,13 @@ mod tests {
 
         assert_eq!(exit, Exit::Success);
         assert!(
-            layout.work_dir().join("0001-a.patch").exists(),
+            layout.work_patch_dir("0001-a.patch").unwrap().exists(),
             "the unrelated work area must survive"
         );
         assert!(
             crate::session::Manifest::load(&layout)
                 .unwrap()
-                .get("0001-a.patch")
+                .get(&layout, "0001-a.patch")
                 .is_some(),
             "and stay recorded"
         );
