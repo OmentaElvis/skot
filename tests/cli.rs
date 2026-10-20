@@ -33,15 +33,9 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-/// A project with a mirror holding one commit, a sandbox, and no patches.
-fn bare_project(root: &Path) -> Layout {
-    // The scope the spawned commands resolve from config, which defaults to one tree
-    // per series: a fixture whose own Layout disagreed would read the wrong sandbox.
-    let layout = Layout::new(root).with_per_series_sandbox(true);
-    std::fs::create_dir_all(layout.patches_dir()).unwrap();
-    std::fs::create_dir_all(layout.mirror_dir()).unwrap();
-
-    let repo = git2::Repository::init_bare(layout.mirror_dir()).unwrap();
+/// A bare repository with one commit on `main`: an upstream that costs no network.
+fn bare_with_one_commit(path: &Path) {
+    let repo = git2::Repository::init_bare(path).unwrap();
     let tree = {
         let mut b = repo.treebuilder(None).unwrap();
         b.insert("f.txt", repo.blob(b"base\n").unwrap(), 0o100644)
@@ -58,6 +52,17 @@ fn bare_project(root: &Path) -> Layout {
     // ref that resolves to nothing, and every command that asks for `main` fails to find it.
     repo.reference("refs/heads/main", commit, true, "init")
         .unwrap();
+}
+
+/// A project with a mirror holding one commit, a sandbox, and no patches.
+fn bare_project(root: &Path) -> Layout {
+    // The scope the spawned commands resolve from config, which defaults to one tree
+    // per series: a fixture whose own Layout disagreed would read the wrong sandbox.
+    let layout = Layout::new(root).with_per_series_sandbox(true);
+    std::fs::create_dir_all(layout.patches_dir()).unwrap();
+    std::fs::create_dir_all(layout.mirror_dir()).unwrap();
+
+    bare_with_one_commit(&layout.mirror_dir());
 
     std::fs::write(
         layout.config_file(),
@@ -68,6 +73,13 @@ fn bare_project(root: &Path) -> Layout {
     let mirror = Mirror::open(&layout).unwrap();
     skot::git::sandbox::create(&layout, &mirror).unwrap();
     layout
+}
+
+/// The path of a fresh upstream repository: `init --url` can name it without a network.
+fn upstream(root: &Path) -> String {
+    let path = root.join("upstream.git");
+    bare_with_one_commit(&path);
+    path.display().to_string()
 }
 
 fn patch_one() -> &'static str {
@@ -92,7 +104,7 @@ fn sandbox_text(layout: &Layout) -> String {
 fn build_json_is_a_single_document() {
     let tmp = tempfile::tempdir().unwrap();
     let layout = bare_project(tmp.path());
-    write_series(&layout, "0001-a.patch", patch_one());
+    write_series(&layout, "a.patch", patch_one());
 
     let out = skot(tmp.path(), &["build", "--only", "apply", "--json"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -112,7 +124,7 @@ fn build_json_is_a_single_document() {
 fn apply_json_is_a_single_document() {
     let tmp = tempfile::tempdir().unwrap();
     let layout = bare_project(tmp.path());
-    write_series(&layout, "0001-a.patch", patch_one());
+    write_series(&layout, "a.patch", patch_one());
 
     let out = skot(tmp.path(), &["patch", "apply", "main", "--json"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
@@ -128,20 +140,20 @@ fn apply_json_is_a_single_document() {
 fn enable_and_disable_steer_what_apply_lands() {
     let tmp = tempfile::tempdir().unwrap();
     let layout = bare_project(tmp.path());
-    write_series(&layout, "0001-a.patch", patch_one());
+    write_series(&layout, "a.patch", patch_one());
     std::fs::write(
-        layout.patches_dir().join("0002-b.patch"),
+        layout.patches_dir().join("b.patch"),
         "diff --git a/f.txt b/f.txt\nindex 3333333..4444444 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,1 @@\n-first\n+second\n",
     )
     .unwrap();
-    std::fs::write(layout.series_file(), "0001-a.patch\n0002-b.patch\n").unwrap();
+    std::fs::write(layout.series_file(), "a.patch\nb.patch\n").unwrap();
 
-    // Disable the second patch: its line is commented out, and apply leaves it out.
-    let out = skot(tmp.path(), &["patch", "disable", "0002-b.patch", "--json"]);
+    // Disable the second patch: its line is marked `#!`, and apply leaves it out.
+    let out = skot(tmp.path(), &["patch", "disable", "b.patch", "--json"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert_eq!(
         std::fs::read_to_string(layout.series_file()).unwrap(),
-        "0001-a.patch\n# 0002-b.patch\n"
+        "a.patch\n#!b.patch\n"
     );
 
     let out = skot(tmp.path(), &["patch", "apply", "main", "--json"]);
@@ -149,11 +161,11 @@ fn enable_and_disable_steer_what_apply_lands() {
     assert_eq!(sandbox_text(&layout), "first\n");
 
     // Enable puts the line back; apply realizes the enabled set again.
-    let out = skot(tmp.path(), &["patch", "enable", "0002-b.patch", "--json"]);
+    let out = skot(tmp.path(), &["patch", "enable", "b.patch", "--json"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert_eq!(
         std::fs::read_to_string(layout.series_file()).unwrap(),
-        "0001-a.patch\n0002-b.patch\n"
+        "a.patch\nb.patch\n"
     );
 
     let out = skot(tmp.path(), &["patch", "apply", "main", "--json"]);
@@ -161,19 +173,19 @@ fn enable_and_disable_steer_what_apply_lands() {
     assert_eq!(sandbox_text(&layout), "second\n");
 }
 
-/// `patch move` reorders and renumbers, and under `--json` it still owes the caller exactly
-/// one document, with the positions it moved between.
+/// `patch move` reorders, and under `--json` it still owes the caller exactly one
+/// document, with the positions it moved between.
 #[test]
 fn move_json_is_a_single_document_and_the_series_follows() {
     let tmp = tempfile::tempdir().unwrap();
     let layout = bare_project(tmp.path());
-    std::fs::write(layout.patches_dir().join("0001-a.patch"), "a\n").unwrap();
-    std::fs::write(layout.patches_dir().join("0002-b.patch"), "b\n").unwrap();
-    std::fs::write(layout.series_file(), "0001-a.patch\n0002-b.patch\n").unwrap();
+    std::fs::write(layout.patches_dir().join("a.patch"), "a\n").unwrap();
+    std::fs::write(layout.patches_dir().join("b.patch"), "b\n").unwrap();
+    std::fs::write(layout.series_file(), "a.patch\nb.patch\n").unwrap();
 
     let out = skot(
         tmp.path(),
-        &["patch", "move", "0002-b.patch", "--to", "1", "--json"],
+        &["patch", "move", "b.patch", "--to", "1", "--json"],
     );
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
 
@@ -181,20 +193,21 @@ fn move_json_is_a_single_document_and_the_series_follows() {
     let parsed: serde_json::Value = serde_json::from_str(&text)
         .unwrap_or_else(|e| panic!("stdout is not one JSON document: {e}\n---\n{text}\n---"));
     assert_eq!(parsed["ok"], true, "{text}");
-    assert_eq!(parsed["patch"], "0002-b.patch", "{text}");
+    assert_eq!(parsed["patch"], "b.patch", "{text}");
     assert_eq!(parsed["from"], 2, "{text}");
     assert_eq!(parsed["to"], 1, "{text}");
     assert_eq!(
         std::fs::read_to_string(layout.series_file()).unwrap(),
-        "0001-b.patch\n0002-a.patch\n",
+        "b.patch\na.patch\n",
         "the series file followed the move"
     );
     assert_eq!(
-        std::fs::read_to_string(layout.patches_dir().join("0001-b.patch")).unwrap(),
-        "b\n"
+        std::fs::read_to_string(layout.patches_dir().join("b.patch")).unwrap(),
+        "b\n",
+        "and the files kept the names they were created with"
     );
     assert_eq!(
-        std::fs::read_to_string(layout.patches_dir().join("0002-a.patch")).unwrap(),
+        std::fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap(),
         "a\n"
     );
 }
@@ -205,29 +218,26 @@ fn move_json_is_a_single_document_and_the_series_follows() {
 fn drop_deletes_only_when_asked_to() {
     let tmp = tempfile::tempdir().unwrap();
     let layout = bare_project(tmp.path());
-    write_series(&layout, "0001-a.patch", patch_one());
+    write_series(&layout, "a.patch", patch_one());
 
     // No terminal here, so without --yes there is nobody to ask. The refusal goes to
     // stderr; under --json the logger is off by contract, and only the exit code shows.
-    let out = skot(tmp.path(), &["patch", "drop", "0001-a.patch"]);
+    let out = skot(tmp.path(), &["patch", "drop", "a.patch"]);
     assert_ne!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert!(stderr(&out).contains("--yes"), "stderr: {}", stderr(&out));
     assert!(
-        layout.patches_dir().join("0001-a.patch").is_file(),
+        layout.patches_dir().join("a.patch").is_file(),
         "nothing was deleted"
     );
 
-    let out = skot(
-        tmp.path(),
-        &["patch", "drop", "0001-a.patch", "--yes", "--json"],
-    );
+    let out = skot(tmp.path(), &["patch", "drop", "a.patch", "--yes", "--json"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let text = stdout(&out);
     let parsed: serde_json::Value = serde_json::from_str(&text)
         .unwrap_or_else(|e| panic!("stdout is not one JSON document: {e}\n---\n{text}\n---"));
     assert_eq!(parsed["ok"], true, "{text}");
     assert_eq!(parsed["file_removed"], true, "{text}");
-    assert!(!layout.patches_dir().join("0001-a.patch").exists());
+    assert!(!layout.patches_dir().join("a.patch").exists());
 }
 
 /// A failing patch must exit non-zero and explain itself on stderr, because that is what a CI
@@ -239,7 +249,7 @@ fn a_series_that_does_not_apply_fails_loudly() {
     // A patch that expects content the base does not have.
     write_series(
         &layout,
-        "0001-a.patch",
+        "a.patch",
         "diff --git a/f.txt b/f.txt\nindex 1111111..2222222 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,1 @@\n-nonexistent\n+first\n",
     );
 
@@ -268,7 +278,7 @@ fn a_series_that_does_not_apply_fails_loudly() {
 fn build_json_survives_a_noisy_hook() {
     let tmp = tempfile::tempdir().unwrap();
     let layout = bare_project(tmp.path());
-    write_series(&layout, "0001-a.patch", patch_one());
+    write_series(&layout, "a.patch", patch_one());
 
     std::fs::write(
         layout.config_file(),
@@ -302,7 +312,7 @@ fn build_json_survives_a_noisy_hook() {
 fn build_json_reports_a_failure_as_a_document() {
     let tmp = tempfile::tempdir().unwrap();
     let layout = bare_project(tmp.path());
-    write_series(&layout, "0001-a.patch", patch_one());
+    write_series(&layout, "a.patch", patch_one());
 
     std::fs::write(
         layout.config_file(),
@@ -391,7 +401,7 @@ fn a_keep_path_survives_a_base_that_dropped_it_without_taking_the_sandbox_with_i
          \n[sandbox]\nkeep = [\"kept.txt\"]\n",
     )
     .unwrap();
-    write_series(&layout, "0001-a.patch", patch_one());
+    write_series(&layout, "a.patch", patch_one());
 
     let sandbox = layout.sandbox_dir();
     let mirror = Mirror::open(&layout).unwrap();
@@ -430,7 +440,7 @@ fn an_untracked_cache_survives_repeated_applies() {
          \n[sandbox]\nkeep = [\"node_modules\"]\n",
     )
     .unwrap();
-    write_series(&layout, "0001-a.patch", patch_one());
+    write_series(&layout, "a.patch", patch_one());
 
     let sandbox = layout.sandbox_dir();
     let mirror = Mirror::open(&layout).unwrap();
@@ -479,10 +489,10 @@ fn skot_series_environment_variable_names_the_series() {
     let tmp = tempfile::tempdir().unwrap();
     let layout = bare_project(tmp.path());
     std::fs::create_dir_all(layout.series_root().join("exp")).unwrap();
-    write_series(&layout, "0001-a.patch", patch_one());
+    write_series(&layout, "a.patch", patch_one());
     let exp = layout.with_series("exp").unwrap();
-    std::fs::write(exp.patches_dir().join("0002-b.patch"), patch_one()).unwrap();
-    std::fs::write(exp.series_file(), "0002-b.patch\n").unwrap();
+    std::fs::write(exp.patches_dir().join("b.patch"), patch_one()).unwrap();
+    std::fs::write(exp.series_file(), "b.patch\n").unwrap();
 
     // Without the variable this is the ambiguity refusal: several series, nothing
     // naming the active one. Not `--json`: with the flag the logger is off, and an
@@ -510,4 +520,176 @@ fn skot_series_environment_variable_names_the_series() {
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert_eq!(doc["series_name"], "exp");
+}
+
+/// A run that cannot ask refuses the one `init` question that has no default.
+///
+/// An upstream URL is a fact about the project, not a value a default could stand for,
+/// so both ways of not being able to ask (`--yes`, and a missing terminal) take the same
+/// route: exit 2, clap's usage shape, the flag that answers it, and nothing written.
+#[test]
+fn an_init_that_cannot_ask_refuses_to_guess_an_upstream_url() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (name, args) in [("yes", vec!["init", "-y"]), ("silent", vec!["init"])] {
+        let project = tmp.path().join(name);
+        std::fs::create_dir_all(&project).unwrap();
+
+        let out = skot(&project, &args);
+        assert_eq!(out.status.code(), Some(2), "{name}: {}", stderr(&out));
+        let err = stderr(&out);
+        assert!(err.contains("--url"), "{name}: names the flag: {err}");
+        assert!(err.contains("Usage: skot init"), "{name}: {err}");
+        assert!(
+            !project.join("skot.toml").exists(),
+            "{name}: an init that refused to answer must write nothing"
+        );
+    }
+}
+
+/// Every question that cannot be asked is answered the same way: with the default it
+/// would have offered. `--yes` and a terminal-less run must write the same project.
+#[test]
+fn init_takes_the_default_of_every_question_it_cannot_ask() {
+    let tmp = tempfile::tempdir().unwrap();
+    let url = upstream(tmp.path());
+
+    let mut configs = Vec::new();
+    for name in ["yes", "silent"] {
+        let project = tmp.path().join(name);
+        std::fs::create_dir_all(project.join("target")).unwrap();
+        let mut args = vec!["init"];
+        if name == "yes" {
+            args.push("-y");
+        }
+        args.extend(["--url", url.as_str()]);
+
+        let out = skot(&project, &args);
+        assert_eq!(out.status.code(), Some(0), "{name}: {}", stderr(&out));
+
+        let config = std::fs::read_to_string(project.join("skot.toml")).unwrap();
+        assert!(
+            config.contains(&url),
+            "{name}: the URL it was given: {config}"
+        );
+        assert!(
+            config.lines().any(|l| l.starts_with("policy = ")),
+            "{name}: the policy default is taken, not left commented: {config}"
+        );
+        assert!(
+            config.lines().any(|l| l == "keep = [\"target\"]"),
+            "{name}: every keep candidate present is protected: {config}"
+        );
+        assert!(
+            config.lines().any(|l| l.starts_with("# default-ref")),
+            "{name}: a question with no default stays unset: {config}"
+        );
+
+        let layout = Layout::new(&project);
+        let series = std::fs::read_to_string(layout.series_file())
+            .unwrap_or_else(|e| panic!("{name}: the default series exists: {e}"));
+        assert!(
+            series
+                .lines()
+                .all(|line| line.is_empty() || line.starts_with('#')),
+            "{name}: the default series starts empty of patches: {series}"
+        );
+        let mirror = git2::Repository::open(layout.mirror_dir())
+            .unwrap_or_else(|e| panic!("{name}: the mirror was fetched: {e}"));
+        assert!(
+            mirror.refname_to_id("refs/heads/main").is_ok(),
+            "{name}: the upstream landed in the mirror"
+        );
+        configs.push(config);
+    }
+    assert_eq!(
+        configs[0], configs[1],
+        "a terminal-less run and --yes must write the same project"
+    );
+}
+
+/// A question with no default is the same refusal everywhere: exit 2, clap's usage shape,
+/// and the flag that answers it. `--yes` does not invent an answer it cannot know.
+#[test]
+fn a_question_nothing_can_answer_is_a_usage_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = bare_project(tmp.path());
+    // Two patches, one of each state: every picker below has something real to ask about,
+    // so an empty-selection precondition cannot answer the question instead of the asker.
+    std::fs::write(layout.patches_dir().join("a.patch"), patch_one()).unwrap();
+    std::fs::write(layout.patches_dir().join("b.patch"), patch_one()).unwrap();
+    std::fs::write(layout.series_file(), "a.patch\n#!b.patch\n").unwrap();
+    // The pointer first: a second series without one would refuse every command for
+    // ambiguity instead of reaching its question.
+    let used = skot(tmp.path(), &["series", "use", "default"]);
+    assert_eq!(used.status.code(), Some(0), "fixture: {}", stderr(&used));
+    // `series drop` needs a series that is not active; `series undo` needs an undo
+    // buffer, which is checked before the question is reached at all.
+    std::fs::create_dir_all(layout.series_root().join("exp")).unwrap();
+    std::fs::create_dir_all(layout.undo_entry()).unwrap();
+
+    let cases: [(&[&str], &str); 7] = [
+        (&["patch", "enable"], "skot patch enable"),
+        (&["patch", "enable", "-y"], "skot patch enable"),
+        (&["patch", "disable"], "skot patch disable"),
+        (&["patch", "move"], "skot patch move"),
+        (&["patch", "drop", "a.patch"], "skot patch drop"),
+        (&["series", "drop", "exp"], "skot series drop"),
+        (&["series", "undo"], "skot series undo"),
+    ];
+    for (args, advice) in cases {
+        let out = skot(tmp.path(), args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+        let err = stderr(&out);
+        assert!(err.contains(advice), "{args:?}: names the flag: {err}");
+        assert!(err.contains("Usage: skot"), "{args:?}: clap-shaped: {err}");
+    }
+    assert!(
+        layout.patches_dir().join("a.patch").is_file(),
+        "a refusal deletes nothing"
+    );
+}
+
+/// `--yes` must reach the confirmation `series undo` carries as its own flag.
+///
+/// The claim is about the question, not the swap that follows it: nothing here says the
+/// undo succeeds, only that a `--yes` run is never told it cannot ask. Both spellings
+/// count: the subcommand's own long flag, and the global one given before the command.
+#[test]
+fn yes_reaches_series_undo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = bare_project(tmp.path());
+    std::fs::create_dir_all(layout.undo_entry()).unwrap();
+
+    for args in [
+        vec!["series", "undo", "--yes"],
+        vec!["-y", "series", "undo"],
+    ] {
+        let out = skot(tmp.path(), &args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", stderr(&out));
+        let err = stderr(&out);
+        assert!(
+            !err.contains("cannot ask"),
+            "{args:?}: a --yes run must not be refused for having nobody to ask: {err}"
+        );
+    }
+}
+
+/// `--hook` answers the question the hook wizard would have asked.
+#[test]
+fn the_hook_flag_lands_without_a_wizard() {
+    let tmp = tempfile::tempdir().unwrap();
+    let url = upstream(tmp.path());
+    let project = tmp.path().join("hooked");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let out = skot(
+        &project,
+        &["init", "-y", "--url", &url, "--hook", "build=make"],
+    );
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let config = std::fs::read_to_string(project.join("skot.toml")).unwrap();
+    assert!(
+        config.contains("build = \"make\""),
+        "the hook from the flag: {config}"
+    );
 }

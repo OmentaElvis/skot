@@ -69,6 +69,7 @@ pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
             )));
         }
         Hints::new("next")
+            .entry(skot("apply"), "stamp the enabled patches into the sandbox")
             .entry(skot("build"), "the whole run: fetch, apply, build")
             .print();
         return Ok(Exit::Success);
@@ -104,7 +105,7 @@ pub fn run(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
     }
     report::note(&format!(
         "Rebase it against this ref, then `{}` to re-export it.",
-        skot("edit-save")
+        skot("save")
     ));
     Ok(Exit::Failure)
 }
@@ -299,10 +300,10 @@ mod tests {
         let layout = testsupport::landed_set(
             tmp.path(),
             &[
-                ("0001-a.patch", testsupport::patch_adds_g()),
-                ("0002-b.patch", testsupport::patch_two()),
+                ("a.patch", testsupport::patch_adds_g()),
+                ("b.patch", testsupport::patch_two()),
             ],
-            &["0001-a.patch"],
+            &["a.patch"],
         )
         .0;
 
@@ -318,12 +319,8 @@ mod tests {
         // Nothing staged is a legal state (a fresh project, or everything popped), and
         // the answer is vacuously yes rather than an error.
         let tmp = tempfile::tempdir().unwrap();
-        let layout = testsupport::landed_set(
-            tmp.path(),
-            &[("0001-a.patch", testsupport::patch_one())],
-            &[],
-        )
-        .0;
+        let layout =
+            testsupport::landed_set(tmp.path(), &[("a.patch", testsupport::patch_one())], &[]).0;
 
         let exit = run(&ctx_for(&layout), &args(true)).unwrap();
 
@@ -339,7 +336,7 @@ mod tests {
             "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
         )
         .unwrap();
-        testsupport::write_series(&layout, &[("0001-a.patch", testsupport::patch_one())]);
+        testsupport::write_series(&layout, &[("a.patch", testsupport::patch_one())]);
         std::fs::create_dir_all(layout.series_root().join("exp")).unwrap();
 
         let cli = Cli::try_parse_from(["skot", "--series", "all", "check"]).unwrap();
@@ -352,14 +349,14 @@ mod tests {
         // A series whose patch cannot apply makes the whole run a failure...
         testsupport::write_series(
             &layout.with_series("exp").unwrap(),
-            &[("0001-x.patch", "not a patch at all\n")],
+            &[("x.patch", "not a patch at all\n")],
         );
         assert_eq!(run(&ctx, &args(false)).unwrap(), Exit::Failure);
 
         // ...and once every series lands, the run succeeds.
         testsupport::write_series(
             &layout.with_series("exp").unwrap(),
-            &[("0001-x.patch", testsupport::patch_one())],
+            &[("x.patch", testsupport::patch_one())],
         );
         assert_eq!(run(&ctx, &args(false)).unwrap(), Exit::Success);
     }
@@ -390,15 +387,15 @@ mod tests {
         let layout = testsupport::landed_set(
             tmp.path(),
             &[
-                ("0001-a.patch", testsupport::patch_adds_g()),
-                ("0002-b.patch", testsupport::patch_two()),
+                ("a.patch", testsupport::patch_adds_g()),
+                ("b.patch", testsupport::patch_two()),
             ],
-            &["0001-a.patch"],
+            &["a.patch"],
         )
         .0;
         // Hand-edit the series out from under the recorded set, the drift `validate_set`
         // exists to catch.
-        std::fs::write(layout.series_file(), "0002-b.patch\n").unwrap();
+        std::fs::write(layout.series_file(), "b.patch\n").unwrap();
 
         let err = run(&ctx_for(&layout), &args(true)).unwrap_err().to_string();
 

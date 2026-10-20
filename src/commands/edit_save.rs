@@ -1,7 +1,7 @@
-//! `patch edit-save`: turn what you changed in a work area into a patch file.
+//! `patch save`: turn what you changed in a work area into a patch file.
 //!
 //! This is the command that makes patch authoring a loop rather than a chore. You edit in
-//! the worktree under `.skot/work/`, run `edit-save`, and the patch on disk is the diff:
+//! the worktree under `.skot/work/`, run `save`, and the patch on disk is the diff:
 //! no commit, no branch, no rebase, nothing to remember to clean up. After a save the work
 //! area matches the patch, so it retires itself: saving is the end of the loop, and there
 //! is no separate step for being done.
@@ -23,14 +23,14 @@
 //!
 //! One guard sits in front of all that: the recorded base is a claim about the series as it
 //! was when the work area opened. If the patches below no longer replay to that tree,
-//! `edit-save` refuses rather than exporting against a context the series cannot rebuild,
+//! `save` refuses rather than exporting against a context the series cannot rebuild,
 //! and `--force` is the way past it when the change below was deliberate.
 
 use anyhow::{Context, Result, bail};
 use log::{debug, info};
 use serde_json::json;
 
-use crate::cli::EditSaveArgs;
+use crate::cli::SaveArgs;
 use crate::commands::{Ctx, Exit, authoring, emit_json};
 use crate::git::diff;
 use crate::hints::Hints;
@@ -39,7 +39,7 @@ use crate::layout::Layout;
 use crate::series::{self, Series};
 use crate::session::{Manifest, Session, end, open as open_session, reconcile};
 
-/// What `edit-save` did, presented by [`run`].
+/// What `save` did, presented by [`run`].
 #[derive(Debug)]
 struct Saved {
     name: String,
@@ -52,7 +52,7 @@ struct Saved {
     bytes: usize,
 }
 
-pub fn run(ctx: &Ctx, args: &EditSaveArgs) -> Result<Exit> {
+pub fn run(ctx: &Ctx, args: &SaveArgs) -> Result<Exit> {
     let done = save(
         &ctx.layout,
         args.name.as_deref(),
@@ -88,28 +88,29 @@ pub fn run(ctx: &Ctx, args: &EditSaveArgs) -> Result<Exit> {
     }
 
     if !done.changed {
-        info!(target: "edit-save", "{} was already saved", done.name);
+        info!(target: "save", "{} was already saved", done.name);
         info!(
-            target: "edit-save",
+            target: "save",
             "The work area matches it. `{}` starts a new one when you want to change more.",
             skot_args("edit", &done.name)
         );
         return Ok(Exit::Success);
     }
 
-    info!(target: "edit-save", "saved {}", done.name);
-    debug!(target: "edit-save", "  {}", done.summary);
-    debug!(target: "edit-save", "  {}", done.path.display());
+    info!(target: "save", "saved {}", done.name);
+    debug!(target: "save", "  {}", done.summary);
+    debug!(target: "save", "  {}", done.path.display());
     if done.registered {
-        debug!(target: "edit-save", "registered in the series");
+        debug!(target: "save", "registered in the series");
     } else {
         debug!(
-            target: "edit-save",
+            target: "save",
             "already in the series, so the series was left alone"
         );
     }
     Hints::new("next")
         .entry(skot("check"), "re-verify the whole series")
+        .entry(skot("apply"), "stamp the saved patches into the sandbox")
         .print();
     Ok(Exit::Success)
 }
@@ -158,7 +159,7 @@ fn save(
                  `{}` saves against the recorded base anyway, which is only right if the \
                  change below was deliberate.",
                 session.patch,
-                skot_args("edit-save", "--force")
+                skot_args("save", "--force")
             );
         }
     }
@@ -177,7 +178,7 @@ fn save(
         .context(format!("exporting your edits as {}", entry.name))?;
 
     // Saving a patch you have not touched is normal, not a mistake: it is what running
-    // `edit-save` twice looks like. Compare the *body*, because re-rendering the header
+    // `save` twice looks like. Compare the *body*, because re-rendering the header
     // normalises things the author never wrote, hunk counts and offsets among them, and
     // rewriting those bytes is not a change to the patch.
     if diff::change_of(&patch) == diff::change_of(&existing) {
@@ -229,15 +230,8 @@ fn save(
         false
     } else {
         let index = insert_at.unwrap_or(series.len());
-        let (_line, renames) = series.insert_renumbering(layout, &entry.name, index)?;
+        series.insert(&entry.name, index)?;
         series.save(layout)?;
-        let mut state = crate::state::State::load(layout)?;
-        state.follow_renames(layout, &renames)?;
-        // A work area on a patch the insertion renumbered keeps its worktree and follows
-        // the new name, the same way the applied set does.
-        let mut sessions = crate::session::Manifest::load(layout)?;
-        sessions.follow_renames(layout, &renames);
-        sessions.save(layout)?;
         true
     };
 
@@ -333,7 +327,7 @@ fn choose(
                     .map(|s| s.patch.as_str())
                     .collect::<Vec<_>>()
                     .join(", "),
-                skot_args("edit-save", "<patch>")
+                skot_args("save", "<patch>")
             ),
         }
     };
@@ -378,9 +372,10 @@ mod tests {
     use super::*;
     use crate::commands::testsupport;
 
-    /// A project with a two-patch series and a session open on `0002-b.patch`, its worktree
-    /// holding 0001's output plus 0002's own content: what the authoring loop leaves behind.
-    fn session_on_0002(root: &std::path::Path) -> Layout {
+    /// A project with a two-patch series and a session open on `b.patch`, its worktree
+    /// holding a.patch's output plus b.patch's own content: what the authoring loop leaves
+    /// behind.
+    fn session_on_b(root: &std::path::Path) -> Layout {
         let (layout, _sha) = testsupport::mirror_with_one_commit(root);
         std::fs::write(
             layout.config_file(),
@@ -390,22 +385,22 @@ mod tests {
         testsupport::write_series(
             &layout,
             &[
-                ("0001-a.patch", testsupport::patch_one()),
-                ("0002-b.patch", testsupport::patch_two()),
+                ("a.patch", testsupport::patch_one()),
+                ("b.patch", testsupport::patch_two()),
             ],
         );
         let entries = layout.project().unwrap().1.entries(&layout).unwrap();
         let plan = crate::session::plan(&layout, "main", &entries[..1], Some(&entries[1])).unwrap();
-        crate::session::materialise(&layout, "0002-b.patch", &plan).unwrap();
+        crate::session::materialise(&layout, "b.patch", &plan).unwrap();
         layout
     }
 
     /// The same, with a session open on each patch.
     fn session_pair(root: &std::path::Path) -> Layout {
-        let layout = session_on_0002(root);
+        let layout = session_on_b(root);
         let entries = layout.project().unwrap().1.entries(&layout).unwrap();
         let plan = crate::session::plan(&layout, "main", &[], Some(&entries[0])).unwrap();
-        crate::session::materialise(&layout, "0001-a.patch", &plan).unwrap();
+        crate::session::materialise(&layout, "a.patch", &plan).unwrap();
         layout
     }
 
@@ -455,16 +450,16 @@ mod tests {
         // The patch exists; the worktree does not. Saying "not in the series" here would
         // be a lie that sends the user looking at the wrong file.
         let (_tmp, layout) = testsupport::project();
-        testsupport::write_series(&layout, &[("0001-a.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", "")]);
         let series = Series::load(&layout.series_file()).unwrap();
 
-        let err = choose(&layout, &series, &Manifest::default(), Some("0001-a.patch"))
+        let err = choose(&layout, &series, &Manifest::default(), Some("a.patch"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("0001-a.patch"), "it should name it: {err}");
+        assert!(err.contains("a.patch"), "it should name it: {err}");
         assert!(err.contains("nothing to save"), "got {err}");
         assert!(
-            err.contains(&skot_args("edit", "0001-a.patch")),
+            err.contains(&skot_args("edit", "a.patch")),
             "it should say how to open one: {err}"
         );
     }
@@ -472,35 +467,32 @@ mod tests {
     #[test]
     fn several_open_sessions_must_be_named() {
         let (_tmp, layout) = testsupport::project();
-        testsupport::write_series(&layout, &[("0001-a.patch", ""), ("0002-b.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", ""), ("b.patch", "")]);
         let series = Series::load(&layout.series_file()).unwrap();
         let manifest = Manifest {
-            sessions: vec![record("0001-a.patch"), record("0002-b.patch")],
+            sessions: vec![record("a.patch"), record("b.patch")],
         };
 
         let err = choose(&layout, &series, &manifest, None)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("0001-a.patch"), "it should list them: {err}");
-        assert!(err.contains("0002-b.patch"), "it should list them: {err}");
-        assert!(
-            err.contains(&skot("edit-save")),
-            "and say how to pick: {err}"
-        );
+        assert!(err.contains("a.patch"), "it should list them: {err}");
+        assert!(err.contains("b.patch"), "it should list them: {err}");
+        assert!(err.contains(&skot("save")), "and say how to pick: {err}");
     }
 
     #[test]
     fn the_only_open_session_is_the_default_target() {
         let (_tmp, layout) = testsupport::project();
-        testsupport::write_series(&layout, &[("0001-a.patch", ""), ("0002-b.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", ""), ("b.patch", "")]);
         let series = Series::load(&layout.series_file()).unwrap();
         let manifest = Manifest {
-            sessions: vec![record("0002-b.patch")],
+            sessions: vec![record("b.patch")],
         };
 
         let (session, entry, index) = choose(&layout, &series, &manifest, None).unwrap();
-        assert_eq!(session.patch, "0002-b.patch");
-        assert_eq!(entry.name, "0002-b.patch");
+        assert_eq!(session.patch, "b.patch");
+        assert_eq!(entry.name, "b.patch");
         assert_eq!(index, 1, "the patch, and its position in the series");
     }
 
@@ -518,10 +510,10 @@ mod tests {
             .unwrap();
 
         let broken = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,1 @@\n-nothing matches this\n+oops\n";
-        let err = verify_round_trip(&repo, &tree, broken, "0001-a.patch")
+        let err = verify_round_trip(&repo, &tree, broken, "a.patch")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("0001-a.patch"), "got {err}");
+        assert!(err.contains("a.patch"), "got {err}");
         assert!(
             err.contains("intact"),
             "should say nothing was written: {err}"
@@ -540,7 +532,7 @@ mod tests {
             .unwrap();
 
         let good = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,1 @@\n-base\n+changed\n";
-        assert!(verify_round_trip(&repo, &tree, good, "0001-a.patch").is_ok());
+        assert!(verify_round_trip(&repo, &tree, good, "a.patch").is_ok());
     }
 
     #[test]
@@ -550,16 +542,16 @@ mod tests {
         // tree here, because that mistake produces a patch that looks fine and drops an
         // earlier patch.
         let tmp = tempfile::tempdir().unwrap();
-        let layout = session_on_0002(tmp.path());
+        let layout = session_on_b(tmp.path());
 
-        let dir = layout.work_patch_dir("0002-b.patch").unwrap();
+        let dir = layout.work_patch_dir("b.patch").unwrap();
         std::fs::write(dir.join("f.txt"), "edited\n").unwrap();
 
-        save(&layout, Some("0002-b.patch"), None, false, false).unwrap();
+        save(&layout, Some("b.patch"), None, false, false).unwrap();
 
-        let patch = std::fs::read_to_string(layout.patches_dir().join("0002-b.patch")).unwrap();
-        // 0002's recorded base is the tree 0001 leaves behind, which holds `first`, not
-        // `second`, which is what 0002 itself put in the worktree. Diffing against the wrong
+        let patch = std::fs::read_to_string(layout.patches_dir().join("b.patch")).unwrap();
+        // b.patch's recorded base is the tree a.patch leaves behind, which holds `first`, not
+        // `second`, which is what b.patch itself put in the worktree. Diffing against the wrong
         // tree here yields a patch that cannot apply, and one that still looks reasonable.
         assert!(
             patch.contains("-first"),
@@ -571,7 +563,7 @@ mod tests {
         );
         assert!(
             !patch.contains("-second"),
-            "the base must be 0001's output, not 0002's own:\n{patch}"
+            "the base must be a.patch's output, not b.patch's own:\n{patch}"
         );
         assert_eq!(
             patch.matches("diff --git").count(),
@@ -593,15 +585,15 @@ mod tests {
         // there is nothing to tell apart and no reason to send the user away to pop first.
         let tmp = tempfile::tempdir().unwrap();
         let layout = session_pair(tmp.path());
-        let before = std::fs::read_to_string(layout.patches_dir().join("0002-b.patch")).unwrap();
+        let before = std::fs::read_to_string(layout.patches_dir().join("b.patch")).unwrap();
 
-        let one = layout.work_patch_dir("0001-a.patch").unwrap();
+        let one = layout.work_patch_dir("a.patch").unwrap();
         std::fs::write(one.join("f.txt"), "from the bottom\n").unwrap();
-        save(&layout, Some("0001-a.patch"), None, false, false).unwrap();
+        save(&layout, Some("a.patch"), None, false, false).unwrap();
 
-        let patch = std::fs::read_to_string(layout.patches_dir().join("0001-a.patch")).unwrap();
-        // 0001's base is the series ref itself, which holds `base`. Its own original change
-        // ("first") must not be in here, and neither must 0002's ("second").
+        let patch = std::fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap();
+        // a.patch's base is the series ref itself, which holds `base`. Its own original change
+        // ("first") must not be in here, and neither must b.patch's ("second").
         assert!(
             patch.contains("-base"),
             "the ref's contents should be removed:\n{patch}"
@@ -612,19 +604,19 @@ mod tests {
         );
         assert!(
             !patch.contains("-first"),
-            "0001's own old change leaked back in:\n{patch}"
+            "a.patch's own old change leaked back in:\n{patch}"
         );
         assert!(
             !patch.contains("second"),
-            "0002's change leaked into 0001:\n{patch}"
+            "b.patch's change leaked into a.patch:\n{patch}"
         );
         assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0002-b.patch")).unwrap(),
+            std::fs::read_to_string(layout.patches_dir().join("b.patch")).unwrap(),
             before,
-            "0002 must be untouched by a save of 0001"
+            "b.patch must be untouched by a save of a.patch"
         );
 
-        // 0001 now applies to the base it was rewritten against. 0002 does not, because it
+        // a.patch now applies to the base it was rewritten against. b.patch does not, because it
         // was written on top of a `first` that no longer exists, and skot says so instead of
         // leaving a broken series unmarked.
         let repo = mirror_repo(&layout);
@@ -632,25 +624,25 @@ mod tests {
         let report = crate::check::check_series(&repo, "main", &entries).unwrap();
         assert!(
             !report.ok,
-            "0002's base moved, so the series is now inconsistent"
+            "b.patch's base moved, so the series is now inconsistent"
         );
         assert_eq!(
             report.first_failure().map(|p| p.name.as_str()),
-            Some("0002-b.patch"),
-            "0002 is the patch whose base moved, not the one that was edited"
+            Some("b.patch"),
+            "b.patch is the patch whose base moved, not the one that was edited"
         );
     }
 
     #[test]
     fn saving_a_new_file_adds_it_as_the_patch_content() {
         let tmp = tempfile::tempdir().unwrap();
-        let layout = session_on_0002(tmp.path());
-        let dir = layout.work_patch_dir("0002-b.patch").unwrap();
+        let layout = session_on_b(tmp.path());
+        let dir = layout.work_patch_dir("b.patch").unwrap();
         std::fs::write(dir.join("extra.txt"), "a new file\n").unwrap();
 
-        save(&layout, Some("0002-b.patch"), None, false, false).unwrap();
+        save(&layout, Some("b.patch"), None, false, false).unwrap();
 
-        let patch = std::fs::read_to_string(layout.patches_dir().join("0002-b.patch")).unwrap();
+        let patch = std::fs::read_to_string(layout.patches_dir().join("b.patch")).unwrap();
         assert!(
             patch.contains("extra.txt"),
             "the new file is missing:\n{patch}"
@@ -672,12 +664,12 @@ mod tests {
     #[test]
     fn saving_a_patch_that_is_already_registered_leaves_the_series_alone() {
         let tmp = tempfile::tempdir().unwrap();
-        let layout = session_on_0002(tmp.path());
+        let layout = session_on_b(tmp.path());
         let before = std::fs::read_to_string(layout.series_file()).unwrap();
 
-        let dir = layout.work_patch_dir("0002-b.patch").unwrap();
+        let dir = layout.work_patch_dir("b.patch").unwrap();
         std::fs::write(dir.join("f.txt"), "edited\n").unwrap();
-        save(&layout, Some("0002-b.patch"), None, false, false).unwrap();
+        save(&layout, Some("b.patch"), None, false, false).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(layout.series_file()).unwrap(),
@@ -693,19 +685,19 @@ mod tests {
         // work area retires after a save, so the second round opens a fresh one, which is
         // what the loop looks like in practice.
         let tmp = tempfile::tempdir().unwrap();
-        let layout = session_on_0002(tmp.path());
-        let dir = layout.work_patch_dir("0002-b.patch").unwrap();
+        let layout = session_on_b(tmp.path());
+        let dir = layout.work_patch_dir("b.patch").unwrap();
 
         std::fs::write(dir.join("f.txt"), "one\n").unwrap();
-        save(&layout, Some("0002-b.patch"), None, false, false).unwrap();
+        save(&layout, Some("b.patch"), None, false, false).unwrap();
 
         let entries = layout.project().unwrap().1.entries(&layout).unwrap();
         let plan = crate::session::plan(&layout, "main", &entries[..1], Some(&entries[1])).unwrap();
-        crate::session::materialise(&layout, "0002-b.patch", &plan).unwrap();
+        crate::session::materialise(&layout, "b.patch", &plan).unwrap();
         std::fs::write(dir.join("f.txt"), "two\n").unwrap();
-        save(&layout, Some("0002-b.patch"), None, false, false).unwrap();
+        save(&layout, Some("b.patch"), None, false, false).unwrap();
 
-        let patch = std::fs::read_to_string(layout.patches_dir().join("0002-b.patch")).unwrap();
+        let patch = std::fs::read_to_string(layout.patches_dir().join("b.patch")).unwrap();
         assert!(
             patch.contains("+two"),
             "the second edit is missing:\n{patch}"
@@ -723,12 +715,12 @@ mod tests {
         // to avoid their tools. The work area retires either way: it matches the patch, so
         // there is nothing unsaved in it.
         let tmp = tempfile::tempdir().unwrap();
-        let layout = session_on_0002(tmp.path());
-        let before = std::fs::read_to_string(layout.patches_dir().join("0002-b.patch")).unwrap();
+        let layout = session_on_b(tmp.path());
+        let before = std::fs::read_to_string(layout.patches_dir().join("b.patch")).unwrap();
 
-        save(&layout, Some("0002-b.patch"), None, false, false).unwrap();
+        save(&layout, Some("b.patch"), None, false, false).unwrap();
         assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0002-b.patch")).unwrap(),
+            std::fs::read_to_string(layout.patches_dir().join("b.patch")).unwrap(),
             before,
             "nothing should change on disk"
         );
@@ -743,7 +735,7 @@ mod tests {
 
     #[test]
     fn saving_above_a_disabled_patch_diffs_against_only_what_is_below_it() {
-        // 0002 is disabled, so 0003's base is 0001's output alone. A base computed by
+        // b is disabled, so c's base is a's output alone. A base computed by
         // replaying the numbered lines instead would claim the worktree sits on `second`,
         // and the save would rewrite a patch that was never wrong.
         let tmp = tempfile::tempdir().unwrap();
@@ -755,39 +747,35 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(layout.patches_dir()).unwrap();
         std::fs::write(
-            layout.patches_dir().join("0001-a.patch"),
+            layout.patches_dir().join("a.patch"),
             testsupport::patch_one(),
         )
         .unwrap();
         std::fs::write(
-            layout.patches_dir().join("0002-b.patch"),
+            layout.patches_dir().join("b.patch"),
             testsupport::patch_two(),
         )
         .unwrap();
         std::fs::write(
-            layout.patches_dir().join("0003-c.patch"),
+            layout.patches_dir().join("c.patch"),
             testsupport::patch_three(),
         )
         .unwrap();
-        std::fs::write(
-            layout.series_file(),
-            "0001-a.patch\n# 0002-b.patch\n0003-c.patch\n",
-        )
-        .unwrap();
+        std::fs::write(layout.series_file(), "a.patch\n#!b.patch\nc.patch\n").unwrap();
         let entries = layout.project().unwrap().1.entries(&layout).unwrap();
         assert_eq!(
             entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
-            ["0001-a.patch", "0003-c.patch"],
+            ["a.patch", "c.patch"],
             "disabled patches are not positions in the series"
         );
         let plan = crate::session::plan(&layout, "main", &entries[..1], Some(&entries[1])).unwrap();
-        crate::session::materialise(&layout, "0003-c.patch", &plan).unwrap();
-        let before = std::fs::read_to_string(layout.patches_dir().join("0003-c.patch")).unwrap();
+        crate::session::materialise(&layout, "c.patch", &plan).unwrap();
+        let before = std::fs::read_to_string(layout.patches_dir().join("c.patch")).unwrap();
 
-        save(&layout, Some("0003-c.patch"), None, false, false).unwrap();
+        save(&layout, Some("c.patch"), None, false, false).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0003-c.patch")).unwrap(),
+            std::fs::read_to_string(layout.patches_dir().join("c.patch")).unwrap(),
             before,
             "the disabled patch below must not leak into this one's base"
         );
@@ -805,16 +793,16 @@ mod tests {
             "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
         )
         .unwrap();
-        testsupport::write_series(&layout, &[("0001-a.patch", testsupport::patch_one())]);
+        testsupport::write_series(&layout, &[("a.patch", testsupport::patch_one())]);
         let entries = layout.project().unwrap().1.entries(&layout).unwrap();
         let plan = crate::session::plan(&layout, "main", &[], Some(&entries[0])).unwrap();
-        crate::session::materialise(&layout, "0001-a.patch", &plan).unwrap();
+        crate::session::materialise(&layout, "a.patch", &plan).unwrap();
 
-        let dir = layout.work_patch_dir("0001-a.patch").unwrap();
+        let dir = layout.work_patch_dir("a.patch").unwrap();
         std::fs::write(dir.join("f.txt"), "base\n").unwrap();
-        let before = std::fs::read_to_string(layout.patches_dir().join("0001-a.patch")).unwrap();
+        let before = std::fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap();
 
-        let err = save(&layout, Some("0001-a.patch"), None, false, false)
+        let err = save(&layout, Some("a.patch"), None, false, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -822,7 +810,7 @@ mod tests {
             "it should say the change is gone: {err}"
         );
         assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0001-a.patch")).unwrap(),
+            std::fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap(),
             before,
             "the patch must survive"
         );
@@ -837,24 +825,24 @@ mod tests {
             "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
         )
         .unwrap();
-        testsupport::write_series(&layout, &[("0001-a.patch", testsupport::patch_one())]);
+        testsupport::write_series(&layout, &[("a.patch", testsupport::patch_one())]);
         std::fs::create_dir_all(layout.patches_dir()).unwrap();
         let headered = format!(
             "From: Real Person <real@example.com>\nSubject: [PATCH] the real title\n\n---\n\n{}",
             testsupport::patch_two()
         );
-        std::fs::write(layout.patches_dir().join("0002-b.patch"), &headered).unwrap();
-        std::fs::write(layout.series_file(), "0001-a.patch\n0002-b.patch\n").unwrap();
+        std::fs::write(layout.patches_dir().join("b.patch"), &headered).unwrap();
+        std::fs::write(layout.series_file(), "a.patch\nb.patch\n").unwrap();
 
         let entries = layout.project().unwrap().1.entries(&layout).unwrap();
         let plan = crate::session::plan(&layout, "main", &entries[..1], Some(&entries[1])).unwrap();
-        crate::session::materialise(&layout, "0002-b.patch", &plan).unwrap();
+        crate::session::materialise(&layout, "b.patch", &plan).unwrap();
 
-        let dir = layout.work_patch_dir("0002-b.patch").unwrap();
+        let dir = layout.work_patch_dir("b.patch").unwrap();
         std::fs::write(dir.join("f.txt"), "edited\n").unwrap();
-        save(&layout, Some("0002-b.patch"), None, false, false).unwrap();
+        save(&layout, Some("b.patch"), None, false, false).unwrap();
 
-        let patch = std::fs::read_to_string(layout.patches_dir().join("0002-b.patch")).unwrap();
+        let patch = std::fs::read_to_string(layout.patches_dir().join("b.patch")).unwrap();
         assert!(
             patch.contains("Real Person <real@example.com>"),
             "author lost:\n{patch}"
@@ -865,13 +853,13 @@ mod tests {
     #[test]
     fn the_patches_below_moving_under_an_open_session_is_refused() {
         // The drift guard. The session's recorded base names a tree the series produced when
-        // it opened; if 0001 has been rewritten since, that tree is not one the series
+        // it opened; if a.patch has been rewritten since, that tree is not one the series
         // produces any more, and exporting against it would write a patch nobody can rebuild.
         let tmp = tempfile::tempdir().unwrap();
-        let layout = session_on_0002(tmp.path());
-        let before = std::fs::read_to_string(layout.patches_dir().join("0002-b.patch")).unwrap();
+        let layout = session_on_b(tmp.path());
+        let before = std::fs::read_to_string(layout.patches_dir().join("b.patch")).unwrap();
         std::fs::write(
-            layout.patches_dir().join("0001-a.patch"),
+            layout.patches_dir().join("a.patch"),
             "\
 diff --git a/f.txt b/f.txt
 index 1111111..9999999 100644
@@ -884,7 +872,7 @@ index 1111111..9999999 100644
         )
         .unwrap();
 
-        let err = save(&layout, Some("0002-b.patch"), None, false, false)
+        let err = save(&layout, Some("b.patch"), None, false, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -893,7 +881,7 @@ index 1111111..9999999 100644
         );
         assert!(err.contains("--force"), "the way out: {err}");
         assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0002-b.patch")).unwrap(),
+            std::fs::read_to_string(layout.patches_dir().join("b.patch")).unwrap(),
             before,
             "nothing may be written when the base no longer matches"
         );
@@ -902,12 +890,12 @@ index 1111111..9999999 100644
     #[test]
     fn force_exports_against_the_recorded_base_when_the_below_changed() {
         // The informed override: save what the worktree holds against the base the work area
-        // recorded. `check` reports the inconsistency below; `edit-save` does not pretend it
+        // recorded. `check` reports the inconsistency below; `save` does not pretend it
         // away and does not refuse to let the user finish.
         let tmp = tempfile::tempdir().unwrap();
-        let layout = session_on_0002(tmp.path());
+        let layout = session_on_b(tmp.path());
         std::fs::write(
-            layout.patches_dir().join("0001-a.patch"),
+            layout.patches_dir().join("a.patch"),
             "\
 diff --git a/f.txt b/f.txt
 index 1111111..9999999 100644
@@ -920,9 +908,9 @@ index 1111111..9999999 100644
         )
         .unwrap();
 
-        save(&layout, Some("0002-b.patch"), None, false, true).unwrap();
+        save(&layout, Some("b.patch"), None, false, true).unwrap();
 
-        let patch = std::fs::read_to_string(layout.patches_dir().join("0002-b.patch")).unwrap();
+        let patch = std::fs::read_to_string(layout.patches_dir().join("b.patch")).unwrap();
         assert!(
             patch.contains("+second"),
             "the worktree's own content, measured against the recorded base:\n{patch}"
@@ -931,5 +919,89 @@ index 1111111..9999999 100644
             !patch.contains("uno"),
             "the changed patch below must not be folded in:\n{patch}"
         );
+    }
+
+    /// A session on a tree that has files in subdirectories, with no patches below it: what
+    /// `patch new` leaves behind on a real project.
+    fn session_with_directories(root: &std::path::Path) -> Layout {
+        let (layout, _sha) = testsupport::mirror_with_directories(root);
+        std::fs::write(
+            layout.config_file(),
+            "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
+        )
+        .unwrap();
+        testsupport::write_series(&layout, &[("p1.patch", "")]);
+        let plan = crate::session::plan(&layout, "main", &[], None).unwrap();
+        crate::session::materialise(&layout, "p1.patch", &plan).unwrap();
+        layout
+    }
+
+    #[test]
+    fn a_materialised_worktree_is_clean() {
+        // The state every save is computed from. A worktree that starts with staged changes
+        // is a diff waiting to invent deletions the author never made, and no assertion on
+        // the exported patch can see where the extra sections came from.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = session_with_directories(tmp.path());
+        let dir = layout.work_patch_dir("p1.patch").unwrap();
+
+        let repo = git2::Repository::open(&dir).unwrap();
+        let statuses = repo
+            .statuses(Some(
+                git2::StatusOptions::new()
+                    .include_untracked(true)
+                    .recurse_untracked_dirs(true),
+            ))
+            .unwrap();
+        let listed: Vec<String> = statuses
+            .iter()
+            .map(|s| format!("{} {:?}", s.path().unwrap_or("<none>"), s.status()))
+            .collect();
+        assert!(
+            listed.is_empty(),
+            "a fresh worktree must hold no changes at all, got: {listed:?}"
+        );
+    }
+
+    #[test]
+    fn saving_an_edit_touches_only_the_edited_file() {
+        // The whole point of the export: one file edited, one file in the patch. A tree with
+        // subdirectories is what makes this able to fail; against a root-only tree the count
+        // is one no matter what the diff does.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = session_with_directories(tmp.path());
+
+        let dir = layout.work_patch_dir("p1.patch").unwrap();
+        let f = dir.join("f.txt");
+        let mut text = std::fs::read_to_string(&f).unwrap();
+        text.push_str("// edit1\n");
+        std::fs::write(&f, text).unwrap();
+
+        save(&layout, Some("p1.patch"), None, false, false).unwrap();
+
+        let patch = std::fs::read_to_string(layout.patches_dir().join("p1.patch")).unwrap();
+        assert_eq!(
+            patch.matches("diff --git").count(),
+            1,
+            "one file was edited, so one file may change:\n{patch}"
+        );
+        assert!(
+            patch.contains("f.txt"),
+            "the edited file is missing:\n{patch}"
+        );
+        assert!(
+            !patch.contains("src/a.c"),
+            "an untouched file leaked into the patch:\n{patch}"
+        );
+        assert!(
+            !patch.contains("docs/readme.md"),
+            "an untouched file leaked into the patch:\n{patch}"
+        );
+
+        // And the series it produces applies, which is the property that matters.
+        let repo = mirror_repo(&layout);
+        let entries = layout.project().unwrap().1.entries(&layout).unwrap();
+        let report = crate::check::check_series(&repo, "main", &entries).unwrap();
+        assert!(report.ok, "{}", report.summary());
     }
 }

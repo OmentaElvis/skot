@@ -6,7 +6,7 @@
 //! honest implementation of "undo the top patch" is "rebuild the tree the rest of the set
 //! produces", which libgit2 does in one call and cannot get wrong.
 //!
-//! That is also why `pop` takes a patch *name*, cut quilt-style: popping 0002 takes 0002
+//! That is also why `pop` takes a patch *name*, cut quilt-style: popping b takes b
 //! and everything enabled after it, since those stand on it. Turning exactly one patch off
 //! while keeping the set above it whole is a different question; it is a matter of the
 //! enabled set, and [`super::disable`] answers it. See [`authoring::resolve_stack`].
@@ -193,22 +193,18 @@ mod tests {
         let (_tmp, layout) = testsupport::project();
         testsupport::write_series(
             &layout,
-            &[
-                ("0001-a.patch", ""),
-                ("0002-b.patch", ""),
-                ("0003-c.patch", ""),
-            ],
+            &[("a.patch", ""), ("b.patch", ""), ("c.patch", "")],
         );
         let series = layout.project().unwrap().1;
 
         let names = stack_names(
             &layout,
             &series,
-            &state_of(&layout, &["0001-a.patch", "0002-b.patch"]),
+            &state_of(&layout, &["a.patch", "b.patch"]),
             None,
         )
         .unwrap();
-        assert_eq!(names, vec!["0001-a.patch"]);
+        assert_eq!(names, vec!["a.patch"]);
     }
 
     #[test]
@@ -216,72 +212,59 @@ mod tests {
         let (_tmp, layout) = testsupport::project();
         testsupport::write_series(
             &layout,
-            &[
-                ("0001-a.patch", ""),
-                ("0002-b.patch", ""),
-                ("0003-c.patch", ""),
-            ],
+            &[("a.patch", ""), ("b.patch", ""), ("c.patch", "")],
         );
         let series = layout.project().unwrap().1;
 
         let names = stack_names(
             &layout,
             &series,
-            &state_of(&layout, &["0001-a.patch", "0003-c.patch"]),
+            &state_of(&layout, &["a.patch", "c.patch"]),
             None,
         )
         .unwrap();
-        assert_eq!(names, vec!["0001-a.patch"]);
+        assert_eq!(names, vec!["a.patch"]);
     }
 
     #[test]
     fn popping_a_named_patch_also_takes_what_was_enabled_after_it() {
-        // Quilt direction: 0002 and 0003 were enabled together after 0001, so turning
-        // 0002 off takes 0003 with it rather than leaving it standing on a patch that
+        // Quilt direction: b and c were enabled together after a, so turning b off takes c
+        // with it rather than leaving it standing on a patch that
         // is no longer there.
         let (_tmp, layout) = testsupport::project();
         testsupport::write_series(
             &layout,
-            &[
-                ("0001-a.patch", ""),
-                ("0002-b.patch", ""),
-                ("0003-c.patch", ""),
-            ],
+            &[("a.patch", ""), ("b.patch", ""), ("c.patch", "")],
         );
         let series = layout.project().unwrap().1;
 
         let names = stack_names(
             &layout,
             &series,
-            &state_of(&layout, &["0001-a.patch", "0002-b.patch", "0003-c.patch"]),
-            Some("0002-b.patch"),
+            &state_of(&layout, &["a.patch", "b.patch", "c.patch"]),
+            Some("b.patch"),
         )
         .unwrap();
-        assert_eq!(names, vec!["0001-a.patch"]);
+        assert_eq!(names, vec!["a.patch"]);
     }
 
     #[test]
     fn popping_from_one_patch_leaves_nothing_applied() {
         let (_tmp, layout) = testsupport::project();
-        testsupport::write_series(&layout, &[("0001-a.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", "")]);
         let series = layout.project().unwrap().1;
 
         assert!(
-            stack_names(
-                &layout,
-                &series,
-                &state_of(&layout, &["0001-a.patch"]),
-                None
-            )
-            .unwrap()
-            .is_empty()
+            stack_names(&layout, &series, &state_of(&layout, &["a.patch"]), None)
+                .unwrap()
+                .is_empty()
         );
     }
 
     #[test]
     fn popping_from_an_empty_stack_says_so() {
         let (_tmp, layout) = testsupport::project();
-        testsupport::write_series(&layout, &[("0001-a.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", "")]);
         let series = layout.project().unwrap().1;
 
         let err = stack_names(&layout, &series, &State::default(), None)
@@ -293,15 +276,15 @@ mod tests {
     #[test]
     fn popping_the_bottom_patch_empties_the_stack() {
         let (_tmp, layout) = testsupport::project();
-        testsupport::write_series(&layout, &[("0001-a.patch", ""), ("0002-b.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", ""), ("b.patch", "")]);
         let series = layout.project().unwrap().1;
 
         assert!(
             stack_names(
                 &layout,
                 &series,
-                &state_of(&layout, &["0001-a.patch", "0002-b.patch"]),
-                Some("0001-a.patch")
+                &state_of(&layout, &["a.patch", "b.patch"]),
+                Some("a.patch")
             )
             .unwrap()
             .is_empty(),
@@ -312,18 +295,18 @@ mod tests {
     #[test]
     fn popping_something_not_applied_is_refused() {
         let (_tmp, layout) = testsupport::project();
-        testsupport::write_series(&layout, &[("0001-a.patch", ""), ("0002-b.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", ""), ("b.patch", "")]);
         let series = layout.project().unwrap().1;
 
         let err = stack_names(
             &layout,
             &series,
-            &state_of(&layout, &["0001-a.patch"]),
-            Some("0002-b.patch"),
+            &state_of(&layout, &["a.patch"]),
+            Some("b.patch"),
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("0002-b.patch"), "got {err}");
+        assert!(err.contains("b.patch"), "got {err}");
     }
 
     #[test]
@@ -337,7 +320,7 @@ mod tests {
             layout.series().to_owned(),
             crate::state::SandboxState {
                 ref_name: Some("main".to_owned()),
-                applied: vec!["0001-a.patch".to_owned()],
+                applied: vec!["a.patch".to_owned()],
                 ..Default::default()
             },
         );

@@ -23,9 +23,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ui::Styled;
 
-/// Width of the command column: wide enough for `skot patch edit-save <name>`, the longest
-/// entry today, so every description starts in the same place and the block reads as pairs
-/// rather than as prose.
+/// Width of the command column: wide enough for the longest command row, so every
+/// description starts in the same place and the block reads as pairs rather than prose.
 const CMD: usize = 25;
 
 static ENABLED: AtomicBool = AtomicBool::new(true);

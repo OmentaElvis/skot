@@ -207,30 +207,6 @@ impl State {
         self.save(layout)
     }
 
-    /// Follow patches through a renumbering: the applied set keeps pointing at the same
-    /// files after [`crate::series::Series::insert_renumbering`] renames them.
-    ///
-    /// Only this layout's own record is touched. A renumbering renames files in the
-    /// active series, so a shared sandbox held by a *different* series has nothing in
-    /// it that the rename refers to.
-    pub fn follow_renames(&mut self, layout: &Layout, renames: &[(String, String)]) -> Result<()> {
-        let mut moved = false;
-        if let Some(record) = self.sandboxes.get_mut(layout.series()) {
-            for (old, new) in renames {
-                for name in &mut record.applied {
-                    if name == old {
-                        *name = new.clone();
-                        moved = true;
-                    }
-                }
-            }
-        }
-        if moved {
-            self.save(layout)?;
-        }
-        Ok(())
-    }
-
     /// A one-line description of an interrupted run, if there was one.
     pub fn interrupted(&self) -> Option<String> {
         let phase = self.in_flight?;
@@ -275,7 +251,7 @@ mod tests {
         let (_tmp, l) = layout();
         let mut s = State::default();
         s.set_ref(&l, "v1.2.3", "abc123").unwrap();
-        s.set_applied(&l, vec!["0001-a.patch".into()]).unwrap();
+        s.set_applied(&l, vec!["a.patch".into()]).unwrap();
 
         assert_eq!(State::load(&l).unwrap(), s);
     }
@@ -284,7 +260,7 @@ mod tests {
     fn clearing_the_applied_series_forgets_it() {
         let (_tmp, l) = layout();
         let mut s = State::default();
-        s.set_applied(&l, vec!["0001-a.patch".into()]).unwrap();
+        s.set_applied(&l, vec!["a.patch".into()]).unwrap();
         s.set_ref(&l, "main", "abc123").unwrap();
 
         s.clear_applied(&l).unwrap();
@@ -357,16 +333,16 @@ mod tests {
         let (_tmp, l) = layout();
         let mut s = State::default();
         s.set_ref(&l, "main", "aaa").unwrap();
-        s.set_applied(&l, vec!["0001-a.patch".into()]).unwrap();
+        s.set_applied(&l, vec!["a.patch".into()]).unwrap();
         assert_eq!(s.sandbox_holder(&l), Some("default"));
 
         let b = l.with_series("b").unwrap();
         s.set_ref(&b, "v2", "bbb").unwrap();
-        s.set_applied(&b, vec!["0001-x.patch".into()]).unwrap();
+        s.set_applied(&b, vec!["x.patch".into()]).unwrap();
 
         assert_eq!(s.sandboxes.len(), 1, "shared mode holds one record");
         assert_eq!(s.sandbox_holder(&b), Some("b"));
-        assert_eq!(s.applied(&b), ["0001-x.patch"]);
+        assert_eq!(s.applied(&b), ["x.patch"]);
         // The old series no longer sees a sandbox through its own layout: the record
         // belongs to the holder, which the shared view still reports.
         assert_eq!(s.sandbox_holder(&l), Some("b"));
@@ -380,13 +356,13 @@ mod tests {
 
         let mut s = State::load(&a).unwrap();
         s.set_ref(&a, "main", "aaa").unwrap();
-        s.set_applied(&a, vec!["0001-a.patch".into()]).unwrap();
+        s.set_applied(&a, vec!["a.patch".into()]).unwrap();
         s.set_ref(&b, "v2", "bbb").unwrap();
-        s.set_applied(&b, vec!["0001-b.patch".into()]).unwrap();
+        s.set_applied(&b, vec!["b.patch".into()]).unwrap();
 
         assert_eq!(s.sandboxes.len(), 2);
-        assert_eq!(s.applied(&a), ["0001-a.patch"]);
-        assert_eq!(s.applied(&b), ["0001-b.patch"]);
+        assert_eq!(s.applied(&a), ["a.patch"]);
+        assert_eq!(s.applied(&b), ["b.patch"]);
         assert_eq!(s.sandbox_holder(&a), Some("default"));
         assert_eq!(s.sandbox_holder(&b), Some("b"));
         // A series with no sandbox sees none, even though others have one.
@@ -403,7 +379,7 @@ mod tests {
         let (_tmp, l) = layout();
         let mut s = State::default();
         s.set_ref(&l, "main", "aaa").unwrap();
-        s.set_applied(&l, vec!["0001-a.patch".into()]).unwrap();
+        s.set_applied(&l, vec!["a.patch".into()]).unwrap();
         s.set_active_series(&l, "default").unwrap();
 
         let per = l.with_per_series_sandbox(true);
@@ -415,25 +391,5 @@ mod tests {
             "the pointer is a project fact, not a sandbox fact"
         );
         assert_eq!(reloaded.in_flight, s.in_flight);
-    }
-
-    #[test]
-    fn renames_follow_the_active_series_record_only() {
-        let (_tmp, l) = layout();
-        let mut s = State::default();
-        s.set_applied(&l, vec!["0001-a.patch".into(), "0002-b.patch".into()])
-            .unwrap();
-
-        s.follow_renames(
-            &l,
-            &[("0001-a.patch".to_owned(), "0001-renamed.patch".to_owned())],
-        )
-        .unwrap();
-
-        assert_eq!(
-            s.applied(&l),
-            ["0001-renamed.patch", "0002-b.patch"],
-            "the record must follow the files it names"
-        );
     }
 }

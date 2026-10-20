@@ -146,7 +146,7 @@ pub fn run(ctx: &Ctx, args: &CleanArgs) -> Result<Exit> {
             open.len(),
             open.join(", "),
             skot_args("clean", "--sessions"),
-            skot_args("edit-save", "<patch>"),
+            skot_args("save", "<patch>"),
         );
     }
 
@@ -177,7 +177,7 @@ pub fn run(ctx: &Ctx, args: &CleanArgs) -> Result<Exit> {
                 "Keeping {} work area(s) with unsaved changes: {}. `{}` saves them.",
                 open.len(),
                 open.join(", "),
-                skot_args("edit-save", "<patch>")
+                skot_args("save", "<patch>")
             ));
         }
         return Ok(Exit::Success);
@@ -350,7 +350,7 @@ mod tests {
         std::fs::create_dir_all(l.sandbox_dir()).unwrap();
         std::fs::create_dir_all(l.mirror_dir()).unwrap();
         std::fs::create_dir_all(l.patches_dir()).unwrap();
-        std::fs::write(l.series_file(), "0001-a.patch\n").unwrap();
+        std::fs::write(l.series_file(), "a.patch\n").unwrap();
 
         for level in [
             CleanLevel::Sandbox,
@@ -462,8 +462,8 @@ mod tests {
         crate::commands::testsupport::write_series(
             &l,
             &[
-                ("0001-a.patch", crate::commands::testsupport::patch_one()),
-                ("0002-b.patch", crate::commands::testsupport::patch_two()),
+                ("a.patch", crate::commands::testsupport::patch_one()),
+                ("b.patch", crate::commands::testsupport::patch_two()),
             ],
         );
         let entries = l.project().unwrap().1.entries(&l).unwrap();
@@ -516,16 +516,16 @@ mod tests {
         .unwrap();
         crate::commands::testsupport::write_series(
             &l,
-            &[("0001-a.patch", crate::commands::testsupport::patch_one())],
+            &[("a.patch", crate::commands::testsupport::patch_one())],
         );
         let entries = l.project().unwrap().1.entries(&l).unwrap();
         let plan = session::plan(&l, "main", &[], Some(&entries[0])).unwrap();
-        session::materialise(&l, "0001-a.patch", &plan).unwrap();
+        session::materialise(&l, "a.patch", &plan).unwrap();
 
         let plan = Plan::for_level(&l, CleanLevel::Sandbox, false);
 
         assert!(
-            plan.paths.iter().any(|(n, _)| n == "0001-a.patch (saved)"),
+            plan.paths.iter().any(|(n, _)| n == "a.patch (saved)"),
             "a saved work area is derived state: {plan:?}"
         );
         assert!(plan.sessions.is_empty(), "and is not an unsaved complaint");
@@ -534,7 +534,7 @@ mod tests {
             remove_one(&l, label, path).unwrap();
         }
         assert!(
-            !l.work_patch_dir("0001-a.patch").unwrap().exists(),
+            !l.work_patch_dir("a.patch").unwrap().exists(),
             "the work area is gone"
         );
         assert!(
@@ -553,7 +553,7 @@ mod tests {
 
         assert_eq!(
             plan.sessions,
-            ["0001-a.patch", "0002-b.patch"],
+            ["a.patch", "b.patch"],
             "both work areas with unsaved changes are named"
         );
         assert!(plan.paths.iter().any(|(n, _)| n == "work areas"));
@@ -601,7 +601,7 @@ mod tests {
             "a sandbox-level clean never touches the mirror"
         );
         let repo = git2::Repository::open_bare(l.mirror_dir()).unwrap();
-        for name in ["0001-a.patch", "0002-b.patch"] {
+        for name in ["a.patch", "b.patch"] {
             assert!(
                 repo.find_worktree(name).is_err(),
                 "{name}'s registration outlived the clean"
@@ -626,10 +626,10 @@ mod tests {
         let err = run(&ctx, &args).unwrap_err().to_string();
 
         assert!(err.contains("orphan"), "it should say why: {err}");
-        assert!(err.contains("0001-a.patch"), "it should name them: {err}");
+        assert!(err.contains("a.patch"), "it should name them: {err}");
         assert!(err.contains(&skot_args("clean", "--sessions")), "{err}");
         assert!(
-            err.contains(&skot_args("edit-save", "<patch>")),
+            err.contains(&skot_args("save", "<patch>")),
             "it should say how to save them: {err}"
         );
         assert!(

@@ -1,13 +1,19 @@
 //! The series: the ordered list of patches, and the single source of truth for what
 //! gets applied.
 //!
-//! The format is quilt's, deliberately: one patch filename per line, `#` starts a
-//! comment, blank lines are ignored. Unrecognised lines are preserved byte-for-byte
-//! so that saving a series with one new entry produces a one-line diff.
+//! The format is one entry per line. A line that names a patch is that patch enabled,
+//! a line starting `#!` is that patch disabled, `#` starts a comment, and a blank line
+//! is ignored. Everything else is preserved byte-for-byte so that saving a series with
+//! one new entry produces a one-line diff.
+//!
+//! A line says what it is: parsing looks at the line alone and never at the directory,
+//! so what a line means cannot change underfoot. Order lives here and nowhere else, and
+//! a name identifies a patch without saying anything about where it sits. A name is
+//! chosen once, when the patch is created, and skot never rewrites one because
+//! something moved. Reordering is therefore a change to this file alone, and the order
+//! this file lists is the order `apply` follows.
 
 use std::path::{Path, PathBuf};
-
-use anyhow::Context as _;
 
 use crate::layout::Layout;
 
@@ -42,8 +48,6 @@ pub enum SeriesError {
         line: usize,
         name: String,
     },
-    #[error("{}: `{}` already exists and is not in the series.\nPick another name, or `{}` if you think it is stale", .path.display(), .name, crate::invocation::skot("clean"))]
-    OccupiedTarget { path: PathBuf, name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,22 +168,20 @@ impl Series {
         self.len() == 0
     }
 
-    /// The disabled patches: comment lines of the exact form `# <name>` whose file
-    /// still exists in `patches/`.
+    /// The disabled patches: `#!` lines, in the order they sit in the file.
     ///
-    /// The file-existence check is what keeps prose out: a comment that merely mentions
-    /// a patch ("# fix this one someday") is not the bare name of a file that is there,
-    /// so it can never be enabled by accident.
-    pub fn disabled(&self, layout: &Layout) -> Vec<String> {
-        self.disabled_lines(layout)
+    /// This reads the lines and nothing else. A patch whose file is missing is still
+    /// listed here, because whether its line is disabled is a fact about the line; what
+    /// is missing is caught when the series is resolved to paths.
+    pub fn disabled(&self) -> Vec<String> {
+        self.disabled_lines()
             .into_iter()
             .map(|(_, name)| name)
             .collect()
     }
 
-    /// The disabled patches with their 1-based line numbers, so a listing can put them
-    /// back where they sit in the file.
-    pub fn disabled_lines(&self, layout: &Layout) -> Vec<(usize, String)> {
+    /// The disabled patches with their 1-based line numbers.
+    pub fn disabled_lines(&self) -> Vec<(usize, String)> {
         self.lines
             .iter()
             .enumerate()
@@ -187,16 +189,14 @@ impl Series {
                 if l.entry.is_some() {
                     return None;
                 }
-                let rest = l.raw.trim_start().strip_prefix('#')?.trim();
-                resolve(layout, rest)
-                    .is_file()
-                    .then(|| (i + 1, rest.to_owned()))
+                let rest = l.raw.trim_start().strip_prefix("#!")?.trim();
+                (!rest.is_empty()).then(|| (i + 1, rest.to_owned()))
             })
             .collect()
     }
 
-    /// Comment an entry's line out: enabled to disabled, in place. Returns false when
-    /// the name is not an entry (already disabled, or never listed).
+    /// Mark an entry disabled, in place. Returns false when the name is not an entry
+    /// (already disabled, or never listed).
     pub fn disable(&mut self, name: &str) -> bool {
         let Some(line) = self
             .lines
@@ -206,18 +206,15 @@ impl Series {
             return false;
         };
         line.entry = None;
-        line.raw = format!("# {name}");
+        line.raw = format!("#!{name}");
         true
     }
 
-    /// Uncomment a disabled line: disabled to enabled, in place. Returns false when the
-    /// name is not a disabled line or its file is gone.
-    pub fn enable(&mut self, layout: &Layout, name: &str) -> bool {
-        if !resolve(layout, name).is_file() {
-            return false;
-        }
+    /// Mark a disabled patch enabled, in place. Returns false when the name is not a
+    /// disabled line.
+    pub fn enable(&mut self, name: &str) -> bool {
         let Some(line) = self.lines.iter_mut().find(|l| {
-            l.entry.is_none() && l.raw.trim_start().strip_prefix('#').map(str::trim) == Some(name)
+            l.entry.is_none() && l.raw.trim_start().strip_prefix("#!").map(str::trim) == Some(name)
         }) else {
             return false;
         };
@@ -226,11 +223,11 @@ impl Series {
         true
     }
 
-    /// Remove a disabled line entirely. No renumbering: a disabled patch never held a
-    /// number. Returns false when the name is not a disabled line.
+    /// Remove a disabled line entirely. Returns false when the name is not a disabled
+    /// line.
     pub fn remove_disabled(&mut self, name: &str) -> bool {
         let Some(index) = self.lines.iter().position(|l| {
-            l.entry.is_none() && l.raw.trim_start().strip_prefix('#').map(str::trim) == Some(name)
+            l.entry.is_none() && l.raw.trim_start().strip_prefix("#!").map(str::trim) == Some(name)
         }) else {
             return false;
         };
@@ -238,7 +235,7 @@ impl Series {
         true
     }
 
-    /// Remove a disabled patch: its commented line and its file. The caller saves.
+    /// Remove a disabled patch: its `#!` line and its file. The caller saves.
     pub fn drop_disabled(&mut self, layout: &Layout, name: &str) -> Option<FileGone> {
         if !self.remove_disabled(name) {
             return None;
@@ -251,126 +248,14 @@ impl Series {
         })
     }
 
-    /// True when the name is a comment line of the disabled-patch form, file or not:
-    /// [`Series::disable`]'s write, recognisable even after a delete takes the file away.
-    pub fn has_disabled_line(&self, name: &str) -> bool {
-        self.lines.iter().any(|l| {
-            l.entry.is_none() && l.raw.trim_start().strip_prefix('#').map(str::trim) == Some(name)
-        })
-    }
-
-    /// Insert `name` at `index`, 0-based, and renumber everything after it so the numbers
-    /// stay contiguous: lexical order *is* application order, and an insertion renames the
-    /// tail rather than leaving a gap where the numbers from `index` onwards used to sit
-    /// (`0001 0002 0004` becoming `0001 0003-x 0004`).
+    /// Remove the entry `name` and the file it names, leaving every other patch where it is.
     ///
-    /// Returns the new entry's 1-based line and the tail renames, already applied to the
-    /// series and to the files on disk (highest position first, so a chain like
-    /// `0001-a`/`0002-a` never clobbers a file that is about to move). The caller writes
-    /// `name`'s own file afterwards; it does not exist yet. Refuses any target name an
-    /// out-of-series file occupies, and a name already in the series.
-    pub fn insert_renumbering(
-        &mut self,
-        layout: &Layout,
-        name: &str,
-        index: usize,
-    ) -> anyhow::Result<(usize, Vec<(String, String)>)> {
-        let old: Vec<String> = self.names().into_iter().map(String::from).collect();
-        let at = index.min(old.len());
-
-        // Refusals that `insert` would also make, moved ahead of the renames: renaming the
-        // tail and *then* refusing the new name would leave the files out of step with the
-        // series. (A duplicate would be a tail file about to be renamed, which is exactly
-        // the case the move protects.)
-        if name.contains(['\n', '\r']) {
-            return Err(SeriesError::InvalidName {
-                series: self.path.clone(),
-                line: self.lines.len() + 1,
-                name: name.to_owned(),
-            }
-            .into());
-        }
-        if let Some(existing) = old.iter().position(|o| o == name) {
-            return Err(SeriesError::Duplicate {
-                series: self.path.clone(),
-                line: existing + 1,
-                name: name.to_owned(),
-            }
-            .into());
-        }
-
-        let mut renames = Vec::new();
-        for (offset, old_name) in old[at..].iter().enumerate() {
-            let new_name = renumbered(old_name, at + offset + 2);
-            if &new_name != old_name {
-                renames.push((old_name.clone(), new_name));
-            }
-        }
-
-        // Everything else is checked before anything moves: a *rename* target an
-        // out-of-series file occupies is refused rather than overwritten, and one that
-        // belongs to a tail entry about to be renamed is fine because those are freed
-        // first. The new name's own file is the caller's to write (or, for `edit-save`,
-        // already written), so guarding it lives with the caller.
-        let source_names: Vec<&str> = old[at..].iter().map(String::as_str).collect();
-        for (_, new_name) in &renames {
-            let path = resolve(layout, new_name);
-            if path.exists() && !source_names.contains(&new_name.as_str()) {
-                return Err(SeriesError::OccupiedTarget {
-                    path,
-                    name: new_name.clone(),
-                }
-                .into());
-            }
-        }
-
-        // Descending: the highest tail entry takes its new number first, freeing its old
-        // name for the entry below it.
-        for (old_name, new_name) in renames.iter().rev() {
-            let from = resolve(layout, old_name);
-            let to = resolve(layout, new_name);
-            std::fs::rename(&from, &to).context(format!(
-                "renaming {} to {}",
-                from.display(),
-                to.display()
-            ))?;
-        }
-
-        let line = self.insert(name, at)?;
-        // By position, not by name: a sequential name lookup would find the entry the
-        // previous rename just produced instead of the one this rename means. The tail is
-        // walked the same way the rename plan was, so positions line up even where a
-        // rename was skipped as a no-op.
-        let entry_lines: Vec<usize> = self
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.entry.is_some())
-            .map(|(i, _)| i)
-            .collect();
-        for (offset, old_name) in old[at..].iter().enumerate() {
-            let new_name = renumbered(old_name, at + offset + 2);
-            if &new_name != old_name {
-                let l = &mut self.lines[entry_lines[at + 1 + offset]];
-                l.entry = Some(new_name.clone());
-                l.raw = new_name.clone();
-            }
-        }
-        Ok((line, renames))
-    }
-
-    /// Remove the entry `name`, renumbering the tail down so the numbers stay contiguous,
-    /// and move the tail's files with their new names (lowest first: the removed patch's
-    /// number is free the moment its file is gone, and each later rename frees its old
-    /// name for the next).
-    ///
-    /// Returns the entry's 1-based position, the renames (already applied to the series
-    /// and to the files on disk), and what became of the removed patch's own file. The
-    /// file goes first and the series line last, so an interrupted remove leaves a
-    /// missing file that `status` reports and a rerun can finish, rather than a series
-    /// line that names nothing. Refuses any rename target an out-of-series file occupies
-    /// before anything is renamed, and never overwrites the file the layout guard spared.
-    pub fn remove_renumbering(&mut self, layout: &Layout, name: &str) -> anyhow::Result<Removal> {
+    /// Returns the entry's 1-based position and what became of its file. The file goes
+    /// first and the series line last, so an interrupted remove leaves a missing file that
+    /// `status` reports and a rerun can finish, rather than a series line that names
+    /// nothing. Nothing else in the series is read or written: the names around it are
+    /// its own and stay that way.
+    pub fn remove_entry(&mut self, layout: &Layout, name: &str) -> anyhow::Result<Removal> {
         let old: Vec<String> = self.names().into_iter().map(String::from).collect();
         let Some(index) = old.iter().position(|o| o == name) else {
             anyhow::bail!(
@@ -383,117 +268,26 @@ impl Series {
             );
         };
 
-        // The tail fills the hole, numbered past the highest number below the removal
-        // point. Taking the start from the prefix rather than from the position means a
-        // series that already has a gap under where the removal lands still cannot have
-        // the tail's new numbers collide with a prefix entry.
-        let start = old[..index]
-            .iter()
-            .filter_map(|n| leading_number(n))
-            .max()
-            .map_or(1, |highest| highest + 1);
-        let mut renames = Vec::new();
-        for (offset, old_name) in old[index + 1..].iter().enumerate() {
-            let new_name = renumbered(old_name, start + offset);
-            if &new_name != old_name {
-                renames.push((old_name.clone(), new_name));
-            }
-        }
-
-        // Everything is checked before anything moves. The removed patch's own path is
-        // excluded: its slot is the one the tail is moving into, and the file is about to
-        // go (or already has). A prefix file, a stray, or any other out-of-series
-        // occupant of a target is refused instead of overwritten.
         let removed_path = resolve(layout, name);
-        let source_names: Vec<&str> = old[index + 1..].iter().map(String::as_str).collect();
-        for (_, new_name) in &renames {
-            let path = resolve(layout, new_name);
-            if path.exists() && path != removed_path && !source_names.contains(&new_name.as_str()) {
-                return Err(SeriesError::OccupiedTarget {
-                    path,
-                    name: new_name.clone(),
-                }
-                .into());
-            }
-        }
-
-        // The file first: a rename may be aiming at its number, and a file the guard
-        // spares (outside the layout) must not be overwritten by that rename later.
         let file = match layout.guarded_remove(&removed_path) {
             Ok(true) => FileGone::Deleted,
             Ok(false) => FileGone::Missing,
-            Err(_) => FileGone::Kept(removed_path.clone()),
+            Err(_) => FileGone::Kept(removed_path),
         };
-        let spared_taken = match &file {
-            FileGone::Kept(_) => renames
-                .iter()
-                .find(|(_, new_name)| resolve(layout, new_name) == removed_path),
-            _ => None,
-        };
-        if let Some((_, taken)) = spared_taken {
-            return Err(SeriesError::OccupiedTarget {
-                path: removed_path,
-                name: taken.clone(),
-            }
-            .into());
-        }
-
-        // Ascending: the lowest tail entry takes the slot the removed file just freed,
-        // and every later rename lands in the slot the previous one freed.
-        for (old_name, new_name) in &renames {
-            let from = resolve(layout, old_name);
-            let to = resolve(layout, new_name);
-            std::fs::rename(&from, &to).context(format!(
-                "renaming {} to {}",
-                from.display(),
-                to.display()
-            ))?;
-        }
 
         let position = index + 1;
         self.remove(name).expect("the entry was resolved above");
-        // By position, not by name, and counted after the removal shifted the tail down:
-        // a sequential name lookup would find the entry a rename just produced, and the
-        // rename plan skips no-ops, so the tail is walked the same way it was planned.
-        let entry_lines: Vec<usize> = self
-            .lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.entry.is_some())
-            .map(|(i, _)| i)
-            .collect();
-        for (offset, old_name) in old[index + 1..].iter().enumerate() {
-            let new_name = renumbered(old_name, start + offset);
-            if &new_name != old_name {
-                let l = &mut self.lines[entry_lines[index + offset]];
-                l.entry = Some(new_name.clone());
-                l.raw = new_name.clone();
-            }
-        }
-        Ok(Removal {
-            position,
-            renames,
-            file,
-        })
+        Ok(Removal { position, file })
     }
 
-    /// Move `name` so that it becomes the `to`th entry, 0-based, renumbering the entries
-    /// it passes so the numbers stay contiguous: lexical order *is* application order,
-    /// and a move is a rotation of the entries between the two positions.
+    /// Move `name` so that it becomes the `to`th entry, 0-based.
     ///
-    /// Returns the 0-based positions and the renames, already applied to the series and
-    /// to the files on disk. The count does not change, so every name in the rotated
-    /// range is taken: the moved patch's file steps through a temporary name beside
-    /// itself first, which is the one free slot the rotation needs. A leftover temporary
-    /// is refused rather than overwritten, since it means an earlier move was
-    /// interrupted. Refuses any rename target an out-of-series file occupies before
-    /// anything is renamed.
-    pub fn move_renumbering(
-        &mut self,
-        layout: &Layout,
-        name: &str,
-        to: usize,
-    ) -> anyhow::Result<Moved> {
+    /// The series is the order: this moves the patch's line and nothing else. The patch
+    /// keeps the name it was created with, no file under `patches/` is read or written,
+    /// and entries outside the two positions are not visited at all. Returns the 0-based
+    /// positions and the range the move touches, each entry with the position it holds
+    /// afterwards, for a caller that wants to show the result.
+    pub fn reorder(&mut self, name: &str, to: usize) -> anyhow::Result<Moved> {
         let old: Vec<String> = self.names().into_iter().map(String::from).collect();
         let Some(from) = old.iter().position(|o| o == name) else {
             anyhow::bail!(
@@ -513,132 +307,50 @@ impl Series {
                 old.len()
             );
         }
+        let (lo, hi) = (from.min(to), from.max(to));
         if from == to {
             return Ok(Moved {
                 from,
                 to,
-                renames: Vec::new(),
                 window: Vec::new(),
             });
         }
 
-        // The order after the move, and the range the rotation touches: entries outside
-        // it keep their names, so a hand-numbered series is only renumbered where the
-        // move actually reaches.
-        let mut final_names = old.clone();
-        final_names.remove(from);
-        final_names.insert(to, name.to_owned());
-        let (lo, hi) = (from.min(to), from.max(to));
-
-        let mut renames = Vec::new();
-        let mut window = Vec::new();
-        for (i, entry_name) in final_names.iter().enumerate().take(hi + 1).skip(lo) {
-            let new_name = renumbered(entry_name, i + 1);
-            if new_name != *entry_name {
-                renames.push((entry_name.clone(), new_name.clone()));
-            }
-            window.push((i + 1, new_name));
-        }
-
-        // Checked before anything moves: a rename target an out-of-series file occupies
-        // is refused rather than overwritten. Every source in the range is in the series
-        // (the rotation's own members), so those targets are free the moment their
-        // holder is renamed.
-        let source_names: Vec<&str> = old[lo..=hi].iter().map(String::as_str).collect();
-        for (_, new_name) in &renames {
-            let path = resolve(layout, new_name);
-            if path.exists() && !source_names.contains(&new_name.as_str()) {
-                return Err(SeriesError::OccupiedTarget {
-                    path,
-                    name: new_name.clone(),
-                }
-                .into());
-            }
-        }
-
-        // The moved patch steps aside first: the rotation's cycle needs one free name,
-        // and this is it.
-        let moved_path = resolve(layout, name);
-        let tmp_path = moved_path.with_file_name(format!(
-            ".skot-move-{}",
-            moved_path
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_else(|| name.to_owned())
-        ));
-        if tmp_path.exists() {
-            anyhow::bail!(
-                "{} already exists, which means an earlier move was interrupted.\n\
-                 Delete it and run the move again.",
-                tmp_path.display()
-            );
-        }
-        std::fs::rename(&moved_path, &tmp_path).context(format!(
-            "renaming {} to {}",
-            moved_path.display(),
-            tmp_path.display()
-        ))?;
-
-        // The hole the moved patch left propagates through the range, one step at a
-        // time: downward for a move up, upward for a move down. Each rename lands in the
-        // slot the previous one freed.
-        if to > from {
-            for i in from..to {
-                let src = &old[i + 1];
-                let dst = renumbered(src, i + 1);
-                if &dst != src {
-                    let (from_path, to_path) = (resolve(layout, src), resolve(layout, &dst));
-                    std::fs::rename(&from_path, &to_path).context(format!(
-                        "renaming {} to {}",
-                        from_path.display(),
-                        to_path.display()
-                    ))?;
-                }
-            }
+        // The line goes, then comes back at its new place. Positions count entries and
+        // not lines, so the line index is looked up again after the removal instead of
+        // being carried across it.
+        let from_line = self.entry_line(from);
+        let line = self.lines.remove(from_line);
+        let at = if to < from {
+            self.entry_line(to)
         } else {
-            for i in (to..from).rev() {
-                let src = &old[i];
-                let dst = renumbered(src, i + 2);
-                if &dst != src {
-                    let (from_path, to_path) = (resolve(layout, src), resolve(layout, &dst));
-                    std::fs::rename(&from_path, &to_path).context(format!(
-                        "renaming {} to {}",
-                        from_path.display(),
-                        to_path.display()
-                    ))?;
-                }
-            }
-        }
+            self.entry_line(to - 1) + 1
+        };
+        self.lines.insert(at, line);
 
-        let final_moved = renumbered(name, to + 1);
-        std::fs::rename(&tmp_path, resolve(layout, &final_moved)).context(format!(
-            "renaming {} to {}",
-            tmp_path.display(),
-            resolve(layout, &final_moved).display()
-        ))?;
+        let window = self
+            .names()
+            .iter()
+            .enumerate()
+            .skip(lo)
+            .take(hi - lo + 1)
+            .map(|(i, n)| (i + 1, (*n).to_owned()))
+            .collect();
+        Ok(Moved { from, to, window })
+    }
 
-        // The count never changed, so the entry lines sit where they did; only their
-        // names move within the range.
-        let entry_lines: Vec<usize> = self
-            .lines
+    /// The line index of the entry at position `entry_index`.
+    ///
+    /// Comments and blank lines take lines of their own, so an entry's position in the
+    /// series and its line in the file are two different numbers.
+    fn entry_line(&self, entry_index: usize) -> usize {
+        self.lines
             .iter()
             .enumerate()
             .filter(|(_, l)| l.entry.is_some())
+            .nth(entry_index)
             .map(|(i, _)| i)
-            .collect();
-        for i in lo..=hi {
-            let new_name = renumbered(&final_names[i], i + 1);
-            let l = &mut self.lines[entry_lines[i]];
-            l.entry = Some(new_name.clone());
-            l.raw = new_name.clone();
-        }
-
-        Ok(Moved {
-            from,
-            to,
-            renames,
-            window,
-        })
+            .expect("the position came from the entries themselves")
     }
 
     /// Insert `name` so that it becomes the `index`th entry, 0-based.
@@ -726,10 +438,12 @@ impl Series {
     }
 }
 
-/// A stable default name for a new patch: zero-padded so that lexical order matches
-/// application order.
-pub fn default_patch_name(prefix: &str, slug: &str) -> String {
-    format!("{prefix:0>4}-{slug}.patch")
+/// The file a new patch is written to: its slug, as it stands.
+///
+/// Nothing is added to make it unique. Two patches that want the same name are two
+/// patches the filesystem will not hold, and the caller reports that as it comes.
+pub fn default_patch_name(slug: &str) -> String {
+    format!("{slug}.patch")
 }
 
 /// What became of a removed patch's own file.
@@ -744,70 +458,29 @@ pub enum FileGone {
     Kept(PathBuf),
 }
 
-/// What [`Series::remove_renumbering`] did, in one value.
+/// What [`Series::remove_entry`] did, in one value.
 #[derive(Debug)]
 pub struct Removal {
     /// The entry's 1-based position as it was in the series.
     pub position: usize,
-    /// The tail renames, applied to the series and to the files on disk.
-    pub renames: Vec<(String, String)>,
     /// What became of the removed patch's own file.
     pub file: FileGone,
 }
 
-/// What [`Series::move_renumbering`] did, in one value.
+/// What [`Series::reorder`] did, in one value.
 #[derive(Debug)]
 pub struct Moved {
     /// The entry's 0-based position before the move.
     pub from: usize,
     /// The entry's 0-based position after the move.
     pub to: usize,
-    /// The renames the rotation caused, applied to the series and to the files on disk.
-    pub renames: Vec<(String, String)>,
-    /// The range the rotation touched, each entry's name after the move paired with its
-    /// 1-based position: what a person needs in order to see the result without reading
+    /// The range the move touched, each entry's name paired with the 1-based position it
+    /// holds afterwards: what a person needs in order to see the result without reading
     /// the whole series.
     pub window: Vec<(usize, String)>,
 }
 
-/// The same patch file under a new 1-based series number.
-///
-/// A leading run of digits before the first `-` is swapped for the new number; a name
-/// without one gains it; a directory above the file is kept.
-fn renumbered(name: &str, number: usize) -> String {
-    let number = format!("{number:0>4}");
-    match name.rsplit_once('/') {
-        Some((dir, file)) => format!("{dir}/{}", renumber_file(file, &number)),
-        None => renumber_file(name, &number),
-    }
-}
-
-fn renumber_file(file: &str, number: &str) -> String {
-    let numbered = file
-        .split_once('-')
-        .filter(|(digits, _)| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()));
-    if let Some((_, rest)) = numbered {
-        return format!("{number}-{rest}");
-    }
-    match file.strip_suffix(".patch") {
-        Some(stem) => format!("{number}-{stem}.patch"),
-        None => format!("{number}-{file}"),
-    }
-}
-
-/// The 1-based number a name already carries, if any: the digits before the first `-`
-/// in the file part of `name`, the same run [`renumbered`] would swap. A name without
-/// one (or with digits too large to be a series number) counts as unnumbered.
-fn leading_number(name: &str) -> Option<usize> {
-    let file = name.rsplit_once('/').map(|(_, file)| file).unwrap_or(name);
-    let (digits, _) = file.split_once('-')?;
-    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
-}
-
-/// A `--at` value, a 1-based position (`3`) or an existing patch name (`0002-b.patch`),
+/// A `--at` value, a 1-based position (`3`) or an existing patch name (`b.patch`),
 /// as the 0-based index a new patch should occupy. `None` appends; a position past the
 /// end appends too, the way [`Series::insert`] already behaves.
 pub fn position_at(series: &Series, at: Option<&str>) -> anyhow::Result<usize> {
@@ -841,7 +514,7 @@ pub fn position_at(series: &Series, at: Option<&str>) -> anyhow::Result<usize> {
 ///
 /// This is deliberately three simple rules rather than something cleverer, because a
 /// surprising resolution is the kind of thing that costs an afternoon.
-fn resolve(layout: &Layout, name: &str) -> PathBuf {
+pub fn resolve(layout: &Layout, name: &str) -> PathBuf {
     let p = Path::new(name);
     if p.is_absolute() {
         p.to_path_buf()
@@ -883,139 +556,125 @@ mod tests {
 
     #[test]
     fn comments_and_blanks_are_ignored_but_kept_verbatim() {
-        let series = s("# a comment\n\n0001-a.patch\n   \n0002-b.patch  # trailing\n");
+        let series = s("# a comment\n\na.patch\n   \nb.patch  # trailing\n");
         // Quilt's rule, which skot follows: only a line whose first non-blank
         // character is `#` is a comment. Everything else is the filename, verbatim.
         // A trailing `#` is therefore part of the name, because a patch may legitimately
         // be called `fix-#123.patch`, and guessing otherwise would silently apply the
         // wrong file.
-        assert_eq!(
-            series.names(),
-            vec!["0001-a.patch", "0002-b.patch  # trailing"]
-        );
+        assert_eq!(series.names(), vec!["a.patch", "b.patch  # trailing"]);
         assert_eq!(series.len(), 2);
         // Rendered byte for byte, comments and blank lines and all: a `series` file is
         // something a person edits by hand and may well carry commentary.
         assert_eq!(
             series.render(),
-            "# a comment\n\n0001-a.patch\n   \n0002-b.patch  # trailing\n"
+            "# a comment\n\na.patch\n   \nb.patch  # trailing\n"
         );
     }
 
     #[test]
-    fn a_move_keeps_comments_and_blanks_where_they_were() {
+    fn a_move_leaves_commentary_where_it_is() {
         let (tmp, layout) = layout();
-        std::fs::write(layout.patches_dir().join("0001-a.patch"), "a\n").unwrap();
-        std::fs::write(layout.patches_dir().join("0002-b.patch"), "b\n").unwrap();
+        std::fs::write(layout.patches_dir().join("a.patch"), "a\n").unwrap();
+        std::fs::write(layout.patches_dir().join("b.patch"), "b\n").unwrap();
         let mut series = Series::parse(
             &layout.series_file(),
-            "# lead\n0001-a.patch\n# between\n0002-b.patch\n",
+            "# lead\na.patch\n# between\nb.patch\n",
         );
 
-        series.move_renumbering(&layout, "0002-b.patch", 0).unwrap();
+        series.reorder("b.patch", 0).unwrap();
 
         assert_eq!(
             series.render(),
-            "# lead\n0001-b.patch\n# between\n0002-a.patch\n",
-            "the entries swapped numbers; the commentary did not move"
+            "# lead\nb.patch\na.patch\n# between\n",
+            "only entry lines take part in the order"
         );
         drop(tmp);
     }
 
     #[test]
-    fn a_move_leaves_a_hand_made_gap_outside_the_range_alone() {
+    fn a_move_changes_the_order_and_no_name() {
         let (tmp, layout) = layout();
-        for name in ["0001-a.patch", "0002-b.patch", "0005-f.patch"] {
+        for name in ["a.patch", "b.patch", "f.patch"] {
             std::fs::write(layout.patches_dir().join(name), "x\n").unwrap();
         }
-        let mut series = Series::parse(
-            &layout.series_file(),
-            "0001-a.patch\n0002-b.patch\n0005-f.patch\n",
-        );
+        let mut series = Series::parse(&layout.series_file(), "a.patch\nb.patch\nf.patch\n");
 
-        series.move_renumbering(&layout, "0002-b.patch", 0).unwrap();
+        series.reorder("b.patch", 0).unwrap();
 
-        assert_eq!(
-            series.render(),
-            "0001-b.patch\n0002-a.patch\n0005-f.patch\n",
-            "the rotation renumbers where it reaches; the gap at 3-4 is the \
-             person's own numbering and stays theirs"
-        );
-        assert!(layout.patches_dir().join("0005-f.patch").exists());
-        assert!(!layout.patches_dir().join("0003-b.patch").exists());
+        assert_eq!(series.render(), "b.patch\na.patch\nf.patch\n");
+        for name in ["a.patch", "b.patch", "f.patch"] {
+            assert_eq!(
+                std::fs::read_to_string(layout.patches_dir().join(name)).unwrap(),
+                "x\n",
+                "{name} is still the file it was"
+            );
+        }
         drop(tmp);
     }
 
     #[test]
-    fn disabling_comments_the_line_out_and_enabling_puts_it_back() {
+    fn disabling_marks_the_line_and_enabling_puts_it_back() {
         let (tmp, layout) = layout();
-        for name in ["0001-a.patch", "0002-b.patch", "0003-c.patch"] {
-            std::fs::write(layout.patches_dir().join(name), "x\n").unwrap();
-        }
-        let mut series = Series::parse(
-            &layout.series_file(),
-            "0001-a.patch\n0002-b.patch\n0003-c.patch\n",
-        );
+        let mut series = Series::parse(&layout.series_file(), "a.patch\nb.patch\nc.patch\n");
 
-        assert!(series.disable("0002-b.patch"));
+        assert!(series.disable("b.patch"));
+        assert_eq!(series.render(), "a.patch\n#!b.patch\nc.patch\n");
+        assert_eq!(series.names(), vec!["a.patch", "c.patch"]);
+        assert_eq!(series.disabled(), ["b.patch"]);
+
+        assert!(series.enable("b.patch"));
         assert_eq!(
             series.render(),
-            "0001-a.patch\n# 0002-b.patch\n0003-c.patch\n"
-        );
-        assert_eq!(series.names(), vec!["0001-a.patch", "0003-c.patch"]);
-        assert_eq!(series.disabled(&layout), ["0002-b.patch"]);
-
-        assert!(series.enable(&layout, "0002-b.patch"));
-        assert_eq!(
-            series.render(),
-            "0001-a.patch\n0002-b.patch\n0003-c.patch\n",
+            "a.patch\nb.patch\nc.patch\n",
             "the line comes back exactly as it was"
         );
-        assert!(series.disabled(&layout).is_empty());
+        assert!(series.disabled().is_empty());
         drop(tmp);
     }
 
     #[test]
-    fn a_prose_comment_is_not_a_disabled_patch() {
+    fn a_comment_never_becomes_an_entry() {
         let (tmp, layout) = layout();
-        std::fs::write(layout.patches_dir().join("0001-a.patch"), "x\n").unwrap();
         let mut series = Series::parse(
             &layout.series_file(),
-            "# someday, fix 0001-a.patch properly\n0001-a.patch\n#0001-a.patch\n",
+            "# someday, fix b.patch properly\na.patch\n#!b.patch\n",
         );
 
-        // The prose comment names a real file but is not the bare name, so it is not
-        // offered and not touched; the exact `#0001-a.patch` line below is.
-        assert_eq!(series.disabled(&layout), ["0001-a.patch"]);
-        assert!(series.disable("0001-a.patch"));
+        assert_eq!(
+            series.disabled(),
+            ["b.patch"],
+            "only the #! line is a patch"
+        );
+        assert!(series.disable("a.patch"));
         assert_eq!(
             series.render(),
-            "# someday, fix 0001-a.patch properly\n# 0001-a.patch\n#0001-a.patch\n"
+            "# someday, fix b.patch properly\n#!a.patch\n#!b.patch\n"
         );
         drop(tmp);
     }
 
     #[test]
-    fn enabling_a_patch_whose_file_is_gone_is_refused() {
+    fn a_disabled_line_is_read_without_looking_at_the_directory() {
         let (tmp, layout) = layout();
-        let mut series = Series::parse(&layout.series_file(), "# 0009-ghost.patch\n");
+        let mut series = Series::parse(&layout.series_file(), "#!ghost.patch\n");
 
-        assert!(!series.enable(&layout, "0009-ghost.patch"));
-        assert!(series.disabled(&layout).is_empty(), "nothing to offer");
+        assert_eq!(series.disabled(), ["ghost.patch"]);
+        assert!(series.enable("ghost.patch"));
+        assert_eq!(series.render(), "ghost.patch\n");
         drop(tmp);
     }
 
     #[test]
     fn removing_a_disabled_line_takes_the_line_and_nothing_else() {
         let (tmp, layout) = layout();
-        std::fs::write(layout.patches_dir().join("0001-a.patch"), "x\n").unwrap();
         let mut series = Series::parse(
             &layout.series_file(),
-            "# a note kept verbatim\n0001-a.patch\n# 0002-b.patch\n",
+            "# a note kept verbatim\na.patch\n#!b.patch\n",
         );
 
-        assert!(series.remove_disabled("0002-b.patch"));
-        assert_eq!(series.render(), "# a note kept verbatim\n0001-a.patch\n");
+        assert!(series.remove_disabled("b.patch"));
+        assert_eq!(series.render(), "# a note kept verbatim\na.patch\n");
         assert!(!series.remove_disabled("nope.patch"));
         drop(tmp);
     }
@@ -1023,9 +682,9 @@ mod tests {
     #[test]
     fn render_round_trips_byte_for_byte() {
         for text in [
-            "0001-a.patch\n0002-b.patch\n",
-            "0001-a.patch\n0002-b.patch", // no final newline
-            "# header\n\n0001-a.patch\n",
+            "a.patch\nb.patch\n",
+            "a.patch\nb.patch", // no final newline
+            "# header\n\na.patch\n",
             "",
             "\n",
             "# only a comment\n",
@@ -1036,9 +695,9 @@ mod tests {
 
     #[test]
     fn crlf_round_trips() {
-        let text = "0001-a.patch\r\n0002-b.patch\r\n";
+        let text = "a.patch\r\nb.patch\r\n";
         assert_eq!(s(text).render(), text);
-        assert_eq!(s(text).names(), vec!["0001-a.patch", "0002-b.patch"]);
+        assert_eq!(s(text).names(), vec!["a.patch", "b.patch"]);
     }
 
     #[test]
@@ -1055,46 +714,40 @@ mod tests {
     #[test]
     fn bare_names_land_in_the_patch_directory() {
         let (_tmp, l) = layout();
-        let series = s("0001-a.patch\n");
+        let series = s("a.patch\n");
         assert_eq!(
             series.entries(&l).unwrap()[0].path,
-            l.patches_dir().join("0001-a.patch")
+            l.patches_dir().join("a.patch")
         );
     }
 
     #[test]
     fn insert_positions_by_entry_not_by_line() {
-        let mut series = s("# header\n0001-a.patch\n0002-b.patch\n");
-        let line = series.insert("0003-c.patch", 1).unwrap();
-        assert_eq!(
-            series.names(),
-            vec!["0001-a.patch", "0003-c.patch", "0002-b.patch"]
-        );
+        let mut series = s("# header\na.patch\nb.patch\n");
+        let line = series.insert("c.patch", 1).unwrap();
+        assert_eq!(series.names(), vec!["a.patch", "c.patch", "b.patch"]);
         // Inserted at physical line 3, after the header.
         assert_eq!(line, 3);
-        assert_eq!(
-            series.render(),
-            "# header\n0001-a.patch\n0003-c.patch\n0002-b.patch\n"
-        );
+        assert_eq!(series.render(), "# header\na.patch\nc.patch\nb.patch\n");
     }
 
     #[test]
     fn insert_appends_when_past_the_end() {
-        let mut series = s("0001-a.patch\n");
-        series.insert("0002-b.patch", 99).unwrap();
-        assert_eq!(series.render(), "0001-a.patch\n0002-b.patch\n");
+        let mut series = s("a.patch\n");
+        series.insert("b.patch", 99).unwrap();
+        assert_eq!(series.render(), "a.patch\nb.patch\n");
     }
 
     #[test]
     fn insert_refuses_a_duplicate() {
-        let mut series = s("0001-a.patch\n");
-        let err = series.insert("0001-a.patch", 0).unwrap_err();
+        let mut series = s("a.patch\n");
+        let err = series.insert("a.patch", 0).unwrap_err();
         assert!(matches!(err, SeriesError::Duplicate { .. }), "got {err:?}");
     }
 
     #[test]
     fn insert_refuses_a_name_with_a_newline() {
-        let mut series = s("0001-a.patch\n");
+        let mut series = s("a.patch\n");
         let err = series.insert("evil\nrm -rf /", 0).unwrap_err();
         assert!(
             matches!(err, SeriesError::InvalidName { .. }),
@@ -1104,9 +757,9 @@ mod tests {
 
     #[test]
     fn remove_reports_the_position_and_round_trips() {
-        let mut series = s("0001-a.patch\n0002-b.patch\n0003-c.patch\n");
-        assert_eq!(series.remove("0002-b.patch"), Some(1));
-        assert_eq!(series.render(), "0001-a.patch\n0003-c.patch\n");
+        let mut series = s("a.patch\nb.patch\nc.patch\n");
+        assert_eq!(series.remove("b.patch"), Some(1));
+        assert_eq!(series.render(), "a.patch\nc.patch\n");
         assert_eq!(series.remove("absent.patch"), None);
     }
 
@@ -1122,172 +775,59 @@ mod tests {
     #[test]
     fn require_resolvable_names_the_line_and_the_missing_file() {
         let (_tmp, l) = layout();
-        std::fs::write(l.patches_dir().join("0001-a.patch"), "").unwrap();
-        let series = s("0001-a.patch\n0002-gone.patch\n");
+        std::fs::write(l.patches_dir().join("a.patch"), "").unwrap();
+        let series = s("a.patch\ngone.patch\n");
 
         let err = series.require_resolvable(&l).unwrap_err().to_string();
-        assert!(err.contains("0002-gone.patch"), "got {err}");
+        assert!(err.contains("gone.patch"), "got {err}");
         assert!(err.contains(":2:"), "should name the line: {err}");
     }
 
     #[test]
     fn lenient_entries_report_missing_patches_instead_of_failing() {
         let (_tmp, l) = layout();
-        let series = s("0001-a.patch\n0002-gone.patch\n");
+        let series = s("a.patch\ngone.patch\n");
         let entries = series.entries_lenient(&l);
         assert_eq!(entries.len(), 2);
         assert!(!entries[1].path.is_file());
     }
 
     #[test]
-    fn default_names_sort_lexically_in_application_order() {
-        let names: Vec<_> = (1..12)
-            .map(|n| default_patch_name(&n.to_string(), "thing"))
-            .collect();
-        let mut sorted = names.clone();
-        sorted.sort();
-        assert_eq!(names, sorted);
+    fn a_default_name_is_the_patch_name_it_was_given() {
+        assert_eq!(default_patch_name("trim-widgets"), "trim-widgets.patch");
+        assert_eq!(default_patch_name("add_greeting"), "add_greeting.patch");
     }
 
     #[test]
-    fn a_renumbered_name_swaps_its_number_and_keeps_everything_else() {
-        assert_eq!(renumbered("0001-a.patch", 7), "0007-a.patch");
-        assert_eq!(renumbered("add-feature.patch", 3), "0003-add-feature.patch");
-        assert_eq!(renumbered("sub/0005-b.patch", 2), "sub/0002-b.patch");
-        assert_eq!(renumbered("fix-#123.patch", 4), "0004-fix-#123.patch");
-    }
-
-    #[test]
-    fn inserting_renumbers_the_tail_and_moves_the_files() {
+    fn inserting_a_line_leaves_every_other_name_alone() {
         let (_tmp, l) = layout();
-        for name in ["0001-a.patch", "0002-b.patch", "0003-c.patch"] {
+        for name in ["a.patch", "b.patch", "c.patch"] {
             std::fs::write(l.patches_dir().join(name), name).unwrap();
         }
-        let mut series = s("0001-a.patch\n0002-b.patch\n0003-c.patch\n");
+        let mut series = s("a.patch\nb.patch\nc.patch\n");
 
-        let (line, renames) = series.insert_renumbering(&l, "0002-new.patch", 1).unwrap();
+        let line = series.insert("new.patch", 1).unwrap();
 
         assert_eq!(line, 2);
         assert_eq!(
             series.names(),
-            vec![
-                "0001-a.patch",
-                "0002-new.patch",
-                "0003-b.patch",
-                "0004-c.patch"
-            ],
-            "the tail stays contiguous, so lexical order is application order"
+            vec!["a.patch", "new.patch", "b.patch", "c.patch"]
         );
-        assert_eq!(
-            renames,
-            [
-                ("0002-b.patch".to_owned(), "0003-b.patch".to_owned()),
-                ("0003-c.patch".to_owned(), "0004-c.patch".to_owned())
-            ]
-        );
-        assert_eq!(
-            std::fs::read_to_string(l.patches_dir().join("0003-b.patch")).unwrap(),
-            "0002-b.patch",
-            "the file moves with its name"
-        );
-        assert_eq!(
-            std::fs::read_to_string(l.patches_dir().join("0004-c.patch")).unwrap(),
-            "0003-c.patch"
-        );
-        assert!(!l.patches_dir().join("0002-b.patch").exists());
-    }
-
-    #[test]
-    fn tail_files_rename_highest_first_so_a_chain_never_clobbers() {
-        // Three files with the same slug: an ascending pass would rename 0001-a onto the
-        // still-present 0002-a and lose it.
-        let (_tmp, l) = layout();
-        for name in ["0001-a.patch", "0002-a.patch", "0003-a.patch"] {
-            std::fs::write(l.patches_dir().join(name), name).unwrap();
+        for name in ["a.patch", "b.patch", "c.patch"] {
+            assert_eq!(
+                std::fs::read_to_string(l.patches_dir().join(name)).unwrap(),
+                name,
+                "{name} is the file it always was"
+            );
         }
-        let mut series = s("0001-a.patch\n0002-a.patch\n0003-a.patch\n");
-
-        let (_line, renames) = series.insert_renumbering(&l, "0001-new.patch", 0).unwrap();
-
-        assert_eq!(
-            series.names(),
-            vec![
-                "0001-new.patch",
-                "0002-a.patch",
-                "0003-a.patch",
-                "0004-a.patch"
-            ]
-        );
-        assert_eq!(renames.len(), 3);
-        assert_eq!(
-            std::fs::read_to_string(l.patches_dir().join("0002-a.patch")).unwrap(),
-            "0001-a.patch",
-            "0002-a is the old 0001-a, not the file that used to be called 0002-a"
-        );
-        assert_eq!(
-            std::fs::read_to_string(l.patches_dir().join("0003-a.patch")).unwrap(),
-            "0002-a.patch"
-        );
-        assert_eq!(
-            std::fs::read_to_string(l.patches_dir().join("0004-a.patch")).unwrap(),
-            "0003-a.patch"
-        );
-        assert!(!l.patches_dir().join("0001-a.patch").exists());
-    }
-
-    #[test]
-    fn inserting_refuses_a_rename_target_a_stray_file_occupies() {
-        let (_tmp, l) = layout();
-        std::fs::write(l.patches_dir().join("0001-a.patch"), "one").unwrap();
-        std::fs::write(l.patches_dir().join("0003-c.patch"), "three").unwrap();
-        // Not in the series, but in the way: inserting at the front would want to rename
-        // 0001-a to 0002-a, which this occupies.
-        std::fs::write(l.patches_dir().join("0002-a.patch"), "stray").unwrap();
-        let mut series = s("0001-a.patch\n0003-c.patch\n");
-
-        let err = series
-            .insert_renumbering(&l, "0004-new.patch", 0)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("0002-a.patch"), "got {err}");
-        assert!(err.contains("not in the series"), "got {err}");
-        assert_eq!(
-            std::fs::read_to_string(l.patches_dir().join("0002-a.patch")).unwrap(),
-            "stray",
-            "the stray file must be untouched"
-        );
-        assert!(l.patches_dir().join("0001-a.patch").exists());
-    }
-
-    #[test]
-    fn inserting_refuses_a_duplicate_before_moving_anything() {
-        let (_tmp, l) = layout();
-        std::fs::write(l.patches_dir().join("0001-a.patch"), "one").unwrap();
-        std::fs::write(l.patches_dir().join("0002-b.patch"), "two").unwrap();
-        let mut series = s("0001-a.patch\n0002-b.patch\n");
-
-        let err = series
-            .insert_renumbering(&l, "0002-b.patch", 0)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("already in the series"), "got {err}");
-        assert!(
-            l.patches_dir().join("0002-b.patch").exists(),
-            "no tail file may have been renamed on the way to the refusal"
-        );
-        assert_eq!(
-            series.names(),
-            vec!["0001-a.patch", "0002-b.patch"],
-            "the series must be unchanged"
-        );
     }
 
     #[test]
     fn position_at_accepts_a_number_a_name_or_nothing() {
-        let series = s("0001-a.patch\n0002-b.patch\n0003-c.patch\n");
+        let series = s("a.patch\nb.patch\nc.patch\n");
         assert_eq!(position_at(&series, None).unwrap(), 3, "absent appends");
         assert_eq!(position_at(&series, Some("2")).unwrap(), 1);
-        assert_eq!(position_at(&series, Some("0002-b.patch")).unwrap(), 1);
+        assert_eq!(position_at(&series, Some("b.patch")).unwrap(), 1);
         assert_eq!(
             position_at(&series, Some("99")).unwrap(),
             3,
@@ -1295,28 +835,25 @@ mod tests {
         );
         let err = position_at(&series, Some("0")).unwrap_err().to_string();
         assert!(err.contains("1-based"), "got {err}");
-        let err = position_at(&series, Some("0009-gone.patch"))
+        let err = position_at(&series, Some("gone.patch"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("0009-gone.patch"), "got {err}");
-        assert!(
-            err.contains("0001-a.patch"),
-            "it should list the series: {err}"
-        );
+        assert!(err.contains("gone.patch"), "got {err}");
+        assert!(err.contains("a.patch"), "it should list the series: {err}");
     }
 
     #[test]
     fn save_refuses_a_path_outside_the_project() {
         let (_tmp, l) = layout();
-        let rogue = Series::parse(Path::new("/etc/skot-series"), "0001-a.patch\n");
+        let rogue = Series::parse(Path::new("/etc/skot-series"), "a.patch\n");
         assert!(rogue.save(&l).is_err());
     }
 
     #[test]
     fn save_and_reload_round_trips_through_the_filesystem() {
         let (_tmp, l) = layout();
-        let mut series = Series::parse(&l.series_file(), "# header\n0001-a.patch\n");
-        series.insert("0002-b.patch", 1).unwrap();
+        let mut series = Series::parse(&l.series_file(), "# header\na.patch\n");
+        series.insert("b.patch", 1).unwrap();
         series.save(&l).unwrap();
 
         let reloaded = Series::load(&l.series_file()).unwrap();

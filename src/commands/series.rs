@@ -21,6 +21,7 @@ use crate::config::OnSwitch;
 use crate::hints::Hints;
 use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
+use crate::prompt::Fallback;
 use crate::report;
 use crate::series::Series;
 use crate::seriesdir;
@@ -62,7 +63,7 @@ fn list(ctx: &Ctx) -> Result<Exit> {
         // layout for *that* series is what resolves its patch files correctly.
         let layout = ctx.layout.with_series(&name)?;
         let (patches, disabled) = match Series::load(&layout.series_file()) {
-            Ok(series) => (series.len(), series.disabled(&layout).len()),
+            Ok(series) => (series.len(), series.disabled().len()),
             Err(_) => (0, 0),
         };
         rows.push(Row {
@@ -379,7 +380,7 @@ fn undo(ctx: &Ctx, args: &SeriesUndoArgs) -> Result<Exit> {
              has none."
         );
     }
-    if !args.yes && !confirm_undo(ctx, &name)? {
+    if !confirm_undo(ctx, &name, args.yes)? {
         info!(target: "series", "`{name}` stands as it is");
         return Ok(Exit::Failure);
     }
@@ -415,25 +416,20 @@ fn undo(ctx: &Ctx, args: &SeriesUndoArgs) -> Result<Exit> {
     Ok(rebuild.exit())
 }
 
-/// The question before a swap: a `--yes` caller has already answered.
-fn confirm_undo(ctx: &Ctx, name: &str) -> Result<bool> {
-    if ctx.cli.json || !crate::ui::stdin_is_terminal() {
-        bail!(
-            "cannot ask before putting the previous series back here.\n`{}` means it.",
-            skot_args("series", "undo --yes")
-        );
-    }
+/// The question before a swap: a `--yes` caller has already answered it, and a run
+/// that cannot ask is refused with the flag that says yes for it.
+fn confirm_undo(ctx: &Ctx, name: &str, yes: bool) -> Result<bool> {
     let question = format!("Put the previous version of `{name}` back?");
     let help = format!(
         "The two versions trade places, so undoing again reverses this. `{}` says yes \
          in advance.",
         skot_args("series", "undo --yes")
     );
-    report::note(&help);
-    inquire::Confirm::new(&question)
-        .with_default(false)
-        .prompt()
-        .context("confirming the undo")
+    Ok(ctx.asker().with_yes(yes).confirm(
+        &question,
+        Some(&help),
+        Fallback::Flag(skot_args("series", "undo --yes")),
+    )?)
 }
 
 /// `skot series drop <name>`: a series, its patches and its base, for good.
@@ -487,14 +483,14 @@ fn drop_series(ctx: &Ctx, args: &SeriesDropArgs) -> Result<Exit> {
                  Save it (`{}`) or throw it away (`{}`) per patch, then drop the series.",
                 args.name,
                 held.join(", "),
-                skot_args("edit-save", "<patch>"),
+                skot_args("save", "<patch>"),
                 skot_args("clean", "--sessions")
             );
         }
     }
 
     let patches = crate::series::Series::load(&target.series_file()).map_or(0, |s| s.len());
-    if !ctx.yes && !confirm_drop(ctx, &args.name, patches)? {
+    if !confirm_drop(ctx, &args.name, patches)? {
         info!(target: "series", "the series `{}` stands", args.name);
         return Ok(Exit::Failure);
     }
@@ -538,19 +534,11 @@ fn drop_series(ctx: &Ctx, args: &SeriesDropArgs) -> Result<Exit> {
     Ok(Exit::Success)
 }
 
-/// The question, before anything is deleted: a `--yes` caller has already answered.
-///
-/// A prompt-free caller is told how to answer instead of being asked, the same way
-/// `patch drop` does it: `--json` puts a document on stdout and an `inquire` prompt
-/// would sit on the same stream, and `stdin_is_terminal` is false under the test
-/// harness, so no test can ever block on a question no one is there to answer.
+/// The question, before anything is deleted: a `--yes` caller has already answered it,
+/// and a run that cannot ask is refused with the flag that says yes for it, the same
+/// way `patch drop` does it. Under `--json` that refusal is a usage error rather than
+/// a document, since a document cannot answer a question.
 fn confirm_drop(ctx: &Ctx, name: &str, patches: usize) -> Result<bool> {
-    if ctx.cli.json || !crate::ui::stdin_is_terminal() {
-        bail!(
-            "cannot ask before deleting a series here.\n`{}` means it.",
-            skot_args("series", &format!("drop {name} --yes"))
-        );
-    }
     let question = format!(
         "Remove the series `{name}` and its {}?",
         apply::count(patches, "patch", "patches")
@@ -559,11 +547,11 @@ fn confirm_drop(ctx: &Ctx, name: &str, patches: usize) -> Result<bool> {
         "This deletes every patch file it holds. `{}` says yes in advance.",
         skot_args("series", &format!("drop {name} --yes"))
     );
-    report::note(&help);
-    inquire::Confirm::new(&question)
-        .with_default(false)
-        .prompt()
-        .context("confirming the drop")
+    Ok(ctx.asker().confirm(
+        &question,
+        Some(&help),
+        Fallback::Flag(skot_args("series", &format!("drop {name} --yes"))),
+    )?)
 }
 
 /// Remove a per-series sandbox tree, which is derived state the next apply rebuilds.
@@ -623,7 +611,7 @@ fn rename(ctx: &Ctx, args: &SeriesRenameArgs) -> Result<Exit> {
                 "the series `{from}` holds work its patches do not: {}.\n\
                  Save it (`{}`) or throw it away (`{}`) per patch, then rename.",
                 held.join(", "),
-                skot_args("edit-save", "<patch>"),
+                skot_args("save", "<patch>"),
                 skot_args("clean", "--sessions")
             );
         }
@@ -807,7 +795,7 @@ impl Rebuild {
             target: "series",
             "`{}` shows the conflicts; rebasing a patch and `{}` fixes one.",
             skot("check"),
-            skot_args("edit-save", "<patch>")
+            skot_args("save", "<patch>")
         );
     }
 
@@ -916,7 +904,7 @@ mod tests {
         let (_tmp, layout) = crate::commands::testsupport::project();
         fs::create_dir_all(layout.series_root().join("alpha")).unwrap();
         fs::create_dir_all(layout.series_root().join("exp")).unwrap();
-        write_series(&layout, &[("0001-a.patch", "a\n")]);
+        write_series(&layout, &[("a.patch", "a\n")]);
 
         let ctx = ctx_for(&layout);
         let exit = call(&ctx, None).unwrap();
@@ -1013,7 +1001,10 @@ mod tests {
     #[test]
     fn copying_leaves_the_active_series_alone() {
         let (_tmp, layout) = crate::commands::testsupport::project();
-        write_series(&layout, &[("0001-a.patch", "a\n")]);
+        write_series(
+            &layout,
+            &[("a.patch", crate::commands::testsupport::patch_one())],
+        );
         let ctx = ctx_for(&layout);
 
         let exit = call(
@@ -1027,11 +1018,8 @@ mod tests {
         assert!(matches!(exit, Exit::Success));
 
         let copy = layout.with_series("checkpoint").unwrap();
-        assert_eq!(
-            fs::read_to_string(copy.series_file()).unwrap(),
-            "0001-a.patch\n"
-        );
-        assert!(copy.patches_dir().join("0001-a.patch").is_file());
+        assert_eq!(fs::read_to_string(copy.series_file()).unwrap(), "a.patch\n");
+        assert!(copy.patches_dir().join("a.patch").is_file());
         assert_eq!(layout.series(), DEFAULT_SERIES, "copying is not switching");
         assert!(
             State::load(&layout).unwrap().active_series().is_none(),
@@ -1046,7 +1034,10 @@ mod tests {
         create(&ctx_for(&layout), "exp").unwrap();
         write_series(
             &layout.with_series("exp").unwrap(),
-            &[("0001-a.patch", "a\n"), ("0002-b.patch", "b\n")],
+            &[
+                ("a.patch", crate::commands::testsupport::patch_one()),
+                ("b.patch", crate::commands::testsupport::patch_two()),
+            ],
         );
         let ctx = ctx_for(&layout);
 
@@ -1071,10 +1062,10 @@ mod tests {
             let layout = layout.with_series(name).unwrap();
             let text = fs::read_to_string(layout.series_file()).unwrap();
             assert!(
-                text.contains("0001-a.patch") && text.contains("0002-b.patch"),
+                text.contains("a.patch") && text.contains("b.patch"),
                 "{name} got {text:?}"
             );
-            assert!(layout.patches_dir().join("0002-b.patch").is_file());
+            assert!(layout.patches_dir().join("b.patch").is_file());
         }
         assert_eq!(
             State::load(&layout).unwrap().active_series(),
@@ -1087,10 +1078,7 @@ mod tests {
     fn dropping_removes_the_series_but_never_the_active_one() {
         let (_tmp, layout) = crate::commands::testsupport::project();
         create(&ctx_for(&layout), "exp").unwrap();
-        write_series(
-            &layout.with_series("exp").unwrap(),
-            &[("0001-a.patch", "a\n")],
-        );
+        write_series(&layout.with_series("exp").unwrap(), &[("a.patch", "a\n")]);
         // Back on the default series: the pointer, not this run's layout, is what
         // decides "active" for a drop.
         use_(
@@ -1138,10 +1126,7 @@ mod tests {
     fn dropping_without_yes_in_a_prompt_free_environment_is_told_how() {
         let (_tmp, layout) = crate::commands::testsupport::project();
         create(&ctx_for(&layout), "exp").unwrap();
-        write_series(
-            &layout.with_series("exp").unwrap(),
-            &[("0001-a.patch", "a\n")],
-        );
+        write_series(&layout.with_series("exp").unwrap(), &[("a.patch", "a\n")]);
         // Back on the default, so `exp` is droppable and only the question stands
         // between it and the delete.
         use_(
@@ -1156,7 +1141,7 @@ mod tests {
         };
         // No terminal under the test harness, which is the case the message exists for:
         // `confirm_drop` refuses with the remedy rather than opening a prompt no one
-        // answers. Relying on inquire to fail instead would only hold when stdin is
+        // answers. Opening a prompt instead would only refuse on its own when stdin is
         // already not a terminal, so `cargo test` from a shell would block.
         let err = call(
             &ctx,
@@ -1179,10 +1164,7 @@ mod tests {
     fn renaming_moves_the_pointer_the_directory_and_anything_named_after_it() {
         let (_tmp, layout) = crate::commands::testsupport::project();
         create(&ctx_for(&layout), "exp").unwrap();
-        write_series(
-            &layout.with_series("exp").unwrap(),
-            &[("0001-a.patch", "a\n")],
-        );
+        write_series(&layout.with_series("exp").unwrap(), &[("a.patch", "a\n")]);
         fs::write(layout.with_series("exp").unwrap().base_file(), "main\n").unwrap();
         let ctx = ctx_for(&layout.with_series("exp").unwrap());
 
@@ -1196,7 +1178,7 @@ mod tests {
 
         assert!(!layout.with_series("exp").unwrap().patches_dir().exists());
         let target = layout.with_series("renamed").unwrap();
-        assert!(target.patches_dir().join("0001-a.patch").is_file());
+        assert!(target.patches_dir().join("a.patch").is_file());
         assert_eq!(fs::read_to_string(target.base_file()).unwrap(), "main\n");
         assert_eq!(
             State::load(&layout).unwrap().active_series(),
@@ -1243,17 +1225,17 @@ mod tests {
         .unwrap();
         write_series(
             &layout,
-            &[("0001-a.patch", crate::commands::testsupport::patch_one())],
+            &[("a.patch", crate::commands::testsupport::patch_one())],
         );
         create(&ctx_for(&layout), "exp").unwrap();
         write_series(
             &layout.with_series("exp").unwrap(),
-            &[("0001-a.patch", crate::commands::testsupport::patch_one())],
+            &[("a.patch", crate::commands::testsupport::patch_one())],
         );
         let exp = layout.with_series("exp").unwrap();
         let entries = exp.project().unwrap().1.entries(&exp).unwrap();
         let plan = crate::session::plan(&exp, "main", &[], Some(&entries[0])).unwrap();
-        crate::session::materialise(&exp, "0001-a.patch", &plan).unwrap();
+        crate::session::materialise(&exp, "a.patch", &plan).unwrap();
 
         call(
             &ctx_for(&exp),
@@ -1332,11 +1314,11 @@ mod tests {
 
     /// A series with `held` as its patch text, plus an undo entry holding `kept`.
     fn series_with_undo(layout: &Layout, held: &str, kept: &str) {
-        write_series(layout, &[("0001-a.patch", held)]);
+        write_series(layout, &[("a.patch", held)]);
         let undo = layout.undo_entry();
         fs::create_dir_all(&undo).unwrap();
-        fs::write(undo.join("0001-a.patch"), kept).unwrap();
-        fs::write(undo.join("series"), "0001-a.patch\n").unwrap();
+        fs::write(undo.join("a.patch"), kept).unwrap();
+        fs::write(undo.join("series"), "a.patch\n").unwrap();
     }
 
     #[test]
@@ -1350,22 +1332,22 @@ mod tests {
 
         // What was live is now the undo entry, and vice versa: the trade, not a copy.
         assert_eq!(
-            fs::read_to_string(layout.patches_dir().join("0001-a.patch")).unwrap(),
+            fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap(),
             "original\n"
         );
         assert_eq!(
-            fs::read_to_string(layout.undo_entry().join("0001-a.patch")).unwrap(),
+            fs::read_to_string(layout.undo_entry().join("a.patch")).unwrap(),
             "rebased\n"
         );
 
         // A second undo reverses the first: the two versions keep swapping.
         undo(&ctx, &SeriesUndoArgs { yes: true }).unwrap();
         assert_eq!(
-            fs::read_to_string(layout.patches_dir().join("0001-a.patch")).unwrap(),
+            fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap(),
             "rebased\n"
         );
         assert_eq!(
-            fs::read_to_string(layout.undo_entry().join("0001-a.patch")).unwrap(),
+            fs::read_to_string(layout.undo_entry().join("a.patch")).unwrap(),
             "original\n"
         );
     }
@@ -1373,14 +1355,14 @@ mod tests {
     #[test]
     fn undo_with_nothing_to_put_back_says_so() {
         let (_tmp, layout) = crate::commands::testsupport::project();
-        write_series(&layout, &[("0001-a.patch", "a\n")]);
+        write_series(&layout, &[("a.patch", "a\n")]);
         let ctx = ctx_for(&layout);
 
         let err = undo(&ctx, &SeriesUndoArgs { yes: true }).unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("nothing to undo"), "got {text}");
         assert!(
-            layout.patches_dir().join("0001-a.patch").is_file(),
+            layout.patches_dir().join("a.patch").is_file(),
             "nothing is touched when there is no undo entry"
         );
     }
@@ -1397,7 +1379,7 @@ mod tests {
         assert!(err.contains("cannot ask"), "{err}");
         assert!(err.contains("--yes"), "{err}");
         assert_eq!(
-            fs::read_to_string(layout.patches_dir().join("0001-a.patch")).unwrap(),
+            fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap(),
             "rebased\n",
             "nothing swaps when the question cannot be asked"
         );
@@ -1409,7 +1391,13 @@ mod tests {
         // whole series or no series: never the two files that were reached before an
         // error stopped the loop.
         let (_tmp, layout) = crate::commands::testsupport::project();
-        write_series(&layout, &[("0001-a.patch", "a\n"), ("0002-b.patch", "b\n")]);
+        write_series(
+            &layout,
+            &[
+                ("a.patch", crate::commands::testsupport::patch_one()),
+                ("b.patch", crate::commands::testsupport::patch_two()),
+            ],
+        );
         let ctx = ctx_for(&layout);
 
         call(
@@ -1424,10 +1412,10 @@ mod tests {
         let copy = layout.with_series("snapshot").unwrap();
         assert_eq!(
             fs::read_to_string(copy.series_file()).unwrap(),
-            "0001-a.patch\n0002-b.patch\n"
+            "a.patch\nb.patch\n"
         );
-        assert!(copy.patches_dir().join("0001-a.patch").is_file());
-        assert!(copy.patches_dir().join("0002-b.patch").is_file());
+        assert!(copy.patches_dir().join("a.patch").is_file());
+        assert!(copy.patches_dir().join("b.patch").is_file());
         // Scratch was renamed away, not left beside the result.
         assert!(
             !layout.tmp_dir().join("snapshot.new").exists(),

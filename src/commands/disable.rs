@@ -1,11 +1,10 @@
 //! `patch disable`: skip a patch from now on.
 //!
-//! The series file is the record: `disable` comments the patch's line out, quilt-style,
-//! so the choice is trackable in git and lasts. The applied set is untouched, and a
-//! patch the sandbox is holding cannot be disabled underneath it: `skot patch pop` puts
-//! it down first.
+//! The series file is the record: `disable` marks the patch's line `#!`, so the choice
+//! is trackable in git and lasts. The applied set is untouched, and a patch the sandbox
+//! is holding cannot be disabled underneath it: `skot patch pop` puts it down first.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use log::{debug, info};
 use serde_json::json;
 
@@ -15,11 +14,12 @@ use crate::commands::{Ctx, Exit, emit_json};
 use crate::hints::Hints;
 use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
+use crate::prompt::{Asker, Fallback};
 use crate::state::State;
 
 /// What a disable did, presented by [`run`].
 struct Changed {
-    /// The patches whose lines were commented out, in series order.
+    /// The patches whose lines were marked `#!`, in series order.
     names: Vec<String>,
     /// The enabled set after the change, in series order.
     enabled: Vec<String>,
@@ -27,27 +27,32 @@ struct Changed {
     disabled: Vec<String>,
 }
 
-/// Comment patches' lines out: skipped from now on, persistently.
+/// Mark the named patches `#!`: skipped from now on, persistently.
 ///
-/// Success is [`Exit::Success`] when anything changed. Nothing changing (an empty
-/// selection, a patch already disabled) is [`Exit::Failure`], the house rule for a
-/// command that did not do the thing asked for.
+/// Success is [`Exit::Success`] whenever the named patches end up disabled, even when
+/// some already were: the state asked for holds, so the command did its job. Failure
+/// is an empty selection, which asked for nothing.
 pub fn run(ctx: &Ctx, args: &DisableArgs) -> Result<Exit> {
     // The question is asked before the lock: a prompt sitting on the lock is one the
     // user can walk away from mid-answer.
     let (_config, series) = ctx.layout.project()?;
     let state = State::load(&ctx.layout).unwrap_or_default();
     let enabled: Vec<String> = series.names().into_iter().map(String::from).collect();
-    let disabled = series.disabled(&ctx.layout);
+    let disabled = series.disabled();
 
     let wanted: Vec<String> = if args.all {
         // Everything the sandbox is not holding: the applied ones stay enabled, since
         // the applied set is always a subset of the enabled one.
-        enabled
+        let candidates: Vec<String> = enabled
             .iter()
             .filter(|n| !state.applied(&ctx.layout).contains(*n))
             .cloned()
-            .collect()
+            .collect();
+        if candidates.is_empty() && !disabled.is_empty() {
+            info!(target: "disable", "every patch is already disabled; nothing changed");
+            return Ok(Exit::Success);
+        }
+        candidates
     } else if !args.patches.is_empty() {
         let names: Vec<&str> = enabled.iter().map(String::as_str).collect();
         let mut universe: Vec<&str> = names.clone();
@@ -61,13 +66,8 @@ pub fn run(ctx: &Ctx, args: &DisableArgs) -> Result<Exit> {
             targets.push(name);
         }
         targets
-    } else if !ctx.cli.json && crate::ui::stdin_is_terminal() {
-        pick(&enabled, state.applied(&ctx.layout))?
     } else {
-        bail!(
-            "cannot ask which patch to disable here.\nName it: `{}`.",
-            skot_args("disable", "<patch>")
-        )
+        pick(&ctx.asker(), &enabled, state.applied(&ctx.layout))?
     };
     if wanted.is_empty() {
         info!(target: "disable", "nothing selected; nothing changed");
@@ -94,14 +94,14 @@ pub fn run(ctx: &Ctx, args: &DisableArgs) -> Result<Exit> {
                 "every enabled patch is applied; `{}` puts them down first.",
                 skot("pop")
             );
-        } else {
-            info!(
-                target: "disable",
-                "{} already disabled; nothing changed",
-                already.join(", ")
-            );
+            return Ok(Exit::Failure);
         }
-        return Ok(Exit::Failure);
+        info!(
+            target: "disable",
+            "{} already disabled; nothing changed",
+            already.join(", ")
+        );
+        return Ok(Exit::Success);
     }
 
     let changed = disable(&ctx.layout, &todo)?;
@@ -149,10 +149,10 @@ pub fn run(ctx: &Ctx, args: &DisableArgs) -> Result<Exit> {
     Ok(Exit::Success)
 }
 
-/// Ask an interactive session which patches to disable. Only enabled, not-yet-applied
-/// patches are offered: the others cannot go without a pop first, and offering them
-/// would only produce the refusal afterwards.
-fn pick(enabled: &[String], applied: &[String]) -> Result<Vec<String>> {
+/// Which patches to disable: only enabled, not-yet-applied patches are offered, the
+/// others cannot go without a pop first and would only produce the refusal
+/// afterwards. A run that cannot ask is refused with the flag that names the patch.
+fn pick(asker: &Asker, enabled: &[String], applied: &[String]) -> Result<Vec<String>> {
     let options: Vec<String> = enabled
         .iter()
         .filter(|n| !applied.contains(*n))
@@ -165,13 +165,15 @@ fn pick(enabled: &[String], applied: &[String]) -> Result<Vec<String>> {
             skot("pop")
         );
     }
-    inquire::MultiSelect::new("Which patches to disable", options)
-        .with_help_message("Space toggles; Enter disables the selection. Esc cancels.")
-        .prompt()
-        .context("asking which patches to disable")
+    Ok(asker.multi(
+        "Which patches to disable",
+        Some("Space toggles; Enter disables the selection. Esc cancels."),
+        options,
+        Fallback::Flag(skot_args("disable", "<patch>")),
+    )?)
 }
 
-/// The plain work: lock, comment out, record.
+/// The plain work: lock, mark `#!`, record.
 fn disable(layout: &Layout, wanted: &[String]) -> Result<Changed> {
     let lock = layout.lock()?;
     let (_config, mut series) = layout.project()?;
@@ -189,7 +191,7 @@ fn disable(layout: &Layout, wanted: &[String]) -> Result<Changed> {
     }
     series.save(layout)?;
     let enabled = series.names().into_iter().map(String::from).collect();
-    let disabled = series.disabled(layout);
+    let disabled = series.disabled();
     drop(lock);
 
     Ok(Changed {
@@ -221,19 +223,15 @@ mod tests {
         let (tmp, layout) = testsupport::project();
         testsupport::write_series(
             &layout,
-            &[
-                ("0001-a.patch", "a\n"),
-                ("0002-b.patch", "b\n"),
-                ("0003-c.patch", "c\n"),
-            ],
+            &[("a.patch", "a\n"), ("b.patch", "b\n"), ("c.patch", "c\n")],
         );
         (tmp, layout)
     }
 
     #[test]
-    fn disabling_comments_the_line_out_and_positions_fold_for_apply() {
+    fn disabling_marks_the_line_and_positions_fold_for_apply() {
         let (_tmp, layout) = three_enabled();
-        let cli = Cli::try_parse_from(["skot", "patch", "disable", "0002-b.patch"]).unwrap();
+        let cli = Cli::try_parse_from(["skot", "patch", "disable", "b.patch"]).unwrap();
         let ctx = Ctx {
             layout,
             cli,
@@ -243,7 +241,7 @@ mod tests {
         let exit = run(
             &ctx,
             &DisableArgs {
-                patches: vec!["0002-b.patch".to_owned()],
+                patches: vec!["b.patch".to_owned()],
                 all: false,
             },
         )
@@ -252,20 +250,17 @@ mod tests {
         assert_eq!(exit, Exit::Success);
         assert_eq!(
             std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
-            "0001-a.patch\n# 0002-b.patch\n0003-c.patch\n",
+            "a.patch\n#!b.patch\nc.patch\n",
             "the choice is in the file, trackable"
         );
     }
 
     #[test]
-    fn disabling_an_already_disabled_patch_is_a_no_op() {
+    fn disabling_an_already_disabled_patch_is_a_successful_no_op() {
+        // The state asked for already holds, so the command succeeded.
         let (_tmp, layout) = three_enabled();
-        std::fs::write(
-            layout.series_file(),
-            "0001-a.patch\n# 0002-b.patch\n0003-c.patch\n",
-        )
-        .unwrap();
-        let cli = Cli::try_parse_from(["skot", "patch", "disable", "0002-b.patch"]).unwrap();
+        std::fs::write(layout.series_file(), "a.patch\n#!b.patch\nc.patch\n").unwrap();
+        let cli = Cli::try_parse_from(["skot", "patch", "disable", "b.patch"]).unwrap();
         let ctx = Ctx {
             layout,
             cli,
@@ -275,16 +270,16 @@ mod tests {
         let exit = run(
             &ctx,
             &DisableArgs {
-                patches: vec!["0002-b.patch".to_owned()],
+                patches: vec!["b.patch".to_owned()],
                 all: false,
             },
         )
         .unwrap();
 
-        assert_eq!(exit, Exit::Failure);
+        assert_eq!(exit, Exit::Success);
         assert_eq!(
             std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
-            "0001-a.patch\n# 0002-b.patch\n0003-c.patch\n"
+            "a.patch\n#!b.patch\nc.patch\n"
         );
     }
 
@@ -294,13 +289,13 @@ mod tests {
         let layout = testsupport::landed_set(
             tmp.path(),
             &[
-                ("0001-a.patch", testsupport::patch_one()),
-                ("0002-b.patch", testsupport::patch_two()),
+                ("a.patch", testsupport::patch_one()),
+                ("b.patch", testsupport::patch_two()),
             ],
-            &["0001-a.patch", "0002-b.patch"],
+            &["a.patch", "b.patch"],
         )
         .0;
-        let cli = Cli::try_parse_from(["skot", "patch", "disable", "0001-a.patch"]).unwrap();
+        let cli = Cli::try_parse_from(["skot", "patch", "disable", "a.patch"]).unwrap();
         let ctx = Ctx {
             layout,
             cli,
@@ -310,7 +305,7 @@ mod tests {
         let err = run(
             &ctx,
             &DisableArgs {
-                patches: vec!["0001-a.patch".to_owned()],
+                patches: vec!["a.patch".to_owned()],
                 all: false,
             },
         )
@@ -318,19 +313,19 @@ mod tests {
         .to_string();
 
         assert!(err.contains("is applied"), "{err}");
-        assert!(err.contains(&skot_args("pop", "0001-a.patch")), "{err}");
+        assert!(err.contains(&skot_args("pop", "a.patch")), "{err}");
         assert!(
             std::fs::read_to_string(ctx.layout.series_file())
                 .unwrap()
-                .contains("0001-a.patch\n"),
+                .contains("a.patch\n"),
             "and the line is still an entry"
         );
     }
 
     #[test]
-    fn several_patches_can_be_disabled_at_once_by_prefix() {
+    fn several_patches_can_be_disabled_at_once_by_position() {
         let (_tmp, layout) = three_enabled();
-        let cli = Cli::try_parse_from(["skot", "patch", "disable", "0002", "0003"]).unwrap();
+        let cli = Cli::try_parse_from(["skot", "patch", "disable", "2", "3"]).unwrap();
         let ctx = Ctx {
             layout,
             cli,
@@ -340,7 +335,7 @@ mod tests {
         let exit = run(
             &ctx,
             &DisableArgs {
-                patches: vec!["0002".to_owned(), "0003".to_owned()],
+                patches: vec!["2".to_owned(), "3".to_owned()],
                 all: false,
             },
         )
@@ -349,7 +344,7 @@ mod tests {
         assert_eq!(exit, Exit::Success);
         assert_eq!(
             std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
-            "0001-a.patch\n# 0002-b.patch\n# 0003-c.patch\n"
+            "a.patch\n#!b.patch\n#!c.patch\n"
         );
     }
 
@@ -375,7 +370,7 @@ mod tests {
         assert_eq!(exit, Exit::Success);
         assert_eq!(
             std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
-            "# 0001-a.patch\n# 0002-b.patch\n# 0003-c.patch\n"
+            "#!a.patch\n#!b.patch\n#!c.patch\n"
         );
     }
 
@@ -387,10 +382,10 @@ mod tests {
         let layout = testsupport::landed_set(
             tmp.path(),
             &[
-                ("0001-a.patch", testsupport::patch_one()),
-                ("0002-b.patch", testsupport::patch_two()),
+                ("a.patch", testsupport::patch_one()),
+                ("b.patch", testsupport::patch_two()),
             ],
-            &["0001-a.patch", "0002-b.patch"],
+            &["a.patch", "b.patch"],
         )
         .0;
         let cli = Cli::try_parse_from(["skot", "patch", "disable", "--all"]).unwrap();
@@ -413,9 +408,33 @@ mod tests {
         assert!(
             std::fs::read_to_string(ctx.layout.series_file())
                 .unwrap()
-                .contains("0001-a.patch\n"),
+                .contains("a.patch\n"),
             "the applied line is still an entry"
         );
+    }
+
+    #[test]
+    fn all_with_everything_already_disabled_is_a_successful_no_op() {
+        // Everything disableable is already disabled: the state holds, so success.
+        let (_tmp, layout) = three_enabled();
+        std::fs::write(layout.series_file(), "#!a.patch\n#!b.patch\n").unwrap();
+        let cli = Cli::try_parse_from(["skot", "patch", "disable", "--all"]).unwrap();
+        let ctx = Ctx {
+            layout,
+            cli,
+            yes: false,
+        };
+
+        let exit = run(
+            &ctx,
+            &DisableArgs {
+                patches: Vec::new(),
+                all: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(exit, Exit::Success);
     }
 
     #[test]
@@ -425,14 +444,14 @@ mod tests {
         let layout = testsupport::landed_set(
             tmp.path(),
             &[
-                ("0001-a.patch", testsupport::patch_one()),
-                ("0002-b.patch", testsupport::patch_two()),
-                ("0003-c.patch", testsupport::patch_three()),
+                ("a.patch", testsupport::patch_one()),
+                ("b.patch", testsupport::patch_two()),
+                ("c.patch", testsupport::patch_three()),
             ],
-            &["0001-a.patch", "0002-b.patch"],
+            &["a.patch", "b.patch"],
         )
         .0;
-        let cli = Cli::try_parse_from(["skot", "patch", "disable", "0003", "0001"]).unwrap();
+        let cli = Cli::try_parse_from(["skot", "patch", "disable", "3", "1"]).unwrap();
         let ctx = Ctx {
             layout,
             cli,
@@ -442,7 +461,7 @@ mod tests {
         let err = run(
             &ctx,
             &DisableArgs {
-                patches: vec!["0003".to_owned(), "0001".to_owned()],
+                patches: vec!["3".to_owned(), "1".to_owned()],
                 all: false,
             },
         )
@@ -452,7 +471,7 @@ mod tests {
         assert!(err.contains("is applied"), "{err}");
         assert_eq!(
             std::fs::read_to_string(ctx.layout.series_file()).unwrap(),
-            "0001-a.patch\n0002-b.patch\n0003-c.patch\n",
+            "a.patch\nb.patch\nc.patch\n",
             "the unapplied patch of the batch is untouched"
         );
     }

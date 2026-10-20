@@ -63,7 +63,7 @@ pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<Exit> {
     Hints::new("next")
         .line(format!("edit in {}", dir.display()))
         .entry(
-            skot_args("edit-save", &session.patch),
+            skot_args("save", &session.patch),
             "save your changes to the patch",
         )
         .print();
@@ -96,7 +96,7 @@ fn open(
                 "{} has unsaved changes.\n\
                  `{}` saves them; `{}` discards them and starts over.",
                 existing.patch,
-                skot_args("edit-save", &existing.patch),
+                skot_args("save", &existing.patch),
                 skot_args("edit", &format!("--yes {patch}"))
             );
         }
@@ -195,8 +195,8 @@ mod tests {
         testsupport::write_series(
             &layout,
             &[
-                ("0001-a.patch", testsupport::patch_one()),
-                ("0002-b.patch", testsupport::patch_two()),
+                ("a.patch", testsupport::patch_one()),
+                ("b.patch", testsupport::patch_two()),
             ],
         );
         layout
@@ -209,13 +209,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = series_only(tmp.path());
 
-        let (session, opened, discarded) = open(&layout, "0002-b.patch", None, false).unwrap();
+        let (session, opened, discarded) = open(&layout, "b.patch", None, false).unwrap();
 
         assert!(opened);
         assert!(!discarded);
-        assert_eq!(session.patch, "0002-b.patch");
+        assert_eq!(session.patch, "b.patch");
         assert_eq!(session.ref_name, "main");
-        let dir = layout.work_patch_dir("0002-b.patch").unwrap();
+        let dir = layout.work_patch_dir("b.patch").unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("f.txt")).unwrap(),
             "second\n",
@@ -235,18 +235,18 @@ mod tests {
         // and resetting would throw away exactly what the user came back for.
         let tmp = tempfile::tempdir().unwrap();
         let layout = series_only(tmp.path());
-        let (session, _, _) = open(&layout, "0001-a.patch", None, false).unwrap();
-        let dir = layout.work_patch_dir("0001-a.patch").unwrap();
+        let (session, _, _) = open(&layout, "a.patch", None, false).unwrap();
+        let dir = layout.work_patch_dir("a.patch").unwrap();
         std::fs::write(dir.join("f.txt"), "work in progress\n").unwrap();
 
-        let err = open(&layout, "0001-a.patch", None, false).unwrap_err();
+        let err = open(&layout, "a.patch", None, false).unwrap_err();
         let text = err.to_string();
         assert!(
             text.contains("unsaved changes"),
             "it should name what is at stake: {text}"
         );
         assert!(
-            text.contains(&skot_args("edit-save", "0001-a.patch")),
+            text.contains(&skot_args("save", "a.patch")),
             "it should say how to save them: {text}"
         );
         assert_eq!(
@@ -254,7 +254,7 @@ mod tests {
             "work in progress\n",
             "the edits must survive the refusal"
         );
-        assert_eq!(session.patch, "0001-a.patch");
+        assert_eq!(session.patch, "a.patch");
     }
 
     #[test]
@@ -263,11 +263,11 @@ mod tests {
         // fresh one opens from the patch. The patch file is untouched either way.
         let tmp = tempfile::tempdir().unwrap();
         let layout = series_only(tmp.path());
-        open(&layout, "0001-a.patch", None, false).unwrap();
-        let dir = layout.work_patch_dir("0001-a.patch").unwrap();
+        open(&layout, "a.patch", None, false).unwrap();
+        let dir = layout.work_patch_dir("a.patch").unwrap();
         std::fs::write(dir.join("f.txt"), "work in progress\n").unwrap();
 
-        let (session, opened, discarded) = open(&layout, "0001-a.patch", None, true).unwrap();
+        let (session, opened, discarded) = open(&layout, "a.patch", None, true).unwrap();
 
         assert!(opened);
         assert!(discarded);
@@ -276,7 +276,7 @@ mod tests {
             "first\n",
             "the work area starts over from the patch's own content"
         );
-        assert_eq!(session.patch, "0001-a.patch");
+        assert_eq!(session.patch, "a.patch");
     }
 
     #[test]
@@ -285,9 +285,9 @@ mod tests {
         // patch, and coming back to it is the normal resume path.
         let tmp = tempfile::tempdir().unwrap();
         let layout = series_only(tmp.path());
-        let (session, _, _) = open(&layout, "0001-a.patch", None, false).unwrap();
+        let (session, _, _) = open(&layout, "a.patch", None, false).unwrap();
 
-        let (again, opened, discarded) = open(&layout, "0001-a.patch", None, false).unwrap();
+        let (again, opened, discarded) = open(&layout, "a.patch", None, false).unwrap();
 
         assert!(!opened, "an existing work area is not reopened");
         assert!(!discarded);
@@ -319,7 +319,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = open(&layout, "0001-a.patch", Some("nope"), false).unwrap_err();
+        let err = open(&layout, "a.patch", Some("nope"), false).unwrap_err();
         let text = format!("{err:#}");
         assert!(
             text.contains("nope"),
@@ -335,9 +335,9 @@ mod tests {
     fn edit_without_a_base_says_how_to_choose_one() {
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = testsupport::mirror_with_one_commit(tmp.path());
-        testsupport::write_series(&layout, &[("0001-a.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", "")]);
 
-        let err = open(&layout, "0001-a.patch", None, false)
+        let err = open(&layout, "a.patch", None, false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--base"), "should point at the flag: {err}");
@@ -353,13 +353,13 @@ mod tests {
         // down to an empty patch replaying as no change at all.
         let tmp = tempfile::tempdir().unwrap();
         let layout = series_only(tmp.path());
-        std::fs::write(layout.patches_dir().join("0001-a.patch"), "").unwrap();
+        std::fs::write(layout.patches_dir().join("a.patch"), "").unwrap();
 
-        let (session, opened, _) = open(&layout, "0001-a.patch", None, false).unwrap();
+        let (session, opened, _) = open(&layout, "a.patch", None, false).unwrap();
 
         assert!(opened);
-        assert_eq!(session.patch, "0001-a.patch");
-        let dir = layout.work_patch_dir("0001-a.patch").unwrap();
+        assert_eq!(session.patch, "a.patch");
+        let dir = layout.work_patch_dir("a.patch").unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("f.txt")).unwrap(),
             "base\n",
@@ -373,23 +373,17 @@ mod tests {
         let layout = series_only(tmp.path());
 
         let err = open(&layout, "nope", None, false).unwrap_err().to_string();
-        assert!(
-            err.contains("0001-a.patch"),
-            "the message should list it: {err}"
-        );
-        assert!(
-            err.contains("0002-b.patch"),
-            "the message should list it: {err}"
-        );
+        assert!(err.contains("a.patch"), "the message should list it: {err}");
+        assert!(err.contains("b.patch"), "the message should list it: {err}");
     }
 
     #[test]
     fn the_edit_command_parses_with_a_patch_and_an_optional_base() {
-        let cli = Cli::try_parse_from(["skot", "patch", "edit", "0001-a.patch"]).unwrap();
+        let cli = Cli::try_parse_from(["skot", "patch", "edit", "a.patch"]).unwrap();
         let Command::Patch(PatchCommand::Edit(args)) = cli.command else {
             panic!("expected edit")
         };
-        assert_eq!(args.patch, "0001-a.patch");
+        assert_eq!(args.patch, "a.patch");
         assert!(args.base.is_none());
         assert!(!args.yes);
         assert!(Cli::try_parse_from(["skot", "patch", "edit", "x", "--base", "v2"]).is_ok());

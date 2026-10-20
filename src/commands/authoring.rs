@@ -1,4 +1,4 @@
-//! Shared plumbing for the authoring commands: `patch new`, `patch edit-save`,
+//! Shared plumbing for the authoring commands: `patch new`, `patch save`,
 //! `patch push`, `patch pop`, and `rebase`.
 //!
 //! These five all move between three states: the series on disk, the sandbox working tree,
@@ -117,15 +117,14 @@ pub fn header_for(
 }
 
 /// The subject to use for a patch named `name`, when the file has no header of its own.
+///
+/// The stem read as words: a name is the patch's own, so this just drops the extension
+/// and separates what the separators separate. An existing `Subject:` header always
+/// wins over this.
 pub fn subject_from_name(name: &str) -> String {
     let stem = name.rsplit('/').next().unwrap_or(name);
     let without_ext = stem.strip_suffix(".patch").unwrap_or(stem);
-    // `0001-trim-the-widgets` reads as "trim the widgets" once the number and extension are
-    // gone. This is a default, not a rule: an existing `Subject:` header always wins.
-    without_ext
-        .split_once('-')
-        .map(|(_, rest)| rest.replace('-', " "))
-        .unwrap_or_else(|| without_ext.replace('_', " "))
+    without_ext.replace(['-', '_'], " ")
 }
 
 /// The ref a stack command should work against.
@@ -223,7 +222,7 @@ pub fn recorded_stack(
 /// Work out the set that `push` or `pop` should leave applied.
 ///
 /// The rule behind both commands: **the applied set is an ordered subset of the series.**
-/// Any patch may be on or off (disabling 0002 while keeping 0003 on 0001 is legitimate),
+/// Any patch may be on or off (disabling b while keeping c on a is legitimate),
 /// and the set always replays in series order. What the commands refuse to do is *guess*
 /// which patch the user meant to touch; both stay directional, quilt-style:
 ///
@@ -241,9 +240,9 @@ pub fn recorded_stack(
 /// among the enabled patches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatchRef {
-    /// An exact name, or a unique prefix of one, such as the serial `0003`.
+    /// An exact name, or a unique prefix of one, such as `fix`.
     Name(String),
-    /// A 1-based position among the enabled patches. Disabled lines hold no number.
+    /// A 1-based position among the enabled patches. A disabled patch has no position.
     Position(usize),
 }
 
@@ -259,10 +258,10 @@ impl PatchRef {
 
 /// Resolve a patch reference the way every `[PATCH]` argument reads one.
 ///
-/// An exact name wins, then a unique name prefix such as the serial `0003` (the digits
-/// `ls` shows), then a 1-based position among the enabled patches. `all` is every name
-/// in the series, enabled or not, so a disabled patch can still be named; `enabled` is
-/// the position space, since a disabled line holds no number.
+/// An exact name wins, then a unique name prefix such as `fix`, then a 1-based position
+/// among the enabled patches. `all` is every name in the series, enabled or not, so a
+/// disabled patch can still be named; `enabled` is the position space, since a disabled
+/// patch has no position.
 pub fn resolve_patch(all: &[&str], enabled: &[&str], want: &str) -> Result<PatchRef> {
     if all.contains(&want) {
         return Ok(PatchRef::Name(want.to_owned()));
@@ -330,7 +329,7 @@ pub fn resolve_stack(
             // resolves too, and lands in the refusal below rather than in a series
             // the sandbox would disagree with.
             let names: Vec<&str> = all.iter().map(|e| e.name.as_str()).collect();
-            let disabled: Vec<String> = series.disabled(layout);
+            let disabled: Vec<String> = series.disabled();
             let mut universe: Vec<&str> = names.clone();
             universe.extend(disabled.iter().map(String::as_str));
             let name = resolve_patch(&universe, &names, want)?.name(&names);
@@ -364,8 +363,8 @@ pub fn resolve_stack(
                             skot_args("pop", &all[position].name)
                         );
                     }
-                    // Enable it and everything below: 0003 cannot stand alone, so pushing a
-                    // named patch fills the holes under it (but never the ones above).
+                    // Enable it and everything below: a patch cannot stand alone, so pushing
+                    // a named patch fills the holes under it (but never the ones above).
                     for slot in on.iter_mut().take(position + 1) {
                         *slot = true;
                     }
@@ -454,43 +453,38 @@ pub fn land(layout: &Layout, ref_name: &str, base: &Sha, stack: &Stack) -> Resul
 mod tests {
     use super::*;
 
-    const THREE: [&str; 3] = ["0001-a.patch", "0002-b.patch", "0003-c.patch"];
+    const THREE: [&str; 3] = ["a.patch", "b.patch", "c.patch"];
 
     #[test]
     fn an_exact_name_resolves_to_itself() {
-        let got = resolve_patch(&THREE, &THREE, "0002-b.patch").unwrap();
-        assert_eq!(got, PatchRef::Name("0002-b.patch".to_owned()));
+        let got = resolve_patch(&THREE, &THREE, "b.patch").unwrap();
+        assert_eq!(got, PatchRef::Name("b.patch".to_owned()));
     }
 
     #[test]
-    fn a_serial_prefix_resolves_to_its_patch() {
-        // The digits `ls` show, without the full name: `0003` is the patch, not
-        // position 3. They usually agree; after a reorder they do not.
-        let got = resolve_patch(&THREE, &THREE, "0003").unwrap();
-        assert_eq!(got, PatchRef::Name("0003-c.patch".to_owned()));
+    fn a_name_prefix_resolves_to_its_patch() {
+        let got = resolve_patch(&THREE, &THREE, "b").unwrap();
+        assert_eq!(got, PatchRef::Name("b.patch".to_owned()));
     }
 
     #[test]
     fn a_bare_number_is_a_position_among_the_enabled() {
         let got = resolve_patch(&THREE, &THREE, "2").unwrap();
         assert_eq!(got, PatchRef::Position(2));
-        assert_eq!(got.name(&THREE), "0002-b.patch");
+        assert_eq!(got.name(&THREE), "b.patch");
     }
 
     #[test]
     fn a_prefix_matching_more_than_one_patch_is_refused_with_the_candidates() {
-        let err = resolve_patch(&THREE, &THREE, "000")
-            .unwrap_err()
-            .to_string();
+        let many = ["fix-a.patch", "fix-b.patch", "other.patch"];
+        let err = resolve_patch(&many, &many, "fix").unwrap_err().to_string();
         assert!(err.contains("more than one"), "{err}");
-        assert!(err.contains("0001-a.patch"), "{err}");
-        assert!(err.contains("0003-c.patch"), "{err}");
+        assert!(err.contains("fix-a.patch"), "{err}");
+        assert!(err.contains("fix-b.patch"), "{err}");
     }
 
     #[test]
     fn a_zero_position_is_refused_as_not_one_based() {
-        // With serial-shaped names `0` would be a prefix of everything and refused as
-        // ambiguous; a series without them still has to refuse the zero position.
         let plain = ["a.patch", "b.patch"];
         let err = resolve_patch(&plain, &plain, "0").unwrap_err().to_string();
         assert!(err.contains("1-based"), "{err}");
@@ -500,26 +494,26 @@ mod tests {
     fn a_position_past_the_enabled_set_lists_what_is_there() {
         let err = resolve_patch(&THREE, &THREE, "4").unwrap_err().to_string();
         assert!(err.contains("does not exist"), "{err}");
-        assert!(err.contains("0003-c.patch"), "{err}");
+        assert!(err.contains("c.patch"), "{err}");
     }
 
     #[test]
     fn an_unknown_reference_lists_every_name_including_the_disabled() {
-        let all = ["0001-a.patch", "0002-b.patch", "0003-c.patch"];
-        let enabled = ["0001-a.patch", "0003-c.patch"];
+        let all = ["a.patch", "b.patch", "c.patch"];
+        let enabled = ["a.patch", "c.patch"];
         let err = resolve_patch(&all, &enabled, "nope.patch")
             .unwrap_err()
             .to_string();
         assert!(err.contains("is not in the series"), "{err}");
-        assert!(err.contains("0002-b.patch"), "{err}");
+        assert!(err.contains("b.patch"), "{err}");
     }
 
     #[test]
     fn a_disabled_patch_can_still_be_named() {
-        let all = ["0001-a.patch", "0002-b.patch", "0003-c.patch"];
-        let enabled = ["0001-a.patch", "0003-c.patch"];
-        let got = resolve_patch(&all, &enabled, "0002").unwrap();
-        assert_eq!(got, PatchRef::Name("0002-b.patch".to_owned()));
+        let all = ["a.patch", "b.patch", "c.patch"];
+        let enabled = ["a.patch", "c.patch"];
+        let got = resolve_patch(&all, &enabled, "b").unwrap();
+        assert_eq!(got, PatchRef::Name("b.patch".to_owned()));
     }
 
     #[test]
@@ -529,36 +523,26 @@ mod tests {
         let (_tmp, layout) = crate::commands::testsupport::project();
         crate::commands::testsupport::write_series(
             &layout,
-            &[
-                ("0001-a.patch", ""),
-                ("0002-b.patch", ""),
-                ("0003-c.patch", ""),
-            ],
+            &[("a.patch", ""), ("b.patch", ""), ("c.patch", "")],
         );
         let series = layout.project().unwrap().1;
         let mut state = State::default();
         state
-            .set_applied(
-                &layout,
-                vec!["0001-a.patch".to_owned(), "0003-c.patch".to_owned()],
-            )
+            .set_applied(&layout, vec!["a.patch".to_owned(), "c.patch".to_owned()])
             .unwrap();
 
         let stack = recorded_stack(&layout, &series, &state).unwrap();
-        assert_eq!(stack.names, ["0001-a.patch", "0003-c.patch"]);
+        assert_eq!(stack.names, ["a.patch", "c.patch"]);
     }
 
     #[test]
     fn a_subject_is_derived_from_a_patch_filename() {
         assert_eq!(
-            subject_from_name("0001-trim-the-widgets.patch"),
+            subject_from_name("trim-the-widgets.patch"),
             "trim the widgets"
         );
-        assert_eq!(subject_from_name("sub/0002-fix-thing.patch"), "fix thing");
-        assert_eq!(
-            subject_from_name("0003-no-number-here.patch"),
-            "no number here"
-        );
+        assert_eq!(subject_from_name("sub/fix-thing.patch"), "fix thing");
+        assert_eq!(subject_from_name("no-number-here.patch"), "no number here");
         assert_eq!(subject_from_name("loose.patch"), "loose");
     }
 
@@ -588,7 +572,7 @@ mod tests {
 
     #[test]
     fn a_header_from_a_bare_diff_is_stamped_rather_than_ignored() {
-        // An empty patch file has no header, and `edit-save` has to turn it into a real patch.
+        // An empty patch file has no header, and `save` has to turn it into a real patch.
         let sig = git2::Signature::now("A U Thor", "author@example.com").unwrap();
         let header = header_for(Some("diff --git a/a b/a\n"), "fallback", &sig);
         assert_eq!(header.subject(), "fallback");
@@ -601,7 +585,7 @@ mod tests {
         std::fs::create_dir_all(layout.series_root().join("exp")).unwrap();
         let mut state = State::load(&layout).unwrap();
         state
-            .set_applied(&layout, vec!["0001-a.patch".to_owned()])
+            .set_applied(&layout, vec!["a.patch".to_owned()])
             .unwrap();
 
         // The holder is the series the sandbox was applied for.

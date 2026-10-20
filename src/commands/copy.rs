@@ -148,25 +148,21 @@ mod tests {
         std::fs::create_dir_all(layout.series_root().join("exp")).unwrap();
         write_series(
             &layout.with_series("exp").unwrap(),
-            &[
-                ("0001-a.patch", "a\n"),
-                ("0002-b.patch", "b\n"),
-                ("0003-c.patch", "c\n"),
-            ],
+            &[("a.patch", "a\n"), ("b.patch", "b\n"), ("c.patch", "c\n")],
         );
-        write_series(&layout, &[("0001-a.patch", "a\n")]);
+        write_series(&layout, &[("a.patch", "a\n")]);
 
         // A prefix, resolved in the source series the way every patch command resolves.
-        let exit = copy(&ctx_for(&layout), "0003", "exp").unwrap();
+        let exit = copy(&ctx_for(&layout), "c", "exp").unwrap();
 
         assert!(matches!(exit, Exit::Success));
         assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0003-c.patch")).unwrap(),
+            std::fs::read_to_string(layout.patches_dir().join("c.patch")).unwrap(),
             "c\n"
         );
         assert_eq!(
             std::fs::read_to_string(layout.series_file()).unwrap(),
-            "0001-a.patch\n0003-c.patch\n",
+            "a.patch\nc.patch\n",
             "the copy lands at the end of the series"
         );
     }
@@ -175,18 +171,18 @@ mod tests {
     fn a_name_the_target_already_holds_is_refused_not_overwritten() {
         let (_tmp, layout) = project();
         std::fs::create_dir_all(layout.series_root().join("exp")).unwrap();
-        write_series(&layout, &[("0001-a.patch", "mine\n")]);
+        write_series(&layout, &[("a.patch", "mine\n")]);
         write_series(
             &layout.with_series("exp").unwrap(),
-            &[("0001-a.patch", "theirs\n")],
+            &[("a.patch", "theirs\n")],
         );
 
-        let err = copy(&ctx_for(&layout), "0001-a.patch", "exp").unwrap_err();
+        let err = copy(&ctx_for(&layout), "a.patch", "exp").unwrap_err();
 
         let text = format!("{err:#}");
         assert!(text.contains("already holds"), "{text}");
         assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0001-a.patch")).unwrap(),
+            std::fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap(),
             "mine\n",
             "the existing file is untouched"
         );
@@ -198,15 +194,15 @@ mod tests {
         std::fs::create_dir_all(layout.series_root().join("exp")).unwrap();
         write_series(
             &layout.with_series("exp").unwrap(),
-            &[("0001-a.patch", "a\n"), ("0002-ab.patch", "b\n")],
+            &[("a.patch", "a\n"), ("ab.patch", "b\n")],
         );
 
-        let err = copy(&ctx_for(&layout), "000", "exp").unwrap_err();
+        let err = copy(&ctx_for(&layout), "a", "exp").unwrap_err();
 
         let text = format!("{err:#}");
         assert!(text.contains("several patches"), "{text}");
         assert!(
-            text.contains("0001-a.patch") && text.contains("0002-ab.patch"),
+            text.contains("a.patch") && text.contains("ab.patch"),
             "{text}"
         );
     }

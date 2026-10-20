@@ -12,9 +12,8 @@
 //! like any other.
 //!
 //! What import does *not* do is apply anything. The patch joins the series at the end (or
-//! at `--at`, with the tail renumbered so the numbers stay contiguous), and the sandbox is
-//! untouched, so the next step is the same as after `new`: verify with
-//! `skot check`, or take the whole run with `skot build`.
+//! at `--at`), and the sandbox is untouched, so the next step is the same as after
+//! `new`: verify with `skot check`, or take the whole run with `skot build`.
 //!
 //! Import is also repeatable. Re-running the same request is not a second copy: a patch
 //! whose diff already matches is reported, not rewritten, and a patch recorded for the
@@ -402,11 +401,9 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     };
 
     // A name the user gave is the subject the same way it is for `new`: read back from the
-    // filename, so `skot patch list` and the patch header say the same words. The number is not
-    // part of those words — it only appears once the patch is placed in the series — so any
-    // placeholder prefix reads the same words the real one will.
+    // filename, so `skot patch list` and the patch header say the same words.
     let subject = if args.name.is_some() {
-        authoring::subject_from_name(&series::default_patch_name("1", &slug))
+        authoring::subject_from_name(&series::default_patch_name(&slug))
     } else {
         derived
     };
@@ -551,8 +548,7 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     // `--at` says otherwise). Chosen here rather than earlier because a run that turns
     // out to be a no-op never names a file.
     let index = series::position_at(&series, args.at.as_deref())?;
-    let prefix = index + 1;
-    let patch_name = series::default_patch_name(&prefix.to_string(), &slug);
+    let patch_name = series::default_patch_name(&slug);
     let path = layout.patches_dir().join(&patch_name);
     if path.exists() {
         bail!(
@@ -566,19 +562,13 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         std::fs::write(&path, &text).context(format!("writing {}", path.display()))?;
         None
     } else {
-        // The tail renumbers first (this may be what frees the name), the series is saved
-        // to match, and only then is the file written: a failure anywhere before the
-        // write leaves at worst a listed patch with no file, which `skot patch list` calls out.
-        let (line, renames) = series.insert_renumbering(layout, &patch_name, index)?;
+        // The line goes in, the series is saved to match, and only then is the file
+        // written: a failure anywhere before the write leaves at worst a listed patch with
+        // no file, which `skot patch list` calls out. Nothing else in the series moves, so
+        // there is no record to carry behind it.
+        let line = series.insert(&patch_name, index)?;
         series.save(layout)?;
         std::fs::write(&path, &text).context(format!("writing {}", path.display()))?;
-        let mut state = crate::state::State::load(layout)?;
-        state.follow_renames(layout, &renames)?;
-        // Sessions opened on a renamed patch keep their worktree and follow the new name,
-        // the same way the applied set does.
-        let mut sessions = crate::session::Manifest::load(layout)?;
-        sessions.follow_renames(layout, &renames);
-        sessions.save(layout)?;
         Some(line)
     };
     drop(lock);
@@ -1277,9 +1267,9 @@ mod tests {
     }
 
     #[test]
-    fn importing_at_a_position_inserts_and_renumbers_the_tail() {
+    fn importing_at_a_position_inserts_the_line() {
         let (_tmp, layout, _main) = fixture();
-        testsupport::write_series(&layout, &[("0001-a.patch", ""), ("0002-b.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", ""), ("b.patch", "")]);
 
         let done = import(
             &layout,
@@ -1291,23 +1281,18 @@ mod tests {
         .unwrap();
 
         assert_eq!(done.series_line, Some(2), "it occupies the second slot");
-        assert!(
-            done.patch.starts_with("0002-"),
-            "its number is its position: {}",
-            done.patch
-        );
         let series = std::fs::read_to_string(layout.series_file()).unwrap();
         assert_eq!(
             series.trim_end().lines().collect::<Vec<_>>(),
             vec![
-                "0001-a.patch".to_owned(),
+                "a.patch".to_owned(),
                 done.patch.clone(),
-                "0003-b.patch".to_owned()
+                "b.patch".to_owned()
             ],
-            "the tail was renumbered, not left with a gap:\n{series}"
+            "the line it took is the second one, and b.patch kept its own:\n{series}"
         );
-        assert!(layout.patches_dir().join("0003-b.patch").is_file());
-        assert!(!layout.patches_dir().join("0002-b.patch").exists());
+        assert!(layout.patches_dir().join(&done.patch).is_file());
+        assert!(layout.patches_dir().join("b.patch").is_file());
     }
 
     #[test]
@@ -1606,7 +1591,7 @@ mod tests {
 
         assert_eq!(done.commits, 2);
         assert_eq!(
-            done.patch, "0001-import-main-feat.patch",
+            done.patch, "import-main-feat.patch",
             "the range as written, not what it resolved to"
         );
     }
@@ -1631,7 +1616,7 @@ mod tests {
 
         let done = import(&layout, &args(Some("feat"))).unwrap();
 
-        assert_eq!(done.patch, "0001-add-the-second-line.patch");
+        assert_eq!(done.patch, "add-the-second-line.patch");
         let text = std::fs::read_to_string(&done.path).unwrap();
         assert!(
             text.contains("Subject: [PATCH] add the second line"),
@@ -1741,7 +1726,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(done.patch, "0001-the-second-line.patch");
+        assert_eq!(done.patch, "the-second-line.patch");
         let text = std::fs::read_to_string(&done.path).unwrap();
         assert!(
             text.contains("Subject: [PATCH] the second line"),
@@ -1980,7 +1965,7 @@ mod tests {
 
         assert_eq!(done.commits, 2);
         assert_eq!(
-            done.patch, "0001-import-pr-7.patch",
+            done.patch, "import-pr-7.patch",
             "the request, not the resolved range, names a multi-commit import"
         );
     }

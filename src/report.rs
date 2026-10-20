@@ -19,7 +19,7 @@ const KEY: usize = 14;
 
 /// A heading, starting a new block.
 pub fn section(title: &str) {
-    println!("\n{}", Styled::new().bold().render(title));
+    println!("\n {}", Styled::new().underlined().bold().render(title));
 }
 
 /// A `key   value` line. The key is dim so the values read as the content.

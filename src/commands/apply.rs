@@ -368,7 +368,7 @@ fn report_failure(report: &check::Report) {
     info!(
         target: "apply",
         "Rebase the patch against this ref, then `{}` to re-export it.",
-        skot("edit-save")
+        skot("save")
     );
 }
 
@@ -499,7 +499,7 @@ mod tests {
         let f = Fixture::new();
         f.with_upstream();
         f.patch(
-            "0001-a.patch",
+            "a.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 1111111..2222222 100644
@@ -511,7 +511,7 @@ index 1111111..2222222 100644
 ",
         );
         f.patch(
-            "0002-b.patch",
+            "b.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 3333333..4444444 100644
@@ -522,9 +522,9 @@ index 3333333..4444444 100644
 +second
 ",
         );
-        f.series(&["0001-a.patch", "0002-b.patch"]);
+        f.series(&["a.patch", "b.patch"]);
 
-        let picked = vec!["0001-a.patch".to_owned()];
+        let picked = vec!["a.patch".to_owned()];
         let applied = apply_inner(&f.layout, Some("main"), false, Some(&picked)).unwrap();
 
         assert!(applied.ok, "{}", applied.failure);
@@ -536,7 +536,7 @@ index 3333333..4444444 100644
         let state = crate::state::State::load(&f.layout).unwrap();
         assert_eq!(
             state.applied(&f.layout).to_vec(),
-            ["0001-a.patch"],
+            ["a.patch"],
             "the record must match the selection"
         );
     }
@@ -546,7 +546,7 @@ index 3333333..4444444 100644
         let f = Fixture::new();
         f.with_upstream();
         f.patch(
-            "0001-a.patch",
+            "a.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 1111111..2222222 100644
@@ -557,7 +557,7 @@ index 1111111..2222222 100644
 +first
 ",
         );
-        f.series(&["0001-a.patch"]);
+        f.series(&["a.patch"]);
 
         assert!(apply_locked(&f.layout, None).unwrap().ok);
         assert_eq!(f.sandbox_file(), "first\n");
@@ -566,7 +566,7 @@ index 1111111..2222222 100644
                 .unwrap()
                 .applied(&f.layout)
                 .to_vec(),
-            vec!["0001-a.patch".to_owned()]
+            vec!["a.patch".to_owned()]
         );
     }
 
@@ -594,11 +594,11 @@ index 1111111..2222222 100644
     #[test]
     fn apply_accumulates_so_the_second_patch_sees_the_first() {
         // The whole reason apply exists as a series operation: these two conflict unless
-        // they are applied in order, and 0002 alone would look fine.
+        // they are applied in order, and b.patch alone would look fine.
         let f = Fixture::new();
         f.with_upstream();
         f.patch(
-            "0001-a.patch",
+            "a.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 1111111..2222222 100644
@@ -610,7 +610,7 @@ index 1111111..2222222 100644
 ",
         );
         f.patch(
-            "0002-b.patch",
+            "b.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 3333333..4444444 100644
@@ -621,7 +621,7 @@ index 3333333..4444444 100644
 +final
 ",
         );
-        f.series(&["0001-a.patch", "0002-b.patch"]);
+        f.series(&["a.patch", "b.patch"]);
 
         assert!(apply_locked(&f.layout, None).unwrap().ok);
         assert_eq!(f.sandbox_file(), "final\n");
@@ -634,7 +634,7 @@ index 3333333..4444444 100644
         let f = Fixture::new();
         f.with_upstream();
         f.patch(
-            "0001-a.patch",
+            "a.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 1111111..2222222 100644
@@ -645,7 +645,7 @@ index 1111111..2222222 100644
 +nope
 ",
         );
-        f.series(&["0001-a.patch"]);
+        f.series(&["a.patch"]);
 
         assert!(!apply_locked(&f.layout, None).unwrap().ok);
         assert_eq!(
@@ -665,11 +665,11 @@ index 1111111..2222222 100644
     #[test]
     fn apply_twice_is_not_a_conflict() {
         // Re-running apply is the normal response to a failed one, and to a patch that
-        // `edit-save` rewrote. It must converge rather than report the series against itself.
+        // `save` rewrote. It must converge rather than report the series against itself.
         let f = Fixture::new();
         f.with_upstream();
         f.patch(
-            "0001-a.patch",
+            "a.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 1111111..2222222 100644
@@ -680,7 +680,7 @@ index 1111111..2222222 100644
 +first
 ",
         );
-        f.series(&["0001-a.patch"]);
+        f.series(&["a.patch"]);
 
         assert!(apply_locked(&f.layout, None).unwrap().ok);
         assert!(apply_locked(&f.layout, None).unwrap().ok);
@@ -692,7 +692,7 @@ index 1111111..2222222 100644
         let f = Fixture::new();
         f.with_upstream();
         f.patch(
-            "0001-a.patch",
+            "a.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 1111111..2222222 100644
@@ -703,7 +703,7 @@ index 1111111..2222222 100644
 +first
 ",
         );
-        f.series(&["0001-a.patch"]);
+        f.series(&["a.patch"]);
         apply_locked(&f.layout, None).unwrap();
         assert_eq!(f.sandbox_file(), "first\n");
 
@@ -717,7 +717,7 @@ index 1111111..2222222 100644
                 .is_empty()
         );
         // And the patch itself is still there: unapply is not a delete.
-        assert!(f.layout.patches_dir().join("0001-a.patch").is_file());
+        assert!(f.layout.patches_dir().join("a.patch").is_file());
     }
 
     #[test]
@@ -733,8 +733,8 @@ index 1111111..2222222 100644
         let f = Fixture::new();
         f.with_upstream();
         std::fs::write(f.layout.config_file(), "[upstream]\nurl = \"u\"\n").unwrap();
-        f.patch("0001-a.patch", "");
-        f.series(&["0001-a.patch"]);
+        f.patch("a.patch", "");
+        f.series(&["a.patch"]);
 
         let err = apply_locked(&f.layout, None).unwrap_err().to_string();
         assert!(err.contains("no ref to apply against"), "got {err}");
@@ -752,8 +752,8 @@ index 1111111..2222222 100644
         let f = Fixture::new();
         f.with_upstream();
         f.real_upstream();
-        f.series(&["0001-a.patch"]);
-        f.patch("0001-a.patch", "");
+        f.series(&["a.patch"]);
+        f.patch("a.patch", "");
 
         let err = apply_locked(&f.layout, Some("nonexistent"))
             .unwrap_err()
@@ -773,7 +773,7 @@ index 1111111..2222222 100644
         let f = Fixture::new();
         f.with_upstream();
         f.patch(
-            "0001-a.patch",
+            "a.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 1111111..2222222 100644
@@ -784,14 +784,14 @@ index 1111111..2222222 100644
 +first
 ",
         );
-        f.series(&["0001-a.patch"]);
+        f.series(&["a.patch"]);
 
         assert!(apply_locked(&f.layout, None).unwrap().ok);
         let state = crate::state::State::load(&f.layout).unwrap();
         assert_eq!(state.ref_name(&f.layout), Some("main"));
         assert_eq!(
             state.applied(&f.layout).to_vec(),
-            vec!["0001-a.patch".to_owned()]
+            vec!["a.patch".to_owned()]
         );
     }
 
@@ -803,7 +803,7 @@ index 1111111..2222222 100644
         let f = Fixture::new();
         f.with_upstream();
         f.patch(
-            "0001-a.patch",
+            "a.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 1111111..2222222 100644
@@ -814,7 +814,7 @@ index 1111111..2222222 100644
 +nope
 ",
         );
-        f.series(&["0001-a.patch"]);
+        f.series(&["a.patch"]);
 
         assert!(!apply_locked(&f.layout, None).unwrap().ok);
         assert!(
@@ -834,7 +834,7 @@ index 1111111..2222222 100644
         let f = Fixture::new();
         f.with_upstream();
         f.patch(
-            "0001-a.patch",
+            "a.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 1111111..2222222 100644
@@ -845,11 +845,11 @@ index 1111111..2222222 100644
 +first
 ",
         );
-        f.series(&["0001-a.patch"]);
+        f.series(&["a.patch"]);
         assert!(apply_locked(&f.layout, None).unwrap().ok);
 
         f.patch(
-            "0001-a.patch",
+            "a.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 3333333..4444444 100644
@@ -895,7 +895,7 @@ index 3333333..4444444 100644
             assert_ne!(sha, base);
         }
         f.patch(
-            "0001-a.patch",
+            "a.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 1111111..2222222 100644
@@ -906,7 +906,7 @@ index 1111111..2222222 100644
 +first
 ",
         );
-        f.series(&["0001-a.patch"]);
+        f.series(&["a.patch"]);
         assert!(apply_locked(&f.layout, Some("other")).unwrap().ok);
 
         // Now the default moves, as it would if someone repointed the project.

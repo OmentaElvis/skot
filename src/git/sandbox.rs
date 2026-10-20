@@ -973,11 +973,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (layout, sha) = mirror_with_one_commit(tmp.path());
         let mirror = Mirror::open(&layout).unwrap();
-        let dir = layout.work_patch_dir("0001-a.patch").unwrap();
+        let dir = layout.work_patch_dir("a.patch").unwrap();
 
         add(
             &mirror,
-            "0001-a.patch",
+            "a.patch",
             &dir,
             &crate::invocation::skot_args("clean", "--sessions"),
         )
@@ -987,18 +987,18 @@ mod tests {
         let refs = mirror.refs().unwrap();
         let branches: Vec<&str> = refs.branches.iter().map(|(n, _)| n.as_str()).collect();
         assert!(
-            !branches.contains(&"0001-a.patch"),
+            !branches.contains(&"a.patch"),
             "a named worktree must not leave a branch behind either"
         );
 
         let repo = open_named(
             &mirror,
-            "0001-a.patch",
+            "a.patch",
             &dir,
             &crate::invocation::skot_args("clean", "--sessions"),
         )
         .unwrap();
-        reset_at(&repo, "0001-a.patch", &dir, &sha, &[]).unwrap();
+        reset_at(&repo, "a.patch", &dir, &sha, &[]).unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("a.txt")).unwrap(),
             "one\n",
@@ -1009,10 +1009,10 @@ mod tests {
             "a session is detached, never on a branch"
         );
 
-        prune(&mirror, "0001-a.patch", &dir).unwrap();
+        prune(&mirror, "a.patch", &dir).unwrap();
         assert!(!dir.exists());
         // And the registration went with it: re-adding works rather than refusing.
-        add(&mirror, "0001-a.patch", &dir, "remedy").unwrap();
+        add(&mirror, "a.patch", &dir, "remedy").unwrap();
     }
 
     #[test]
@@ -1022,12 +1022,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = mirror_with_one_commit(tmp.path());
         let mirror = Mirror::open(&layout).unwrap();
-        let dir = layout.work_patch_dir("0001-a.patch").unwrap();
+        let dir = layout.work_patch_dir("a.patch").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("leftover"), b"interrupted").unwrap();
 
         let remedy = crate::invocation::skot_args("clean", "--sessions");
-        let err = add(&mirror, "0001-a.patch", &dir, &remedy)
+        let err = add(&mirror, "a.patch", &dir, &remedy)
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a skot worktree"), "got {err}");
@@ -1045,8 +1045,8 @@ mod tests {
         assert_eq!(pct("my series"), "my%20series");
         assert_eq!(pct("a/b"), "a%2Fb");
         assert_eq!(
-            session_worktree_name("my series", "sub/0001-a.patch"),
-            "my%20series@sub%2F0001-a.patch"
+            session_worktree_name("my series", "sub/a.patch"),
+            "my%20series@sub%2Fa.patch"
         );
         assert_eq!(sandbox_worktree_name(&Layout::new(".")), "sandbox");
         let per = Layout::new(".").with_per_series_sandbox(true);

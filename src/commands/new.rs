@@ -1,10 +1,10 @@
 //! `patch new`: start the next patch, with a work area open on it.
 //!
 //! The authoring loop is one command per step: `new` gives you an empty patch registered at
-//! its position in the series (`--at` picks the position, the end by default, and the tail is
-//! renumbered so the numbers stay contiguous) and a worktree of its own under `.skot/work/`
-//! holding everything below it, ready to edit. `edit-save` turns what you changed in there
-//! into that patch's contents. Nothing is committed anywhere: the patch file *is* the record.
+//! its position in the series (`--at` picks the position, the end by default) and a worktree
+//! of its own under `.skot/work/` holding everything below it, ready to edit. `save`
+//! turns what you changed in there into that patch's contents. Nothing is committed anywhere:
+//! the patch file *is* the record.
 //!
 //! Two things are worth stating, because both are easy to get wrong:
 //!
@@ -14,7 +14,7 @@
 //!   someone to discover later. It also means the work area opens on a tree the series
 //!   actually produces, not on whatever happened to be checked out.
 //! - **It does not invent the patch's contents.** The file is written empty and registered, so
-//!   that `edit-save` has something to fill in and the series is complete before editing
+//!   that `save` has something to fill in and the series is complete before editing
 //!   starts. An empty patch in the series is honest; a patch with a guessed subject and an
 //!   empty diff is not.
 //!
@@ -83,7 +83,7 @@ pub fn run(ctx: &Ctx, args: &NewArgs) -> Result<Exit> {
     Hints::new("next")
         .line(format!("edit in {}", created.work_area.display()))
         .entry(
-            skot_args("edit-save", &created.name),
+            skot_args("save", &created.name),
             "save your changes to the patch",
         )
         .print();
@@ -95,11 +95,11 @@ fn create(layout: &Layout, name: &str, base: Option<&str>, at: Option<&str>) -> 
     let (config, mut series) = layout.project()?;
     let slug = slug(name)?;
 
-    // Held for the whole run: the series, the state record, and the session manifest are
-    // exactly the things two concurrent runs must not interleave, and `session::materialise`
-    // assumes the caller already holds it rather than taking a second one.
+    // Held for the whole run: the series is the file two concurrent runs must not
+    // interleave, and `session::materialise` assumes the caller already holds it rather
+    // than taking a second one.
     let _lock = layout.lock()?;
-    let mut state = State::load(layout)?;
+    let state = State::load(layout)?;
     let base = match base {
         Some(base) => base.to_owned(),
         None => state
@@ -123,8 +123,7 @@ fn create(layout: &Layout, name: &str, base: Option<&str>, at: Option<&str>) -> 
     };
 
     let index = series::position_at(&series, at)?;
-    let prefix = index + 1;
-    let patch_name = series::default_patch_name(&prefix.to_string(), &slug);
+    let patch_name = series::default_patch_name(&slug);
     if layout.patches_dir().join(&patch_name).exists() {
         bail!(
             "{} already exists.\n\
@@ -143,22 +142,14 @@ fn create(layout: &Layout, name: &str, base: Option<&str>, at: Option<&str>) -> 
     let plan = session::plan(layout, &base, &entries[..index], None)?;
 
     std::fs::create_dir_all(layout.patches_dir())?;
-    // The tail moves first (this may be what frees the name), the series is saved to
-    // match, and only then is the new file written: a failure anywhere before the write
-    // leaves at worst a listed patch with no file, which `skot patch list` calls out.
-    let (line, renames) = series.insert_renumbering(layout, &patch_name, index)?;
+    // The line goes in, the series is saved to match, and only then is the new file
+    // written: a failure anywhere before the write leaves at worst a listed patch with no
+    // file, which `skot patch list` calls out. Nothing else in the series moves, so there
+    // is no record to update behind it: the applied set and the work areas still name the
+    // patches they named before.
+    let line = series.insert(&patch_name, index)?;
     series.save(layout)?;
     std::fs::write(layout.patches_dir().join(&patch_name), "")?;
-    // A tail rename moves patches that are recorded as applied and patches that have a work
-    // area open, so both records follow the files rather than pointing at names that
-    // no longer exist. This is the only write `new` makes to either: the applied set
-    // itself is left alone, because starting a patch applies nothing, and a patch counted
-    // as applied before anything replayed it would put the next `pop` and the next
-    // `edit-save` in charge of work that was never done.
-    state.follow_renames(layout, &renames)?;
-    let mut sessions = session::Manifest::load(layout)?;
-    sessions.follow_renames(layout, &renames);
-    sessions.save(layout)?;
 
     // Last of all the work area: a worktree with no manifest entry is recognised as a husk
     // and replaced by the next attempt, while an entry with no worktree would strand the
@@ -246,23 +237,18 @@ mod tests {
     fn new_creates_the_file_and_registers_it() {
         let (_tmp, layout) = project();
         create(&layout, "trim-widgets", None, None).unwrap();
-        assert!(
-            layout
-                .patches_dir()
-                .join("0001-trim-widgets.patch")
-                .is_file()
-        );
+        assert!(layout.patches_dir().join("trim-widgets.patch").is_file());
         assert_eq!(
             std::fs::read_to_string(layout.series_file()).unwrap(),
-            "0001-trim-widgets.patch\n"
+            "trim-widgets.patch\n"
         );
     }
 
     #[test]
-    fn new_at_inserts_the_patch_renumbers_the_tail_and_keeps_the_set_in_order() {
-        // `--at` occupies that slot: the tail is renamed up one number each and the files
-        // move with their names. An applied set that named the tail follows the renames, so
-        // the record keeps pointing at patches that still exist. The new patch is *not*
+    fn new_at_inserts_the_line_and_moves_nothing_else() {
+        // `--at` picks where the line goes. Nothing else in the series is touched: the
+        // patches below keep the names they were created with, and an applied set that
+        // names them keeps pointing at patches that still exist. The new patch is *not*
         // added to the set: `new` applies nothing.
         let (_tmp, layout) = project();
         create(&layout, "first", None, None).unwrap();
@@ -274,68 +260,52 @@ mod tests {
             .set_applied(
                 &layout,
                 vec![
-                    "0001-first.patch".to_owned(),
-                    "0002-second.patch".to_owned(),
-                    "0003-third.patch".to_owned(),
+                    "first.patch".to_owned(),
+                    "second.patch".to_owned(),
+                    "third.patch".to_owned(),
                 ],
             )
             .unwrap();
 
         let created = create(&layout, "middle", None, Some("2")).unwrap();
 
-        assert_eq!(created.name, "0002-middle.patch");
+        assert_eq!(created.name, "middle.patch");
         assert_eq!(created.line, 2);
         assert_eq!(
             std::fs::read_to_string(layout.series_file()).unwrap(),
-            "0001-first.patch\n0002-middle.patch\n0003-second.patch\n0004-third.patch\n"
+            "first.patch\nmiddle.patch\nsecond.patch\nthird.patch\n"
         );
-        assert!(layout.patches_dir().join("0003-second.patch").is_file());
-        assert!(layout.patches_dir().join("0004-third.patch").is_file());
-        assert!(!layout.patches_dir().join("0002-second.patch").exists());
+        assert!(layout.patches_dir().join("second.patch").is_file());
+        assert!(layout.patches_dir().join("third.patch").is_file());
         let state = State::load(&layout).unwrap();
         assert_eq!(
             state.applied(&layout).to_vec(),
-            ["0001-first.patch", "0003-second.patch", "0004-third.patch"],
-            "the applied set follows the renumbered tail, and gains no new patch"
+            ["first.patch", "second.patch", "third.patch"],
+            "the applied set still names the same patches, and gains no new one"
         );
-    }
-
-    #[test]
-    fn new_numbers_its_patches_by_series_position() {
-        // The number is what makes lexical order match application order, so a second patch
-        // must not be called 0001 again.
-        let (_tmp, layout) = project();
-        create(&layout, "first", None, None).unwrap();
-        create(&layout, "second", None, None).unwrap();
-
-        let series = std::fs::read_to_string(layout.series_file()).unwrap();
-        assert_eq!(series, "0001-first.patch\n0002-second.patch\n");
     }
 
     #[test]
     fn new_appends_after_patches_that_are_already_there() {
         let (_tmp, layout) = project();
-        testsupport::write_series(&layout, &[("0001-existing.patch", "")]);
+        testsupport::write_series(&layout, &[("existing.patch", "")]);
         create(&layout, "next", None, None).unwrap();
         assert_eq!(
             std::fs::read_to_string(layout.series_file()).unwrap(),
-            "0001-existing.patch\n0002-next.patch\n"
+            "existing.patch\nnext.patch\n"
         );
     }
 
     #[test]
     fn new_opens_a_work_area_holding_the_series_and_leaves_shared_state_alone() {
-        // The loop is `new` → edit → `edit-save`, and the save diffs the work area against
+        // The loop is `new` → edit → `save`, and the save diffs the work area against
         // the series below the patch. If `new` did not put the series in place, the user's
         // first edit would be exported as a patch against the wrong tree. What it must not do
         // is touch the shared run state: applying the series is not what starting a patch is,
         // and a patch counted as applied before anything replayed it would put the next
         // `pop` in charge of work that was never done.
         let (_tmp, layout) = project();
-        testsupport::write_series(
-            &layout,
-            &[("0001-existing.patch", testsupport::patch_one())],
-        );
+        testsupport::write_series(&layout, &[("existing.patch", testsupport::patch_one())]);
 
         let created = create(&layout, "next", None, None).unwrap();
 
@@ -395,7 +365,7 @@ mod tests {
         // been reset by this point, so writing the patch anyway would register a patch whose
         // base nothing can reach.
         assert!(
-            !layout.patches_dir().join("0001-next.patch").exists(),
+            !layout.patches_dir().join("next.patch").exists(),
             "no patch should be created"
         );
         assert_eq!(
@@ -427,14 +397,11 @@ mod tests {
     fn spaces_in_a_name_become_dashes() {
         // Patch names come from commit subjects, and people write those with spaces. A
         // filename with a space has to be quoted in every shell and in every `series` line
-        // anyone types, and `0001-add greeting.patch` is not something to hand a user.
+        // anyone types, and `add greeting.patch` is not something to hand a user.
         let (_tmp, layout) = project();
         create(&layout, "add greeting", None, None).unwrap();
         assert!(
-            layout
-                .patches_dir()
-                .join("0001-add-greeting.patch")
-                .is_file(),
+            layout.patches_dir().join("add-greeting.patch").is_file(),
             "got {:?}",
             std::fs::read_dir(layout.patches_dir())
                 .unwrap()
@@ -446,14 +413,14 @@ mod tests {
     #[test]
     fn new_refuses_to_clobber_an_existing_patch() {
         let (_tmp, layout) = project();
-        std::fs::write(layout.patches_dir().join("0001-trim-widgets.patch"), "mine").unwrap();
+        std::fs::write(layout.patches_dir().join("trim-widgets.patch"), "mine").unwrap();
 
         let err = create(&layout, "trim-widgets", None, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("already exists"), "got {err}");
         assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0001-trim-widgets.patch")).unwrap(),
+            std::fs::read_to_string(layout.patches_dir().join("trim-widgets.patch")).unwrap(),
             "mine",
             "the existing patch was overwritten"
         );
@@ -474,7 +441,7 @@ mod tests {
     fn a_series_that_will_not_apply_stops_new_before_it_writes_anything() {
         // `new` replays the series against the base before it writes anything. If that
         // replay fails, carrying on would create the patch on a base the series does not
-        // hold, and the first `edit-save` would then fold the *missing* work into the new
+        // hold, and the first `save` would then fold the *missing* work into the new
         // patch, because the base it diffs against is what the patches below produced, not
         // what is actually there. Failing here is much cheaper than debugging that later.
         let tmp = tempfile::tempdir().unwrap();
@@ -488,7 +455,7 @@ mod tests {
         testsupport::write_series(
             &layout,
             &[(
-                "0001-a.patch",
+                "a.patch",
                 "\
 diff --git a/nowhere.txt b/nowhere.txt
 index 1111111..2222222 100644
@@ -504,11 +471,11 @@ index 1111111..2222222 100644
         let err = create(&layout, "after", None, None).unwrap_err();
         let text = format!("{err:#}");
         assert!(
-            text.contains("0001-a.patch"),
+            text.contains("a.patch"),
             "the error should name the patch that would not apply: {text}"
         );
         assert!(
-            !layout.patches_dir().join("0001-after.patch").exists(),
+            !layout.patches_dir().join("after.patch").exists(),
             "no patch should be created when the base could not be prepared"
         );
         assert!(

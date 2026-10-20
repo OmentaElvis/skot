@@ -11,7 +11,7 @@ use crate::session;
 pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
     let (_config, series) = ctx.project()?;
     let entries = series.entries_lenient(&ctx.layout);
-    let disabled = series.disabled_lines(&ctx.layout);
+    let disabled = series.disabled_lines();
     let unsaved = unsaved_work_areas(&ctx.layout);
 
     if entries.is_empty() && disabled.is_empty() {
@@ -85,6 +85,7 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
         entries.iter().map(|e| (e.line, Some(e), None)).collect();
     rows.extend(disabled.iter().map(|d| (d.0, None, Some(d))));
     rows.sort_by_key(|(line, _, _)| *line);
+    let had_rows = !rows.is_empty();
 
     let mut position = 0usize;
     for (_, entry, off) in rows {
@@ -136,6 +137,14 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
         }
         return Ok(Exit::Failure);
     }
+    if had_rows {
+        report::section("key");
+        report::field("[x]", "applied to the sandbox");
+        report::field("[x]", "applied to the sandbox");
+        report::field("[ ]", "not applied");
+        report::field("#", "disabled");
+        report::field("(unsaved)", "unsaved work-area changes");
+    }
     Ok(Exit::Success)
 }
 
@@ -175,8 +184,8 @@ mod tests {
         session::Manifest {
             sessions: vec![session::Session {
                 series: crate::layout::DEFAULT_SERIES.to_owned(),
-                patch: "0002-b.patch".to_owned(),
-                dir: "0002-b.patch".to_owned(),
+                patch: "b.patch".to_owned(),
+                dir: "b.patch".to_owned(),
                 ref_name: "main".to_owned(),
                 base_sha: "abc".to_owned(),
                 base_tree: "def".to_owned(),

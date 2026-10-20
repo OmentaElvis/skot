@@ -1,19 +1,18 @@
 //! `patch move`: reorder the series, one patch at a time.
 //!
-//! Moving is a rotation: the patch steps through a temporary name, the entries it
-//! passes fold one place at a time, and the numbers stay contiguous, so lexical order
-//! remains application order. Only an unapplied patch can move — the applied set is a
-//! tree the sandbox is holding, and reordering what it is made of would make the next
-//! apply disagree with what is on disk, so `skot patch pop` puts it down first.
+//! A move changes the order the series file lists, and nothing else: the patch's line
+//! goes to its new place, every patch keeps the name it was created with, and no file
+//! under `patches/` is read or written. Only an unapplied patch can move: the applied
+//! set is a tree the sandbox is holding, and reordering what it is made of would make
+//! the next apply disagree with what is on disk, so `skot patch pop` puts it down first.
 //!
 //! The destination is a final position (`--to 3` means "become the third patch"), or an
 //! existing patch name to land before. Left unnamed, the patch is picked from a list and
-//! the position is typed: numbers are what `ls` shows and what they stay after the move,
-//! while names renumber under the rotation. A script gets told to name both rather than
-//! a default it did not ask for.
+//! the position is typed: positions are what `patch list` shows and what the series
+//! holds, and a script gets told to name both rather than a default it did not ask for.
 
 use anyhow::{Context, Result, bail};
-use log::{debug, info};
+use log::info;
 use serde_json::json;
 
 use crate::cli::MoveArgs;
@@ -22,6 +21,7 @@ use crate::commands::{Ctx, Exit, emit_json};
 use crate::hints::Hints;
 use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
+use crate::prompt::{Asker, Fallback};
 use crate::report;
 use crate::state::State;
 
@@ -34,13 +34,11 @@ struct Moved {
     from: usize,
     /// The 1-based position it occupies now.
     to: usize,
-    /// The renames the rotation caused.
-    renames: Vec<(String, String)>,
-    /// The range the rotation touched, after the move.
+    /// The range the move touched, after the move.
     window: Vec<(usize, String)>,
 }
 
-/// Move a patch to a different position: its line, its file, and the numbers in between.
+/// Move a patch to a different position: its line, and nothing else.
 pub fn run(ctx: &Ctx, args: &MoveArgs) -> Result<Exit> {
     // The questions are asked before the lock, the way `apply` asks which patches: a
     // prompt sitting on the lock is one the user can walk away from mid-answer.
@@ -55,18 +53,13 @@ pub fn run(ctx: &Ctx, args: &MoveArgs) -> Result<Exit> {
         );
     }
     let state = State::load(&ctx.layout).unwrap_or_default();
-    let interactive = !ctx.cli.json && crate::ui::stdin_is_terminal();
+    let asker = ctx.asker();
 
     let want = match &args.patch {
         Some(want) => want.clone(),
-        None if interactive => pick_patch(&names, state.applied(&ctx.layout))?,
-        None => bail!(
-            "cannot ask which patch to move here.\n\
-             Name both ends: `{}`.",
-            skot_args("move", "<patch> --to <patch|N>")
-        ),
+        None => pick_patch(&asker, &names, state.applied(&ctx.layout))?,
     };
-    let disabled = series.disabled(&ctx.layout);
+    let disabled = series.disabled();
     let mut universe: Vec<&str> = names.iter().map(String::as_str).collect();
     universe.extend(disabled.iter().map(String::as_str));
     let from = resolve_position(&names, &universe, &want)?;
@@ -74,12 +67,7 @@ pub fn run(ctx: &Ctx, args: &MoveArgs) -> Result<Exit> {
 
     let to = match &args.to {
         Some(at) => resolve_destination(&names, at, &name)?,
-        None if interactive => ask_position(&names, &name)?,
-        None => bail!(
-            "cannot ask where the patch should go here.\n\
-             Name the destination: `{}`.",
-            skot_args("move", "<patch> --to <patch|N>")
-        ),
+        None => ask_position(&asker, &names, &name)?,
     };
 
     if to == from {
@@ -100,11 +88,6 @@ pub fn run(ctx: &Ctx, args: &MoveArgs) -> Result<Exit> {
             "patch": moved.name,
             "from": moved.from,
             "to": moved.to,
-            "renamed": moved
-                .renames
-                .iter()
-                .map(|(from, to)| json!({ "from": from, "to": to }))
-                .collect::<Vec<_>>(),
         }))?;
         return Ok(Exit::Success);
     }
@@ -114,9 +97,6 @@ pub fn run(ctx: &Ctx, args: &MoveArgs) -> Result<Exit> {
         "moved {} from position {} to position {}",
         moved.name, moved.from, moved.to
     );
-    for (from, to) in &moved.renames {
-        debug!(target: "move", "  {from} -> {to}");
-    }
     for line in window_lines(&moved.window) {
         report::item(&line);
     }
@@ -127,14 +107,14 @@ pub fn run(ctx: &Ctx, args: &MoveArgs) -> Result<Exit> {
     Ok(Exit::Success)
 }
 
-/// The plain work behind [`run`]: lock, renumber, record. No prompts, no verdict.
+/// The plain work behind [`run`]: lock, move the line, save. No prompts, no verdict.
 ///
 /// The lock goes on before the series is read: two reorders racing over the same files
 /// would otherwise both succeed, and the later save would put the earlier order back.
 fn relocate(layout: &Layout, name: &str, to: usize) -> Result<Moved> {
     let lock = layout.lock()?;
     let (_config, mut series) = layout.project()?;
-    let mut state = State::load(layout)?;
+    let state = State::load(layout)?;
 
     if state.applied(layout).contains(&name.to_owned()) {
         bail!(
@@ -145,21 +125,14 @@ fn relocate(layout: &Layout, name: &str, to: usize) -> Result<Moved> {
         );
     }
 
-    let moved = series.move_renumbering(layout, name, to)?;
+    let moved = series.reorder(name, to)?;
     series.save(layout)?;
-    state.follow_renames(layout, &moved.renames)?;
-    // A patch with a work area keeps its worktree; only the name it answers to in the
-    // series moves, and the session record follows that name.
-    let mut sessions = crate::session::Manifest::load(layout)?;
-    sessions.follow_renames(layout, &moved.renames);
-    sessions.save(layout)?;
     drop(lock);
 
     Ok(Moved {
         name: name.to_owned(),
         from: moved.from + 1,
         to: moved.to + 1,
-        renames: moved.renames,
         window: moved.window,
     })
 }
@@ -209,10 +182,11 @@ fn resolve_destination(names: &[String], at: &str, moving: &str) -> Result<usize
         .expect("resolved name is enabled"))
 }
 
-/// Ask an interactive session which patch to move. Only unapplied patches are offered:
-/// the others cannot move, and offering them would only produce the refusal afterwards.
-/// The labels carry the series position, the same numbers `ls` shows.
-fn pick_patch(names: &[String], applied: &[String]) -> Result<String> {
+/// Which patch to move: only unapplied patches are offered, the others cannot move
+/// and offering them would only produce the refusal afterwards. The labels carry the
+/// series position, which is what the answer decides. A run that cannot ask is
+/// refused with the flag that names both ends.
+fn pick_patch(asker: &Asker, names: &[String], applied: &[String]) -> Result<String> {
     let options: Vec<(String, String)> = names
         .iter()
         .enumerate()
@@ -227,10 +201,14 @@ fn pick_patch(names: &[String], applied: &[String]) -> Result<String> {
         );
     }
     let labels: Vec<String> = options.iter().map(|(label, _)| label.clone()).collect();
-    let chosen = inquire::Select::new("Which patch to move", labels)
-        .with_help_message("A patch that is applied cannot move; pop it first.")
-        .prompt()
-        .context("asking which patch to move")?;
+    let chosen = asker.select(
+        "Which patch to move",
+        Some("A patch that is applied cannot move; pop it first."),
+        labels,
+        Fallback::Flag(skot_args("move", "<patch> --to <patch|N>")),
+        None,
+        None,
+    )?;
     let (_, patch) = options
         .iter()
         .find(|(label, _)| *label == chosen)
@@ -238,26 +216,22 @@ fn pick_patch(names: &[String], applied: &[String]) -> Result<String> {
     Ok(patch.clone())
 }
 
-/// Ask an interactive session for the position the patch should end at. The answer is a
-/// number, not a name: numbers are what `ls` shows and what they stay after the move,
-/// while names renumber under the rotation, and a menu of positions is the whole series
-/// long.
-fn ask_position(names: &[String], moving: &str) -> Result<usize> {
+/// The position the patch should end at, typed. The answer is a number, not a name:
+/// a patch's name is its own and does not change, so the only thing to choose is
+/// where its line goes, and a menu of positions is the whole series long. A run that
+/// cannot ask is refused with the flag that names both ends.
+fn ask_position(asker: &Asker, names: &[String], moving: &str) -> Result<usize> {
     let count = names.len();
     if count == 1 {
         bail!("the series holds one patch, so there is nowhere to move it.");
     }
     let question = format!("New position for {moving} (1 to {count})");
-    let answer = inquire::Text::new(&question)
-        .with_help_message("The number the patch should have after the move. Esc cancels.")
-        .with_validator(move |input: &str| {
-            Ok(match parse_position(input, count) {
-                Ok(_) => inquire::validator::Validation::Valid,
-                Err(message) => inquire::validator::Validation::Invalid(message.into()),
-            })
-        })
-        .prompt()
-        .context("asking where the patch should go")?;
+    let answer = asker.text_validated(
+        &question,
+        Some("The number the patch should have after the move. Esc cancels."),
+        Fallback::Flag(skot_args("move", "<patch> --to <patch|N>")),
+        move |input: &str| parse_position(input, count).map(|_| ()),
+    )?;
     Ok(parse_position(&answer, count).expect("the validator admitted this") - 1)
 }
 
@@ -269,9 +243,9 @@ fn parse_position(input: &str, count: usize) -> std::result::Result<usize, Strin
     }
 }
 
-/// The range a rotation touched as `ls`-style lines, shortened to its ends when the
-/// range is wide: the middle of a long rotation is the least informative part of it,
-/// and fifty lines of renumbered names helps nobody read the result.
+/// The range a move touched as `patch list`-style lines, shortened to its ends when the
+/// range is wide: the middle of a long run is the least informative part of it, and
+/// fifty lines help nobody read the result.
 fn window_lines(window: &[(usize, String)]) -> Vec<String> {
     const ENDS: usize = 3;
     let render = |(pos, name): &(usize, String)| format!("{pos:>3}  {name}");
@@ -295,11 +269,7 @@ mod tests {
         let (tmp, layout) = testsupport::project();
         testsupport::write_series(
             &layout,
-            &[
-                ("0001-a.patch", "a\n"),
-                ("0002-b.patch", "b\n"),
-                ("0003-c.patch", "c\n"),
-            ],
+            &[("a.patch", "a\n"), ("b.patch", "b\n"), ("c.patch", "c\n")],
         );
         (tmp, layout)
     }
@@ -313,85 +283,116 @@ mod tests {
     }
 
     #[test]
-    fn moving_forward_rotates_the_patches_and_the_numbers_follow() {
+    fn moving_a_patch_forward_reorders_the_series() {
         let (_tmp, layout) = three_patches();
 
-        let moved = relocate(&layout, "0001-a.patch", 2).unwrap();
+        let moved = relocate(&layout, "a.patch", 2).unwrap();
 
         assert_eq!(moved.from, 1);
         assert_eq!(moved.to, 3);
         assert_eq!(
             moved.window,
             vec![
-                (1, "0001-b.patch".to_owned()),
-                (2, "0002-c.patch".to_owned()),
-                (3, "0003-a.patch".to_owned()),
+                (1, "b.patch".to_owned()),
+                (2, "c.patch".to_owned()),
+                (3, "a.patch".to_owned()),
             ],
             "the touched range, ready to show"
         );
         assert_eq!(
             std::fs::read_to_string(layout.series_file()).unwrap(),
-            "0001-b.patch\n0002-c.patch\n0003-a.patch\n"
+            "b.patch\nc.patch\na.patch\n"
         );
-        assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0003-a.patch")).unwrap(),
-            "a\n",
-            "the patch's own file moved with it, contents intact"
-        );
-        assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0001-b.patch")).unwrap(),
-            "b\n"
-        );
-        assert!(!layout.patches_dir().join("0001-a.patch").exists());
+        for (name, body) in [("a.patch", "a\n"), ("b.patch", "b\n"), ("c.patch", "c\n")] {
+            assert_eq!(
+                std::fs::read_to_string(layout.patches_dir().join(name)).unwrap(),
+                body,
+                "{name} is the file it always was"
+            );
+        }
     }
 
     #[test]
-    fn moving_backward_is_the_same_rotation_the_other_way() {
+    fn moving_a_patch_backward_reorders_the_series() {
         let (_tmp, layout) = three_patches();
 
-        relocate(&layout, "0003-c.patch", 0).unwrap();
+        relocate(&layout, "c.patch", 0).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(layout.series_file()).unwrap(),
-            "0001-c.patch\n0002-a.patch\n0003-b.patch\n"
+            "c.patch\na.patch\nb.patch\n"
         );
     }
 
     #[test]
-    fn moving_through_the_middle_only_touches_the_range_it_passes() {
+    fn a_move_changes_only_the_order_of_the_series() {
+        let (_tmp, layout) = three_patches();
+        // A disabled patch has a line of its own in the file, between the two patches that
+        // trade places here: a reorder has to leave it exactly where it is.
+        let mut series = crate::series::Series::load(&layout.series_file()).unwrap();
+        assert!(series.disable("b.patch"));
+        series.save(&layout).unwrap();
+
+        relocate(&layout, "c.patch", 0).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(layout.series_file()).unwrap(),
+            "c.patch\na.patch\n#!b.patch\n",
+            "the order is the series file's; only its lines moved"
+        );
+        let mut on_disk: Vec<String> = std::fs::read_dir(layout.patches_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".patch"))
+            .collect();
+        on_disk.sort();
+        assert_eq!(
+            on_disk,
+            ["a.patch", "b.patch", "c.patch"],
+            "a name belongs to the patch for good, so every patch answers to its own"
+        );
+        assert_eq!(
+            std::fs::read_to_string(layout.patches_dir().join("c.patch")).unwrap(),
+            "c\n",
+            "and the patch itself is the same file, holding what it held"
+        );
+    }
+
+    #[test]
+    fn moving_through_the_middle_leaves_the_rest_in_order() {
         let (tmp, layout) = testsupport::project();
         testsupport::write_series(
             &layout,
             &[
-                ("0001-a.patch", "a\n"),
-                ("0002-b.patch", "b\n"),
-                ("0003-c.patch", "c\n"),
-                ("0004-d.patch", "d\n"),
+                ("a.patch", "a\n"),
+                ("b.patch", "b\n"),
+                ("c.patch", "c\n"),
+                ("d.patch", "d\n"),
             ],
         );
 
-        relocate(&layout, "0001-a.patch", 2).unwrap();
+        relocate(&layout, "a.patch", 2).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(layout.series_file()).unwrap(),
-            "0001-b.patch\n0002-c.patch\n0003-a.patch\n0004-d.patch\n",
-            "the last patch keeps its name: the rotation stops where the move does"
+            "b.patch\nc.patch\na.patch\nd.patch\n",
+            "the move passes over two patches; the one past them keeps its place"
         );
         drop(tmp);
     }
 
     #[test]
-    fn the_applied_set_follows_the_renames() {
+    fn a_move_leaves_the_applied_set_alone() {
         let (_tmp, layout) = three_patches();
-        applied(&["0002-b.patch", "0003-c.patch"], &layout);
+        applied(&["b.patch", "c.patch"], &layout);
 
-        relocate(&layout, "0001-a.patch", 2).unwrap();
+        relocate(&layout, "a.patch", 2).unwrap();
 
         let state = State::load(&layout).unwrap();
         assert_eq!(
             state.applied(&layout).to_vec(),
-            vec!["0001-b.patch".to_owned(), "0002-c.patch".to_owned()],
-            "the same patches, under their new names, still in series order"
+            vec!["b.patch".to_owned(), "c.patch".to_owned()],
+            "a move is a fact about the series file, and the applied set is not that file"
         );
     }
 
@@ -399,12 +400,11 @@ mod tests {
     fn moving_to_its_own_position_is_a_no_op() {
         let (_tmp, layout) = three_patches();
 
-        let moved = relocate(&layout, "0002-b.patch", 1).unwrap();
+        relocate(&layout, "b.patch", 1).unwrap();
 
-        assert_eq!(moved.renames, Vec::new());
         assert_eq!(
             std::fs::read_to_string(layout.series_file()).unwrap(),
-            "0001-a.patch\n0002-b.patch\n0003-c.patch\n"
+            "a.patch\nb.patch\nc.patch\n"
         );
     }
 
@@ -415,75 +415,22 @@ mod tests {
         let err = relocate(&layout, "nope.patch", 0).unwrap_err().to_string();
 
         assert!(err.contains("not in the series"), "{err}");
-        assert!(
-            err.contains("0001-a.patch, 0002-b.patch, 0003-c.patch"),
-            "{err}"
-        );
+        assert!(err.contains("a.patch, b.patch, c.patch"), "{err}");
     }
 
     #[test]
     fn a_position_past_the_end_is_refused() {
         let (_tmp, layout) = three_patches();
 
-        let err = relocate(&layout, "0001-a.patch", 3)
-            .unwrap_err()
-            .to_string();
+        let err = relocate(&layout, "a.patch", 3).unwrap_err().to_string();
 
         assert!(err.contains("holds 3 patches"), "{err}");
     }
 
     #[test]
-    fn a_stray_file_squatting_on_a_rename_target_is_refused_before_anything_moves() {
-        let (tmp, layout) = testsupport::project();
-        // A gap at 2, so moving 0003-c.patch to the front wants 0002-a.patch, a name
-        // no series member holds.
-        testsupport::write_series(&layout, &[("0001-a.patch", "a\n"), ("0003-c.patch", "c\n")]);
-        std::fs::write(layout.patches_dir().join("0002-a.patch"), "stray\n").unwrap();
-
-        let err = relocate(&layout, "0003-c.patch", 0)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("0002-a.patch"), "{err}");
-        assert_eq!(
-            std::fs::read_to_string(layout.series_file()).unwrap(),
-            "0001-a.patch\n0003-c.patch\n",
-            "the series is untouched"
-        );
-        assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0003-c.patch")).unwrap(),
-            "c\n",
-            "so are the files"
-        );
-        drop(tmp);
-    }
-
-    #[test]
-    fn a_leftover_temporary_from_an_interrupted_move_is_refused() {
-        let (_tmp, layout) = three_patches();
-        std::fs::write(
-            layout.patches_dir().join(".skot-move-0001-a.patch"),
-            "half-moved\n",
-        )
-        .unwrap();
-
-        let err = relocate(&layout, "0001-a.patch", 2)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("interrupted"), "{err}");
-        assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0001-a.patch")).unwrap(),
-            "a\n",
-            "nothing moved"
-        );
-    }
-
-    #[test]
     fn run_reports_the_move_as_a_success() {
         let (tmp, layout) = three_patches();
-        let cli =
-            Cli::try_parse_from(["skot", "patch", "move", "0001-a.patch", "--to", "3"]).unwrap();
+        let cli = Cli::try_parse_from(["skot", "patch", "move", "a.patch", "--to", "3"]).unwrap();
         let ctx = Ctx {
             layout,
             cli,
@@ -493,7 +440,7 @@ mod tests {
         let exit = run(
             &ctx,
             &MoveArgs {
-                patch: Some("0001-a.patch".to_owned()),
+                patch: Some("a.patch".to_owned()),
                 to: Some("3".to_owned()),
             },
         )
@@ -536,43 +483,51 @@ mod tests {
     #[test]
     fn an_applied_patch_is_refused_with_a_way_to_put_it_down() {
         let (tmp, layout) = three_patches();
-        applied(&["0002-b.patch"], &layout);
+        applied(&["b.patch"], &layout);
 
-        let err = relocate(&layout, "0002-b.patch", 0)
-            .unwrap_err()
-            .to_string();
+        let err = relocate(&layout, "b.patch", 0).unwrap_err().to_string();
 
         assert!(err.contains("is applied"), "{err}");
-        assert!(err.contains(&skot_args("pop", "0002-b.patch")), "{err}");
+        assert!(err.contains(&skot_args("pop", "b.patch")), "{err}");
         drop(tmp);
     }
 
     #[test]
     fn a_short_window_is_shown_line_for_line() {
-        let window: Vec<(usize, String)> =
-            (1..=3).map(|i| (i, format!("000{i}-p.patch"))).collect();
+        let window: Vec<(usize, String)> = ["alpha.patch", "beta.patch", "gamma.patch"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (i + 1, (*n).to_owned()))
+            .collect();
 
         assert_eq!(
             window_lines(&window),
             vec![
-                "  1  0001-p.patch".to_owned(),
-                "  2  0002-p.patch".to_owned(),
-                "  3  0003-p.patch".to_owned(),
+                "  1  alpha.patch".to_owned(),
+                "  2  beta.patch".to_owned(),
+                "  3  gamma.patch".to_owned(),
             ]
         );
     }
 
     #[test]
     fn a_wide_window_is_shortened_to_its_ends() {
-        let window: Vec<(usize, String)> =
-            (1..=10).map(|i| (i, format!("00{i:02}-p.patch"))).collect();
+        let names = [
+            "aa.patch", "bb.patch", "cc.patch", "dd.patch", "ee.patch", "ff.patch", "gg.patch",
+            "hh.patch", "ii.patch", "jj.patch",
+        ];
+        let window: Vec<(usize, String)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (i + 1, (*n).to_owned()))
+            .collect();
 
         let lines = window_lines(&window);
 
         assert_eq!(lines.len(), 7, "three, an ellipsis, three");
-        assert_eq!(lines[0], "  1  0001-p.patch");
+        assert_eq!(lines[0], "  1  aa.patch");
         assert_eq!(lines[3], "...");
-        assert_eq!(lines[6], " 10  0010-p.patch");
+        assert_eq!(lines[6], " 10  jj.patch");
     }
 
     #[test]

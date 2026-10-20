@@ -24,7 +24,7 @@
 //!   and that is what makes iterating on a build hook fast.
 
 use anyhow::{Context, Result, bail};
-use log::{debug, info};
+use log::{debug, info, warn};
 use serde_json::json;
 
 use crate::cli::BuildArgs;
@@ -34,7 +34,7 @@ use crate::commands::{Ctx, Exit, emit_json};
 use crate::config::{Config, SandboxPolicy};
 use crate::git::sandbox;
 use crate::hooks::{self, Env};
-use crate::invocation::skot_args;
+use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
 use crate::phase::{HookPoint, Phase, Selection};
 use crate::report;
@@ -116,15 +116,15 @@ pub fn run(ctx: &Ctx, args: &BuildArgs) -> Result<Exit> {
             "sandbox": ctx.layout.sandbox_dir().display().to_string(),
         }))?;
     } else {
-        // The name and the ref together, since a build is the answer to "what did I
-        // just build": the series, and the upstream it was built on.
-        report::section("build");
-        report::field("series", &format!("{} @ {}", ctx.layout.series(), ref_name));
         info!(
             target: "build",
             "complete; the sandbox at {} is ready.",
             ctx.layout.sandbox_dir().display()
         );
+        // The name and the ref together, since a build is the answer to "what did I
+        // just build": the series, and the upstream it was built on.
+        report::section("build");
+        report::field("series", &format!("{} @ {}", ctx.layout.series(), ref_name));
     }
     Ok(Exit::Success)
 }
@@ -198,10 +198,7 @@ fn drive(
 fn sync_phase(layout: &Layout, config: &Config, ref_name: &str, json: bool) -> Result<()> {
     // Stated before the work: `ensure` can be a network fetch taking minutes, and this is
     // the line that says what the silence (or the spinner) is for.
-    info!(
-        target: "build",
-        "sync: making sure {ref_name} is in the mirror"
-    );
+    info!(target: "sync", "making sure {ref_name} is in the mirror");
     // `pre_sync` runs before there is a sandbox on a first run, so its working directory
     // is the project root (`HookPoint::runs_in_project_root`). Hooks that want the tree
     // wait for `post_apply`.
@@ -249,27 +246,47 @@ fn apply_phase(
         Some(authoring::recorded_stack(layout, &series, &state)?)
     };
     let pushed = stack.as_ref().map_or(total, |s| s.entries.len());
+    let enabled = series.names().len();
+    // Two words, one meaning each: *enabled* is the series listing a patch (`enable`/
+    // `disable`), *applied* is the sandbox holding it (`apply`/`pop`). The phase replays
+    // the applied set, so a patch enabled but never applied is skipped, and the line
+    // that says so names the command that stamps it in.
     if total == 0 {
         info!(
-            target: "build",
-            "apply: the series is empty; the sandbox holds {against} only"
+            target: "apply",
+            "the series is empty; the sandbox holds {against} only"
         );
     } else if pushed == 0 {
-        info!(
-            target: "build",
-            "apply: nothing enabled; the sandbox holds {against} alone"
-        );
+        if enabled == 0 {
+            info!(
+                target: "apply",
+                "no patches are enabled; the sandbox holds {against} alone"
+            );
+        } else {
+            info!(
+                target: "apply",
+                "nothing applied; the sandbox holds {against} alone"
+            );
+        }
     } else if pushed == total {
         info!(
-            target: "build",
-            "apply: applying the whole series ({}) against {against}",
+            target: "apply",
+            "applying the whole series ({}) against {against}",
             apply::count(total, "patch", "patches")
         );
     } else {
         info!(
-            target: "build",
-            "apply: applying {pushed} of the {} against {against}",
+            target: "apply",
+            "applying {pushed} of the {} against {against}",
             apply::count(total, "patch", "patches")
+        );
+    }
+    if let Some(skipped) = enabled.checked_sub(pushed).filter(|n| *n > 0) {
+        warn!(
+            target: "apply",
+            "{} enabled but not applied; run `{}` to stamp them into the sandbox",
+            apply::count(skipped, "patch", "patches"),
+            skot("apply")
         );
     }
     // `pre_apply` runs before `apply` has created the sandbox on a first run, so its
@@ -349,11 +366,7 @@ fn hook_phase(
         .map(|point| point.to_string())
         .collect();
     if !configured.is_empty() {
-        info!(
-            target: "build",
-            "{phase}: running {}",
-            configured.join(" → ")
-        );
+        info!(target: "build", "running {}", configured.join(" → "));
     }
 
     for point in points {
@@ -537,7 +550,7 @@ mod tests {
         let (layout, _sha) = crate::commands::testsupport::project_with_sandbox(root);
         crate::commands::testsupport::write_series(
             &layout,
-            &[("0001-a.patch", crate::commands::testsupport::patch_one())],
+            &[("a.patch", crate::commands::testsupport::patch_one())],
         );
         std::fs::write(
             layout.config_file(),
@@ -570,8 +583,8 @@ mod tests {
         crate::commands::testsupport::write_series(
             &layout,
             &[
-                ("0001-a.patch", crate::commands::testsupport::patch_one()),
-                ("0002-b.patch", crate::commands::testsupport::patch_two()),
+                ("a.patch", crate::commands::testsupport::patch_one()),
+                ("b.patch", crate::commands::testsupport::patch_two()),
             ],
         );
         std::fs::write(
@@ -592,7 +605,7 @@ mod tests {
         // push/pop and build must agree: a patch popped out for testing must stay out
         // through a build, or the stack is useless for building without one.
         let tmp = tempfile::tempdir().unwrap();
-        let layout = stacked(tmp.path(), &["0001-a.patch"]);
+        let layout = stacked(tmp.path(), &["a.patch"]);
         let (config, _) = layout.project().unwrap();
 
         let ran = drive(&layout, &config, "main", &[Phase::Apply], false).unwrap();
@@ -601,7 +614,7 @@ mod tests {
         let state = State::load(&layout).unwrap();
         assert_eq!(
             state.applied(&layout).to_vec(),
-            ["0001-a.patch"],
+            ["a.patch"],
             "the popped patch must stay popped"
         );
         assert_eq!(
@@ -642,9 +655,9 @@ mod tests {
         crate::commands::testsupport::write_series(
             &layout,
             &[
-                ("0001-a.patch", crate::commands::testsupport::patch_one()),
-                ("0002-b.patch", crate::commands::testsupport::patch_two()),
-                ("0003-c.patch", crate::commands::testsupport::patch_three()),
+                ("a.patch", crate::commands::testsupport::patch_one()),
+                ("b.patch", crate::commands::testsupport::patch_two()),
+                ("c.patch", crate::commands::testsupport::patch_three()),
             ],
         );
         std::fs::write(
@@ -655,10 +668,7 @@ mod tests {
         let mut state = State::load(&layout).unwrap();
         state.set_ref(&layout, "main", &sha).unwrap();
         state
-            .set_applied(
-                &layout,
-                ["0001-a.patch", "0003-c.patch"].map(String::from).to_vec(),
-            )
+            .set_applied(&layout, ["a.patch", "c.patch"].map(String::from).to_vec())
             .unwrap();
         let (config, _) = layout.project().unwrap();
 
@@ -672,7 +682,7 @@ mod tests {
         let state = State::load(&layout).unwrap();
         assert_eq!(
             state.applied(&layout).to_vec(),
-            ["0001-a.patch", "0003-c.patch"],
+            ["a.patch", "c.patch"],
             "the hole must survive the build"
         );
     }
@@ -723,7 +733,7 @@ mod tests {
 
         let state = State::load(&ctx.layout).unwrap();
         assert_eq!(state.ref_name(&ctx.layout), Some("main"));
-        assert_eq!(state.applied(&ctx.layout), ["0001-a.patch"]);
+        assert_eq!(state.applied(&ctx.layout), ["a.patch"]);
         assert!(state.sha(&ctx.layout).is_some_and(|s| s.len() == 40));
         assert!(
             state.in_flight.is_none() && state.in_flight_command.is_none(),

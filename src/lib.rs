@@ -21,6 +21,7 @@ pub mod hooks;
 pub mod invocation;
 pub mod layout;
 pub mod phase;
+pub mod prompt;
 pub mod report;
 pub mod series;
 pub mod seriesdir;

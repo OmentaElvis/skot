@@ -2,7 +2,7 @@
 //!
 //! This is the other half of [`crate::check`]. `check` consumes a patch file and applies
 //! it to a tree; this module produces one by diffing a tree against what the user has in
-//! the sandbox. `edit-save` and `rebase` both need it, and neither writes patch text by hand,
+//! the sandbox. `save` and `rebase` both need it, and neither writes patch text by hand,
 //! because a patch file is a structured format that libgit2 already knows how to write.
 //!
 //! Two details that are easy to get wrong and expensive to debug:
@@ -36,7 +36,7 @@ pub struct Header {
     ///
     /// The mail format allows headers beyond the four above, and dropping one would be
     /// silent data loss: `import` records where a patch came from in an `X-Skot-Import`
-    /// line, which is how a later run recognises the same request. `edit-save` parses the
+    /// line, which is how a later run recognises the same request. `save` parses the
     /// existing header before re-exporting, so anything a parser forgot here would
     /// disappear from the patch the first time it was saved.
     pub extra: Vec<String>,
@@ -269,6 +269,12 @@ pub fn tree_to_patch(
         .diff_tree_to_workdir_with_index(Some(tree), Some(&mut options))
         .context("diffing the sandbox working directory against the base tree")?;
 
+    // Same rule as `tree_to_tree_patch`: no deltas means an empty patch, and an empty patch is
+    // an empty file, not a header with nothing behind it.
+    if diff.deltas().len() == 0 {
+        return Ok(String::new());
+    }
+
     let mut body = String::new();
     render_body(&diff, &mut body)?;
     let stats = render_stats(&diff)?.map(|lines| lines.join("\n"));
@@ -289,6 +295,14 @@ pub fn tree_to_tree_patch(
     let diff = repo
         .diff_tree_to_tree(Some(old), Some(new), None)
         .context("diffing two trees")?;
+
+    // No change between the trees is an empty patch, and an empty patch is the 0-byte file
+    // `patch new` writes: no hunks, so no header to wrap around them. Rendering a header over
+    // nothing would produce a file libgit2 reads back as "no patch found", which is how an
+    // empty patch used to come out of a rebase unparseable and break the series it was in.
+    if diff.deltas().len() == 0 {
+        return Ok(String::new());
+    }
 
     let mut body = String::new();
     render_body(&diff, &mut body)?;
@@ -381,7 +395,7 @@ pub fn summarise(text: &str) -> String {
 /// Skips the parts that are re-derived every time: blob ids in `index`, and the line numbers
 /// in hunk headers. Both come out of libgit2 now rather than off the author's keyboard, so
 /// they change when a patch is saved even though the patch still makes exactly the same
-/// edit. Comparing these is what makes `edit-save` idempotent and tells a work area whether
+/// edit. Comparing these is what makes `save` idempotent and tells a work area whether
 /// it has been edited; comparing whole files does neither.
 pub fn change_of(patch: &str) -> Vec<&str> {
     let body = match patch.find("diff --git ") {
@@ -1031,7 +1045,7 @@ diff --git a/a.txt b/a.txt
 
     #[test]
     fn an_export_of_a_file_only_the_sandbox_has_still_applies() {
-        // The end-to-end promise of `edit-save`: whatever the export says, it must apply back.
+        // The end-to-end promise of `save`: whatever the export says, it must apply back.
         let s = Sandbox::new();
         std::fs::write(s.dir().join("a.txt"), "a\n").unwrap();
         std::fs::create_dir_all(s.dir().join("d")).unwrap();

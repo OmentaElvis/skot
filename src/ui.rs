@@ -13,22 +13,6 @@ use std::time::{Duration, Instant};
 use git2::Progress as Transfer;
 use log::{Level, info};
 
-/// True when stdin is a terminal and a prompt would have somebody to answer it.
-///
-/// Always false in tests: `cargo test` run interactively has a terminal on stdin, and
-/// an `inquire` prompt opened against it would sit there waiting for a person.
-pub fn stdin_is_terminal() -> bool {
-    #[cfg(test)]
-    {
-        false
-    }
-    #[cfg(not(test))]
-    {
-        use std::io::IsTerminal as _;
-        std::io::stdin().is_terminal()
-    }
-}
-
 /// True when stderr is a terminal, i.e. colour and spinners will actually be seen.
 ///
 /// Always false in tests so `cargo test` stays quiet whatever it is run from.

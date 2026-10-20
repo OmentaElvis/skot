@@ -524,8 +524,8 @@ index 3333333..4444444 100644
         // reports OK here, because both patches apply cleanly in isolation.
         let tmp = tempfile::tempdir().unwrap();
         let entries = vec![
-            entry(tmp.path(), "0001-a.patch", CONFLICTING_A),
-            entry(tmp.path(), "0002-b.patch", CONFLICTING_B),
+            entry(tmp.path(), "a.patch", CONFLICTING_A),
+            entry(tmp.path(), "b.patch", CONFLICTING_B),
         ];
         let (_dir, repo, sha) = repo_with(&[("f.txt", BASE)]);
 
@@ -533,7 +533,7 @@ index 3333333..4444444 100644
 
         assert!(!report.ok, "a conflicting series must not report ok");
         let failure = report.first_failure().expect("a patch should have failed");
-        assert_eq!(failure.name, "0002-b.patch");
+        assert_eq!(failure.name, "b.patch");
         assert_eq!(failure.files[0].path, "f.txt");
         let detail = failure.files[0]
             .detail
@@ -550,8 +550,8 @@ index 3333333..4444444 100644
     fn each_patch_in_a_conflicting_series_is_reported_individually() {
         let tmp = tempfile::tempdir().unwrap();
         let entries = vec![
-            entry(tmp.path(), "0001-a.patch", CONFLICTING_A),
-            entry(tmp.path(), "0002-b.patch", CONFLICTING_B),
+            entry(tmp.path(), "a.patch", CONFLICTING_A),
+            entry(tmp.path(), "b.patch", CONFLICTING_B),
         ];
         let (_dir, repo, sha) = repo_with(&[("f.txt", BASE)]);
         let report = check_series(&repo, &sha, &entries).unwrap();
@@ -576,10 +576,10 @@ index 3333333..4444444 100644
     #[test]
     fn a_clean_series_reports_ok() {
         let tmp = tempfile::tempdir().unwrap();
-        let a = entry(tmp.path(), "0001-a.patch", CONFLICTING_A);
+        let a = entry(tmp.path(), "a.patch", CONFLICTING_A);
         let b = entry(
             tmp.path(),
-            "0002-b.patch",
+            "b.patch",
             "\
 diff --git a/g.txt b/g.txt
 new file mode 100644
@@ -601,7 +601,7 @@ index 0000000..2222222
         let tmp = tempfile::tempdir().unwrap();
         let create = entry(
             tmp.path(),
-            "0001-new.patch",
+            "new.patch",
             "\
 diff --git a/f.txt b/f.txt
 new file mode 100644
@@ -617,7 +617,7 @@ index 0000000..1111111
         // first patch's result was carried forward.
         let edit = entry(
             tmp.path(),
-            "0002-edit.patch",
+            "edit.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 2222222..3333333 100644
@@ -641,7 +641,7 @@ index 2222222..3333333 100644
         // report must not call that a success.
         let patch = entry(
             tmp.path(),
-            "0001-half.patch",
+            "half.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 1111111..2222222 100644
@@ -669,7 +669,7 @@ index 1111111..2222222 100644
         let tmp = tempfile::tempdir().unwrap();
         let del = entry(
             tmp.path(),
-            "0001-del.patch",
+            "del.patch",
             "\
 diff --git a/f.txt b/f.txt
 deleted file mode 100644
@@ -682,7 +682,7 @@ index 1111111..0000000
         );
         let create = entry(
             tmp.path(),
-            "0002-new.patch",
+            "created.patch",
             "\
 diff --git a/g.txt b/g.txt
 new file mode 100644
@@ -705,7 +705,7 @@ index 0000000..4444444
         // is the useful answer and a single boolean is not.
         let patch = entry(
             tmp.path(),
-            "0001-two.patch",
+            "two.patch",
             "\
 diff --git a/f.txt b/f.txt
 index 1111111..2222222 100644
@@ -745,8 +745,8 @@ index 3333333..4444444 100644
     fn a_missing_patch_file_is_reported_not_ignored() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = Entry {
-            name: "0001-gone.patch".into(),
-            path: tmp.path().join("0001-gone.patch"),
+            name: "gone.patch".into(),
+            path: tmp.path().join("gone.patch"),
             line: 1,
         };
         let (_dir, repo, sha) = repo_with(&[]);
@@ -763,7 +763,7 @@ index 3333333..4444444 100644
     #[test]
     fn an_unparseable_patch_is_reported_not_ignored() {
         let tmp = tempfile::tempdir().unwrap();
-        let bad = entry(tmp.path(), "0001-bad.patch", "this is not a diff\n");
+        let bad = entry(tmp.path(), "bad.patch", "this is not a diff\n");
         let (_dir, repo, sha) = repo_with(&[]);
         let report = check_series(&repo, &sha, &[bad]).unwrap();
         assert!(!report.ok);
@@ -788,20 +788,20 @@ index 3333333..4444444 100644
     fn the_summary_names_the_patch_file_and_the_path() {
         let tmp = tempfile::tempdir().unwrap();
         let entries = vec![
-            entry(tmp.path(), "0001-a.patch", CONFLICTING_A),
-            entry(tmp.path(), "0002-b.patch", CONFLICTING_B),
+            entry(tmp.path(), "a.patch", CONFLICTING_A),
+            entry(tmp.path(), "b.patch", CONFLICTING_B),
         ];
         let (_dir, repo, sha) = repo_with(&[("f.txt", BASE)]);
         let summary = check_series(&repo, &sha, &entries).unwrap().summary();
-        assert!(summary.contains("0001-a.patch"), "got {summary}");
-        assert!(summary.contains("0002-b.patch"), "got {summary}");
+        assert!(summary.contains("a.patch"), "got {summary}");
+        assert!(summary.contains("b.patch"), "got {summary}");
         assert!(summary.contains("f.txt"), "got {summary}");
     }
 
     #[test]
     fn the_report_serialises_to_json() {
         let tmp = tempfile::tempdir().unwrap();
-        let entries = vec![entry(tmp.path(), "0001-a.patch", CONFLICTING_A)];
+        let entries = vec![entry(tmp.path(), "a.patch", CONFLICTING_A)];
         let (_dir, repo, sha) = repo_with(&[("f.txt", BASE)]);
         let json = serde_json::to_string(&check_series(&repo, &sha, &entries).unwrap()).unwrap();
         assert!(json.contains("\"patch_count\":1"));
@@ -829,7 +829,7 @@ index 3333333..4444444 100644
             .id();
         let patch = entry(
             tmp.path(),
-            "0001-done.patch",
+            "done.patch",
             &format!(
                 "\
 diff --git a/f.txt b/f.txt
@@ -853,7 +853,7 @@ index 1111111..{post} 100644
     #[test]
     fn a_missing_base_ref_is_an_error_not_an_empty_tree() {
         let tmp = tempfile::tempdir().unwrap();
-        let entries = vec![entry(tmp.path(), "0001-a.patch", CONFLICTING_A)];
+        let entries = vec![entry(tmp.path(), "a.patch", CONFLICTING_A)];
         let (_dir, repo, _sha) = repo_with(&[]);
         let err = check_series(&repo, "no-such-ref", &entries)
             .expect_err("an unknown base must not look like an empty tree");

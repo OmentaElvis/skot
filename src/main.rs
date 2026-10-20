@@ -6,11 +6,15 @@ use clap::FromArgMatches;
 use skot::cli::{Cli, Command, build_cli};
 use skot::commands::{self, Exit};
 use skot::hints;
+use skot::prompt::PromptError;
 use skot::ui;
 
 fn main() -> ExitCode {
     // One tree for parsing and for help: `--help` is what `build_cli` dresses up.
     let matches = build_cli().get_matches();
+    // Which subcommand this run took: the usage line of a question nobody answered
+    // starts at the command that asked it, not at `skot`.
+    let path = command_path(&matches);
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     ui::set_json(cli.json);
     hints::set_enabled(!cli.no_hints);
@@ -18,10 +22,24 @@ fn main() -> ExitCode {
 
     // The one place a command's verdict becomes a process status. `Err` is a
     // malfunction and says so on stderr; `Exit` is a command that ran and answered.
-    match run(cli) {
+    match run(&cli) {
         Ok(Exit::Success) => ExitCode::SUCCESS,
         Ok(Exit::Failure) => ExitCode::FAILURE,
         Err(err) => {
+            // A question with nobody to answer it is not a malfunction but a usage
+            // error: clap prints it with the command's usage line and exits 2, the
+            // way it refuses a missing flag.
+            let no_answer =
+                err.chain()
+                    .find_map(|cause| match cause.downcast_ref::<PromptError>() {
+                        Some(PromptError::NoAnswer { question, instead }) => {
+                            Some((question, instead))
+                        }
+                        _ => None,
+                    });
+            if let Some((question, instead)) = no_answer {
+                return usage_error(&path, question, instead);
+            }
             log::error!("Error: {:?}", err);
             for cause in err.chain().skip(1) {
                 log::debug!("caused by: {cause}");
@@ -31,13 +49,50 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<Exit> {
+/// A question nobody could answer, printed the way clap refuses a missing flag: the
+/// message, the subcommand's usage line, and exit code 2.
+fn usage_error(path: &[String], question: &str, instead: &str) -> ExitCode {
+    // The same tree the run was parsed from, walked to the command that asked, so
+    // the usage line is that command's rather than the root's.
+    let mut cmd = build_cli();
+    for name in path {
+        let Some(sub) = cmd.find_subcommand(name).cloned() else {
+            break;
+        };
+        cmd = sub;
+    }
+    cmd = cmd.bin_name(if path.is_empty() {
+        "skot".to_owned()
+    } else {
+        format!("skot {}", path.join(" "))
+    });
+    let err = cmd.error(
+        clap::error::ErrorKind::MissingRequiredArgument,
+        format!("cannot ask {question} here; answer it with: {instead}"),
+    );
+    // Swallow broken pipe errors, the way clap's own exit does.
+    let _ = err.print();
+    ExitCode::from(err.exit_code() as u8)
+}
+
+/// The subcommand path this invocation took, exactly as clap parsed it.
+fn command_path(matches: &clap::ArgMatches) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut current = matches;
+    while let Some((name, sub)) = current.subcommand() {
+        path.push(name.to_owned());
+        current = sub;
+    }
+    path
+}
+
+fn run(cli: &Cli) -> Result<Exit> {
     // `init` is the one command that must work before a project exists.
     if matches!(cli.command, Command::Init(_)) {
-        let ctx = commands::Ctx::discover_or_init(&cli)?;
+        let ctx = commands::Ctx::discover_or_init(cli)?;
         return commands::run(ctx);
     }
 
-    let ctx = commands::Ctx::discover(&cli)?;
+    let ctx = commands::Ctx::discover(cli)?;
     commands::run(ctx)
 }

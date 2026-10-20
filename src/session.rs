@@ -9,11 +9,11 @@
 //! Three properties follow from that split, and each closes a bug the shared sandbox had:
 //!
 //! - **A session names its patch.** The old loop targeted "the patch on top of the applied
-//!   set", so `new --at 2` followed by a bare `edit-save` exported into the *tail* patch
+//!   set", so `new --at 2` followed by a bare `save` exported into the *tail* patch
 //!   instead. Here a session has exactly one patch, or a command has the list of sessions
 //!   to pick from.
 //! - **A session records its base.** `base_sha` is the commit it opened on, and
-//!   `base_tree` the tree the patches below produced then. `edit-save` diffs against that
+//!   `base_tree` the tree the patches below produced then. `save` diffs against that
 //!   record, so editing the series below the patch cannot silently move what its edits are
 //!   measured against; a mismatch is refused and named rather than written.
 //! - **A session touches neither `state.json` nor the sandbox.** The old `new` wrote the
@@ -49,10 +49,10 @@ pub struct Session {
     pub series: String,
     /// The series entry's name at the moment the session opened.
     ///
-    /// Not stable: `new --at`, `move` and `drop` renumber the tail, so a session opened as
-    /// `0001-a.patch` is on `0002-a.patch` once a patch lands in front of it. What follows
-    /// the rename is this field; what does not move is [`Session::dir`], because the
-    /// worktree is registered under a name git will not follow.
+    /// A patch's name is the name it was created with, so this stays put; what two series
+    /// can still disagree about is which patch a name means, which is what
+    /// [`Session::series`] is for. What does not move either way is [`Session::dir`],
+    /// because the worktree is registered under a name git will not follow.
     pub patch: String,
     /// The worktree directory's name under `.skot/work/<series>/`, fixed when the session
     /// opened.
@@ -70,7 +70,7 @@ pub struct Session {
     pub base_sha: Sha,
     /// The tree the patches below this one produced when the session opened, as an oid.
     ///
-    /// This is the drift guard's anchor: `edit-save` replays the series below against
+    /// This is the drift guard's anchor: `save` replays the series below against
     /// `base_sha` and refuses if that replay no longer reaches this tree, because the
     /// patch's recorded base has moved out from under it.
     pub base_tree: String,
@@ -186,29 +186,6 @@ impl Manifest {
         self.sessions.remove(at);
         true
     }
-
-    /// Follow a tail renumbering, the way [`crate::state::State::follow_renames`] does for
-    /// the applied set: the record's patch name changes to whatever the series now calls
-    /// it, and the worktree stays exactly where it is.
-    ///
-    /// Only the layout's own series is touched: a renumbering renames files in the active
-    /// series, and another series' same-named patch has nothing to do with it.
-    ///
-    /// Without this, `new --at` or `move` in front of an open patch leaves the manifest
-    /// naming a patch the series no longer has: `list` loses the `(unsaved)` marker,
-    /// `edit-save` finds no work area, and the next `reconcile` treats the worktree as
-    /// an orphan and deletes the edits.
-    pub fn follow_renames(&mut self, layout: &Layout, renames: &[(String, String)]) {
-        for (from, to) in renames {
-            if let Some(session) = self
-                .sessions
-                .iter_mut()
-                .find(|s| s.series_name() == layout.series() && s.patch == *from)
-            {
-                session.patch = to.clone();
-            }
-        }
-    }
 }
 
 /// Bring `.skot/work/` and the manifest back into agreement. The caller holds the lock.
@@ -223,7 +200,7 @@ impl Manifest {
 /// but it is where the user was: deleting it because they ran `check` in between would pull
 /// the directory out from under an open editor. Being clean costs nothing: [`unsaved`]
 /// decides what counts as a complaint, and only unsaved work areas ever block anything.
-/// `edit-save` retires one when it saves it, and `clean` reaps the rest
+/// `save` retires one when it saves it, and `clean` reaps the rest
 /// as derived state.
 pub fn reconcile(layout: &Layout) -> Result<Manifest> {
     let mut manifest = Manifest::load(layout)?;
@@ -249,10 +226,17 @@ pub fn reconcile(layout: &Layout) -> Result<Manifest> {
     }
 
     // Directories nobody recorded, at any depth under the work directory: the per-series
-    // level, and the patch's own subdirectory inside it. A directory that *contains* a
-    // recorded session is not an orphan: a patch name may carry a subdirectory
-    // (`sub/0002-fix.patch`), and deleting the parent to tidy an "orphan" would delete
-    // the session inside it, so a kept directory is walked into rather than skipped.
+    // level, and the patch's own subdirectory inside it. Two nesting cases decide what is
+    // an orphan, and getting either wrong deletes something that is not skot's:
+    //
+    // - A patch name may carry a subdirectory (`sub/fix.patch`), so a directory that
+    //   *leads to* a recorded session is not an orphan; it is walked into rather than
+    //   deleted, or the session inside it would go with it.
+    // - A directory that *is* a recorded session holds the project's own files, which look
+    //   exactly like orphans to anything scanning by name. Sweeping inside a live worktree
+    //   deletes the tree the author is editing, and the index keeps listing what the
+    //   working directory no longer has, so every later export reports those files as
+    //   deleted. A session's worktree is therefore left alone entirely.
     let recorded: Vec<std::path::PathBuf> = manifest
         .sessions
         .iter()
@@ -270,7 +254,14 @@ pub fn reconcile(layout: &Layout) -> Result<Manifest> {
                 if !path.is_dir() {
                     continue;
                 }
-                if recorded.iter().any(|r| r == &path || r.starts_with(&path)) {
+                if recorded.contains(&path) {
+                    // A live session's worktree: the project's files live here, and none
+                    // of them are ours to tidy.
+                    continue;
+                }
+                if recorded.iter().any(|r| r.starts_with(&path)) {
+                    // An ancestor of a session, so walk in to find it rather than delete
+                    // the whole subtree it sits in.
                     sweep(layout, &path, recorded, changed)?;
                     continue;
                 }
@@ -369,7 +360,7 @@ pub fn materialise(layout: &Layout, patch: &str, plan: &Plan) -> Result<Session>
             "`{patch}` already has a work area at {}.\n\
              `{}` saves what is in it.",
             dir.display(),
-            skot_args("edit-save", patch),
+            skot_args("save", patch),
         );
     }
 
@@ -442,10 +433,9 @@ pub fn end(layout: &Layout, session: &Session) -> Result<()> {
     let dir = session.dir_path(layout)?;
     sandbox::prune(&mirror, &session.worktree_name(), &dir)?;
     let mut manifest = Manifest::load(layout)?;
-    // By series and directory, not by patch name: a renumbering may have renamed the
-    // record since the caller resolved it, and the pair is the one identity that never
-    // moves. The series half matters too: two series can hold a patch of the same name
-    // with its own work area, and ending one must not forget the other.
+    // By series and directory, not by patch name: the pair is the one identity that
+    // never moves. The series half matters too: two series can hold a patch of the same
+    // name with its own work area, and ending one must not forget the other.
     manifest.sessions.retain(|s| {
         !(s.series_name() == session.series_name() && s.dir_name() == session.dir_name())
     });
@@ -455,7 +445,7 @@ pub fn end(layout: &Layout, session: &Session) -> Result<()> {
 
 /// Whether the work area holds changes the patch file does not.
 ///
-/// The same comparison `edit-save` makes before writing: export the worktree against the
+/// The same comparison `save` makes before writing: export the worktree against the
 /// recorded base and compare the body with what is on disk, ignoring the header, because
 /// re-rendering it normalises things the author never wrote. This is the one thing that
 /// makes a work area worth keeping: a work area that compares equal has nothing unsaved
@@ -529,15 +519,15 @@ mod tests {
         let mut manifest = Manifest::default();
         manifest.insert(Session {
             series: DEFAULT_SERIES.to_owned(),
-            patch: "0001-a.patch".into(),
-            dir: "0001-a.patch".into(),
+            patch: "a.patch".into(),
+            dir: "a.patch".into(),
             ref_name: "main".into(),
             base_sha: "abc123".into(),
             base_tree: "def456".into(),
         });
         manifest.save(&layout).unwrap();
         assert_eq!(Manifest::load(&layout).unwrap(), manifest);
-        assert_eq!(manifest.patches(&layout), ["0001-a.patch"]);
+        assert_eq!(manifest.patches(&layout), ["a.patch"]);
     }
 
     #[test]
@@ -569,35 +559,35 @@ mod tests {
         testsupport::write_series(
             &layout,
             &[
-                ("0001-a.patch", testsupport::patch_one()),
-                ("0002-b.patch", testsupport::patch_two()),
+                ("a.patch", testsupport::patch_one()),
+                ("b.patch", testsupport::patch_two()),
             ],
         );
         let entries = entries_of(&layout);
 
-        // Position zero: nothing below, so the base tree is the ref's own tree and the
+        // First in the series: nothing below, so the base tree is the ref's own tree and the
         // worktree starts there, with the patch's own content adding nothing yet.
-        let for_0001 = plan(&layout, "main", &[], None).unwrap();
-        assert_eq!(for_0001.base_sha, sha);
+        let for_first = plan(&layout, "main", &[], None).unwrap();
+        assert_eq!(for_first.base_sha, sha);
         assert_eq!(
-            for_0001.base_tree,
+            for_first.base_tree,
             crate::git::commit_tree(Mirror::open(&layout).unwrap().repo(), &sha)
                 .unwrap()
                 .id()
         );
-        assert_eq!(for_0001.work_tree, for_0001.base_tree);
-        assert_eq!(text_in(&layout, for_0001.work_tree, "f.txt"), "base\n");
+        assert_eq!(for_first.work_tree, for_first.base_tree);
+        assert_eq!(text_in(&layout, for_first.work_tree, "f.txt"), "base\n");
 
-        // Opening 0002: below holds 0001's output, so the base tree is the tree 0001
+        // Opening b.patch: below holds a.patch's output, so the base tree is the tree a.patch
         // produced, and the worktree is that with nothing of its own on top yet.
-        let for_0002 = plan(&layout, "main", &entries[..1], None).unwrap();
-        assert_eq!(text_in(&layout, for_0002.base_tree, "f.txt"), "first\n");
-        assert_eq!(for_0002.work_tree, for_0002.base_tree);
+        let for_second = plan(&layout, "main", &entries[..1], None).unwrap();
+        assert_eq!(text_in(&layout, for_second.base_tree, "f.txt"), "first\n");
+        assert_eq!(for_second.work_tree, for_second.base_tree);
 
         // With the patch's own file replayed on top, the worktree holds its content.
-        let for_0002 = plan(&layout, "main", &entries[..1], Some(&entries[1])).unwrap();
-        assert_eq!(text_in(&layout, for_0002.base_tree, "f.txt"), "first\n");
-        assert_eq!(text_in(&layout, for_0002.work_tree, "f.txt"), "second\n");
+        let for_second = plan(&layout, "main", &entries[..1], Some(&entries[1])).unwrap();
+        assert_eq!(text_in(&layout, for_second.base_tree, "f.txt"), "first\n");
+        assert_eq!(text_in(&layout, for_second.work_tree, "f.txt"), "second\n");
     }
 
     #[test]
@@ -606,7 +596,7 @@ mod tests {
         // If an empty file did not replay, the very first session would refuse to open.
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = project(tmp.path());
-        testsupport::write_series(&layout, &[("0001-a.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", "")]);
         let entries = entries_of(&layout);
 
         let empty_plan = plan(&layout, "main", &[], Some(&entries[0])).unwrap();
@@ -623,7 +613,7 @@ mod tests {
         testsupport::write_series(
             &layout,
             &[(
-                "0001-a.patch",
+                "a.patch",
                 "\
 diff --git a/nowhere.txt b/nowhere.txt
 index 1111111..2222222 100644
@@ -640,7 +630,7 @@ index 1111111..2222222 100644
         let err = plan(&layout, "main", &entries, None)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("0001-a.patch"), "the failing patch: {err}");
+        assert!(err.contains("a.patch"), "the failing patch: {err}");
         assert!(err.contains("Nothing was written"), "{err}");
         assert!(
             !layout.work_dir().exists(),
@@ -656,16 +646,16 @@ index 1111111..2222222 100644
         testsupport::write_series(
             &layout,
             &[
-                ("0001-a.patch", testsupport::patch_one()),
-                ("0002-b.patch", testsupport::patch_two()),
+                ("a.patch", testsupport::patch_one()),
+                ("b.patch", testsupport::patch_two()),
             ],
         );
         let entries = entries_of(&layout);
 
-        let for_0002 = plan(&layout, "main", &entries[..1], None).unwrap();
-        let session = materialise(&layout, "0002-b.patch", &for_0002).unwrap();
+        let for_second = plan(&layout, "main", &entries[..1], None).unwrap();
+        let session = materialise(&layout, "b.patch", &for_second).unwrap();
 
-        let dir = layout.work_patch_dir("0002-b.patch").unwrap();
+        let dir = layout.work_patch_dir("b.patch").unwrap();
         assert!(dir.join(".git").is_file(), "a linked worktree, not a clone");
         assert_eq!(
             std::fs::read_to_string(dir.join("f.txt")).unwrap(),
@@ -683,8 +673,8 @@ index 1111111..2222222 100644
         // The session is recorded, and the shared run state is not touched at all: the
         // whole point of the split is that `new` and friends stop writing it.
         let manifest = Manifest::load(&layout).unwrap();
-        assert_eq!(manifest.patches(&layout), ["0002-b.patch"]);
-        assert_eq!(manifest.get(&layout, "0002-b.patch").unwrap().base_sha, sha);
+        assert_eq!(manifest.patches(&layout), ["b.patch"]);
+        assert_eq!(manifest.get(&layout, "b.patch").unwrap().base_sha, sha);
         assert!(
             !layout.state_file().exists(),
             "sessions never write state.json"
@@ -709,31 +699,31 @@ index 1111111..2222222 100644
         testsupport::write_series(
             &layout,
             &[
-                ("0001-a.patch", testsupport::patch_one()),
-                ("0002-b.patch", testsupport::patch_two()),
+                ("a.patch", testsupport::patch_one()),
+                ("b.patch", testsupport::patch_two()),
             ],
         );
         let entries = entries_of(&layout);
 
         materialise(
             &layout,
-            "0001-a.patch",
+            "a.patch",
             &plan(&layout, "main", &[], None).unwrap(),
         )
         .unwrap();
         materialise(
             &layout,
-            "0002-b.patch",
+            "b.patch",
             &plan(&layout, "main", &entries[..1], None).unwrap(),
         )
         .unwrap();
 
         assert_eq!(
             Manifest::load(&layout).unwrap().patches(&layout),
-            ["0001-a.patch", "0002-b.patch"]
+            ["a.patch", "b.patch"]
         );
-        let one = layout.work_patch_dir("0001-a.patch").unwrap();
-        let two = layout.work_patch_dir("0002-b.patch").unwrap();
+        let one = layout.work_patch_dir("a.patch").unwrap();
+        let two = layout.work_patch_dir("b.patch").unwrap();
         assert_eq!(
             std::fs::read_to_string(one.join("f.txt")).unwrap(),
             "base\n"
@@ -746,29 +736,29 @@ index 1111111..2222222 100644
 
     #[test]
     fn two_series_can_hold_a_session_for_the_same_patch_name() {
-        // The registration names carry the series, so `0001-a.patch` in one series and
-        // `0001-a.patch` in another are two worktrees of one mirror, not a collision.
+        // The registration names carry the series, so `a.patch` in one series and
+        // `a.patch` in another are two worktrees of one mirror, not a collision.
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = project(tmp.path());
-        testsupport::write_series(&layout, &[("0001-a.patch", testsupport::patch_one())]);
+        testsupport::write_series(&layout, &[("a.patch", testsupport::patch_one())]);
         materialise(
             &layout,
-            "0001-a.patch",
+            "a.patch",
             &plan(&layout, "main", &[], None).unwrap(),
         )
         .unwrap();
 
         let exp = layout.with_series("exp").unwrap();
         std::fs::create_dir_all(exp.patches_dir()).unwrap();
-        std::fs::write(exp.series_file(), "0001-a.patch\n").unwrap();
+        std::fs::write(exp.series_file(), "a.patch\n").unwrap();
         std::fs::write(
-            exp.patches_dir().join("0001-a.patch"),
+            exp.patches_dir().join("a.patch"),
             testsupport::patch_adds_g(),
         )
         .unwrap();
         let session = materialise(
             &exp,
-            "0001-a.patch",
+            "a.patch",
             &plan(&exp, "main", &[], Some(&entries_of(&exp)[0])).unwrap(),
         )
         .unwrap();
@@ -776,22 +766,19 @@ index 1111111..2222222 100644
         assert_eq!(session.series_name(), "exp");
         assert_eq!(
             Manifest::load(&layout).unwrap().patches(&layout),
-            ["0001-a.patch"]
+            ["a.patch"]
         );
-        assert_eq!(
-            Manifest::load(&layout).unwrap().patches(&exp),
-            ["0001-a.patch"]
-        );
+        assert_eq!(Manifest::load(&layout).unwrap().patches(&exp), ["a.patch"]);
         // Different directories, both openable: the names in the mirror did not collide.
         assert_ne!(
-            layout.work_patch_dir("0001-a.patch").unwrap(),
+            layout.work_patch_dir("a.patch").unwrap(),
             session.dir_path(&exp).unwrap()
         );
         open(
             &layout,
             &Manifest::load(&layout)
                 .unwrap()
-                .get(&layout, "0001-a.patch")
+                .get(&layout, "a.patch")
                 .unwrap()
                 .clone(),
         )
@@ -804,15 +791,15 @@ index 1111111..2222222 100644
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = project(tmp.path());
         let first = plan(&layout, "main", &[], None).unwrap();
-        materialise(&layout, "0001-a.patch", &first).unwrap();
+        materialise(&layout, "a.patch", &first).unwrap();
 
-        let err = materialise(&layout, "0001-a.patch", &first)
+        let err = materialise(&layout, "a.patch", &first)
             .unwrap_err()
             .to_string();
         assert!(err.contains("already has a work area"), "got {err}");
         assert_eq!(
             Manifest::load(&layout).unwrap().patches(&layout),
-            ["0001-a.patch"],
+            ["a.patch"],
             "the first session must be untouched"
         );
     }
@@ -824,17 +811,17 @@ index 1111111..2222222 100644
         // "worktree already exists".
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = project(tmp.path());
-        let dir = layout.work_patch_dir("0001-a.patch").unwrap();
+        let dir = layout.work_patch_dir("a.patch").unwrap();
         let mirror = Mirror::open(&layout).unwrap();
-        sandbox::add(&mirror, "0001-a.patch", &dir, "remedy").unwrap();
+        sandbox::add(&mirror, "a.patch", &dir, "remedy").unwrap();
         std::fs::write(dir.join("leftover.txt"), b"half-finished edit").unwrap();
 
         let plan = plan(&layout, "main", &[], None).unwrap();
-        materialise(&layout, "0001-a.patch", &plan).unwrap();
+        materialise(&layout, "a.patch", &plan).unwrap();
 
         assert_eq!(
             Manifest::load(&layout).unwrap().patches(&layout),
-            ["0001-a.patch"]
+            ["a.patch"]
         );
         assert!(
             !dir.join("leftover.txt").exists(),
@@ -849,8 +836,8 @@ index 1111111..2222222 100644
         let mut manifest = Manifest::default();
         manifest.insert(Session {
             series: DEFAULT_SERIES.to_owned(),
-            patch: "0001-a.patch".into(),
-            dir: "0001-a.patch".into(),
+            patch: "a.patch".into(),
+            dir: "a.patch".into(),
             ref_name: "main".into(),
             base_sha: "abc".into(),
             base_tree: "def".into(),
@@ -869,7 +856,7 @@ index 1111111..2222222 100644
     fn reconcile_removes_a_directory_no_session_recorded() {
         let tmp = tempfile::tempdir().unwrap();
         let layout = Layout::new(tmp.path());
-        let husk = layout.work_patch_dir("0001-a.patch").unwrap();
+        let husk = layout.work_patch_dir("a.patch").unwrap();
         std::fs::create_dir_all(&husk).unwrap();
         std::fs::write(husk.join("f.txt"), b"left behind").unwrap();
 
@@ -892,14 +879,14 @@ index 1111111..2222222 100644
         // would delete the session inside.
         let tmp = tempfile::tempdir().unwrap();
         let layout = Layout::new(tmp.path());
-        let dir = layout.work_patch_dir("sub/0002-fix.patch").unwrap();
+        let dir = layout.work_patch_dir("sub/fix.patch").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("f.txt"), b"edits").unwrap();
         let mut manifest = Manifest::default();
         manifest.insert(Session {
             series: DEFAULT_SERIES.to_owned(),
-            patch: "sub/0002-fix.patch".into(),
-            dir: "sub/0002-fix.patch".into(),
+            patch: "sub/fix.patch".into(),
+            dir: "sub/fix.patch".into(),
             ref_name: "main".into(),
             base_sha: "abc".into(),
             base_tree: "def".into(),
@@ -908,7 +895,7 @@ index 1111111..2222222 100644
 
         let reconciled = reconcile(&layout).unwrap();
 
-        assert_eq!(reconciled.patches(&layout), ["sub/0002-fix.patch"]);
+        assert_eq!(reconciled.patches(&layout), ["sub/fix.patch"]);
         assert!(
             dir.join("f.txt").exists(),
             "the session's edits must survive"
@@ -916,36 +903,22 @@ index 1111111..2222222 100644
     }
 
     #[test]
-    fn a_renamed_patch_keeps_its_session_and_the_worktree_it_opened() {
-        // `new --at` or `move` in front of an open patch renames the tail. The session
-        // record has to follow the *name* (so `list` and `edit-save` find it by what
-        // the series now calls it) without following the *directory* (git cannot rename a
-        // worktree registration in place, and the edits live in that directory).
+    fn a_session_stays_with_its_worktree_when_the_series_changes_underneath() {
+        // The worktree is registered under [`Session::dir`], which git will not follow
+        // anywhere, and the record is keyed on it: reordering the series leaves the
+        // session exactly where it is, and `reconcile` has no reason to touch it.
         let tmp = tempfile::tempdir().unwrap();
         let (layout, sha) = project(tmp.path());
-        testsupport::write_series(&layout, &[("0001-a.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", "")]);
         let plan = plan(&layout, "main", &[], None).unwrap();
-        materialise(&layout, "0001-a.patch", &plan).unwrap();
+        materialise(&layout, "a.patch", &plan).unwrap();
 
-        // What `new --at 1` does to the rest of the manifest: the name moves, the
-        // directory does not.
-        let mut manifest = Manifest::load(&layout).unwrap();
-        manifest.follow_renames(
-            &layout,
-            &[("0001-a.patch".to_owned(), "0002-a.patch".to_owned())],
-        );
-        manifest.save(&layout).unwrap();
-
-        let old_dir = layout.work_patch_dir("0001-a.patch").unwrap();
-        assert!(old_dir.exists(), "the worktree does not move");
+        let dir = layout.work_patch_dir("a.patch").unwrap();
 
         let reconciled = reconcile(&layout).unwrap();
-        let session = reconciled.get(&layout, "0002-a.patch").unwrap();
-        assert_eq!(session.dir_name(), "0001-a.patch");
+        let session = reconciled.get(&layout, "a.patch").unwrap();
+        assert_eq!(session.dir_name(), "a.patch");
         assert_eq!(session.base_sha, sha);
-        assert!(
-            old_dir.exists(),
-            "reconcile must not treat the moved name's directory as an orphan"
-        );
+        assert!(dir.exists(), "reconcile must not touch a live work area");
     }
 }

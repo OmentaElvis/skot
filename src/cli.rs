@@ -45,7 +45,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_hints: bool,
 
-    /// Do not ask for confirmation.
+    /// Do not ask: every question takes what Enter would give, a confirmation with
+    /// nothing to give is answered yes, and any other question only a flag can answer
+    /// is refused with that flag.
     #[arg(long, short = 'y', global = true)]
     pub yes: bool,
 
@@ -114,7 +116,8 @@ pub enum PatchCommand {
     Import(ImportArgs),
 
     /// Save your edits to the patch file.
-    EditSave(EditSaveArgs),
+    #[command(alias = "edit-save")]
+    Save(SaveArgs),
 
     /// Open an existing patch for editing, in a worktree of its own.
     Edit(EditArgs),
@@ -122,7 +125,7 @@ pub enum PatchCommand {
     /// Apply the enabled set to the sandbox; choose it with enable and disable.
     Apply(RefArg),
 
-    /// Remove the whole series from the sandbox.
+    /// Remove the applied set from the sandbox.
     Unapply,
 
     /// Apply the next patch in the series, or a named one.
@@ -294,7 +297,7 @@ const ROOT_GROUPS: &[(&str, &[&str])] = &[
 
 /// `skot patch --help`'s groups, same shape as [`ROOT_GROUPS`].
 const PATCH_GROUPS: &[(&str, &[&str])] = &[
-    ("Author", &["new", "edit", "edit-save", "import"]),
+    ("Author", &["new", "edit", "save", "import"]),
     ("Arrange", &["enable", "disable", "move", "drop", "copy"]),
     ("Apply", &["apply", "unapply", "push", "pop"]),
     ("Inspect", &["list"]),
@@ -413,7 +416,7 @@ fn quick_start() -> StyledStr {
             skot_args("new", "my-fix"),
             "work in the worktree skot opens, then:",
         ),
-        (skot("edit-save"), "save your changes"),
+        (skot("save"), "save your changes"),
     ] {
         out.push_str(&format!(
             "  {}{command:<28}{}{purpose}\n",
@@ -482,7 +485,7 @@ pub struct CleanArgs {
     /// Also drop work areas that hold unsaved changes.
     ///
     /// Work areas are never in a default plan: their directories hold edits that exist
-    /// nowhere else until `edit-save` writes them into a patch. `mirror` and `all` refuse
+    /// nowhere else until `save` writes them into a patch. `mirror` and `all` refuse
     /// while any remain, and a work area that matches its patch is already gone by then.
     #[arg(long)]
     pub sessions: bool,
@@ -584,13 +587,13 @@ pub struct SyncArgs {
 
 /// A patch name, for the commands that act on the stack rather than on a ref.
 ///
-/// Deliberately not [`RefArg`]: `skot patch pop 0002-fix` takes a *patch*, and the ref it
+/// Deliberately not [`RefArg`]: `skot patch pop fix` takes a *patch*, and the ref it
 /// works against is the one the sandbox is already on. Sharing one argument type between
 /// the two would mean `pop main` silently meant "pop the patch called main", which is never
 /// what anyone typing that meant.
 #[derive(Debug, Clone, Default, Args)]
 pub struct PatchArg {
-    /// Patch in the series: its name, a unique prefix such as the serial `0003`, or its
+    /// Patch in the series: its name, a unique prefix such as `fix`, or its
     /// 1-based position. Defaults to the one on top of the stack.
     #[arg(value_name = "PATCH")]
     pub patch: Option<String>,
@@ -621,8 +624,8 @@ pub struct ImportArgs {
     #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
 
-    /// Insert at this position: a 1-based index or an existing patch name. Patches after
-    /// it are renumbered so the numbers stay contiguous. Defaults to appending.
+    /// Insert at this position: a 1-based index or an existing patch name. Every other
+    /// patch keeps its name and its place. Defaults to appending.
     #[arg(long, value_name = "PATCH|N", conflicts_with = "no_register")]
     pub at: Option<String>,
 
@@ -646,19 +649,18 @@ pub struct NewArgs {
     #[arg(long, value_name = "REF")]
     pub base: Option<String>,
 
-    /// Insert at this position: a 1-based index or an existing patch name. Patches after
-    /// it are renumbered so the numbers stay contiguous. Defaults to appending.
+    /// Insert at this position: a 1-based index or an existing patch name. Every other
+    /// patch keeps its name and its place. Defaults to appending.
     #[arg(long, value_name = "PATCH|N")]
     pub at: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct EditSaveArgs {
+pub struct SaveArgs {
     /// Patch to save into. Defaults to the work area with unsaved changes.
     pub name: Option<String>,
 
-    /// Where to insert it in the series. Patches after it are renumbered so the numbers
-    /// stay contiguous.
+    /// Where to insert it in the series.
     #[arg(long, value_name = "INDEX")]
     pub insert_at: Option<usize>,
 
@@ -689,7 +691,7 @@ pub struct EditArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct DropArgs {
-    /// Patch to drop: its name, a unique prefix such as the serial `0003`, or its
+    /// Patch to drop: its name, a unique prefix such as `fix`, or its
     /// 1-based position. Refused while it is applied; `skot patch pop` takes it off first.
     #[arg(value_name = "PATCH")]
     pub patch: String,
@@ -697,8 +699,8 @@ pub struct DropArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct EnableArgs {
-    /// Patches to put back in the applying set: names, unique prefixes such as the
-    /// serial `0003`, or 1-based positions among the enabled. Left out, picked from a
+    /// Patches to put back in the applying set: names, unique prefixes such as
+    /// `fix`, or 1-based positions among the disabled. Left out, picked from a
     /// list of the disabled ones; `--all` takes every disabled patch.
     #[arg(value_name = "PATCH")]
     pub patches: Vec<String>,
@@ -709,10 +711,10 @@ pub struct EnableArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct DisableArgs {
-    /// Patches to skip from now on: names, unique prefixes such as the serial `0003`,
+    /// Patches to skip from now on: names, unique prefixes such as `fix`,
     /// or 1-based positions among the enabled. Left out, picked from a list of the
     /// enabled, not-yet-applied ones; `--all` takes every one that can go. The line is
-    /// commented out in the series, so the choice is trackable and lasts.
+    /// marked `#!` in the series, so the choice is trackable and lasts.
     #[arg(value_name = "PATCH")]
     pub patches: Vec<String>,
     /// Every enabled patch the sandbox is not holding.
@@ -722,7 +724,7 @@ pub struct DisableArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct MoveArgs {
-    /// Patch to move: its name, a unique prefix such as the serial `0003`, or its
+    /// Patch to move: its name, a unique prefix such as `fix`, or its
     /// 1-based position. Left out, it is picked from a list; a patch that is applied
     /// cannot move.
     #[arg(value_name = "PATCH")]
@@ -1021,8 +1023,7 @@ mod tests {
         assert_eq!(help_about.as_deref(), Some(HELP_ABOUT));
 
         // Each listed command appears exactly once, as one styled row. Matched on a whole
-        // word because `edit` is a prefix of `edit-save` and a substring count would see
-        // the longer row twice.
+        // word because a substring count would see a longer row twice.
         for name in listed_names(ROOT_GROUPS) {
             assert_eq!(
                 root_help
@@ -1070,8 +1071,7 @@ mod tests {
 
     /// The command name at the start of a rendered help row, if the line is one.
     ///
-    /// Whole-row, whole-word: `edit` is a prefix of `edit-save`, and a styled substring
-    /// count would see the longer row as both.
+    /// Whole-row, whole-word: a styled substring count would see a longer name twice.
     fn row_name(line: &str) -> Option<String> {
         let stripped = strip_ansi(line);
         let mut words = stripped.split_whitespace().map(str::to_owned);
@@ -1183,11 +1183,11 @@ mod tests {
             Command::Patch(PatchCommand::Disable(_))
         ));
         // Both ends of the batch interface: several patches in one run, or `--all`.
-        let cli = Cli::try_parse_from(["skot", "patch", "enable", "0003", "0005"]).unwrap();
+        let cli = Cli::try_parse_from(["skot", "patch", "enable", "fix", "foo"]).unwrap();
         let Command::Patch(PatchCommand::Enable(args)) = cli.command else {
             panic!("expected enable");
         };
-        assert_eq!(args.patches, ["0003", "0005"]);
+        assert_eq!(args.patches, ["fix", "foo"]);
         let cli = Cli::try_parse_from(["skot", "patch", "disable", "--all"]).unwrap();
         let Command::Patch(PatchCommand::Disable(args)) = cli.command else {
             panic!("expected disable");
@@ -1195,7 +1195,7 @@ mod tests {
         assert!(args.all);
         assert!(args.patches.is_empty());
         assert!(
-            Cli::try_parse_from(["skot", "patch", "enable", "0003", "--all"]).is_err(),
+            Cli::try_parse_from(["skot", "patch", "enable", "fix", "--all"]).is_err(),
             "--all and names are two different questions"
         );
         // The reversed extraction of `import`, by either spelling.
@@ -1211,6 +1211,11 @@ mod tests {
             panic!("expected import");
         };
         assert!(!args.reverse, "reversed is the opt-in");
+        // `save` is the command; the old spelling still parses, as a hidden alias.
+        let cli = Cli::try_parse_from(["skot", "patch", "save"]).unwrap();
+        assert!(matches!(cli.command, Command::Patch(PatchCommand::Save(_))));
+        let cli = Cli::try_parse_from(["skot", "patch", "edit-save"]).unwrap();
+        assert!(matches!(cli.command, Command::Patch(PatchCommand::Save(_))));
     }
 
     /// Every name in the tables exists in the tree, appears once across the tables,

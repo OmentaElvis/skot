@@ -53,6 +53,58 @@ pub fn mirror_with_one_commit(root: &std::path::Path) -> (Layout, String) {
     (layout, sha.to_string())
 }
 
+/// A project whose mirror has one commit whose tree has files in subdirectories.
+///
+/// The flat single-file tree of [`mirror_with_one_commit`] cannot exhibit a whole class of
+/// failure: any diff, index or checkout that mishandles paths with a directory component
+/// passes against a root-only tree and fails on a real project. Authoring tests that
+/// exercise `save` and the worktree state need this shape, because that is where the
+/// difference between "the tree" and "the working directory plus index" actually bites.
+///
+/// Returns the commit id. `main` points at it.
+pub fn mirror_with_directories(root: &std::path::Path) -> (Layout, String) {
+    let layout = Layout::new(root);
+    std::fs::write(layout.config_file(), "[upstream]\nurl = \"unused\"\n").unwrap();
+    std::fs::create_dir_all(layout.patches_dir()).unwrap();
+    std::fs::create_dir_all(layout.mirror_dir()).unwrap();
+
+    let repo = git2::Repository::init_bare(layout.mirror_dir()).unwrap();
+    let tree = {
+        let src = {
+            let mut b = repo.treebuilder(None).unwrap();
+            b.insert("a.c", repo.blob(b"int x;\n").unwrap(), 0o100644)
+                .unwrap();
+            b.write().unwrap()
+        };
+        let docs = {
+            let mut b = repo.treebuilder(None).unwrap();
+            b.insert("readme.md", repo.blob(b"doc\n").unwrap(), 0o100644)
+                .unwrap();
+            b.write().unwrap()
+        };
+        let mut b = repo.treebuilder(None).unwrap();
+        b.insert("f.txt", repo.blob(b"base\n").unwrap(), 0o100644)
+            .unwrap();
+        b.insert("src", src, 0o040000).unwrap();
+        b.insert("docs", docs, 0o040000).unwrap();
+        b.write().unwrap()
+    };
+    let who = git2::Signature::now("t", "t@e").unwrap();
+    let sha = repo
+        .commit(
+            Some("refs/heads/main"),
+            &who,
+            &who,
+            "base",
+            &repo.find_tree(tree).unwrap(),
+            &[],
+        )
+        .unwrap();
+    repo.set_head("refs/heads/main").unwrap();
+    drop(repo);
+    (layout, sha.to_string())
+}
+
 /// A project whose mirror has one commit, with a sandbox worktree already created and reset.
 pub fn project_with_sandbox(root: &std::path::Path) -> (Layout, String) {
     let (layout, sha) = mirror_with_one_commit(root);
@@ -89,7 +141,7 @@ index 3333333..4444444 100644
 }
 
 /// A patch that turns `first\n` into `third\n`: it sits on [`patch_one`]'s output, so a set
-/// holding 0001 and this one applies with 0002 disabled between them.
+/// holding a.patch and this one applies with b.patch disabled between them.
 pub fn patch_three() -> &'static str {
     "\
 diff --git a/f.txt b/f.txt
@@ -132,7 +184,7 @@ pub fn applied_two_patch_stack(root: &std::path::Path) -> Layout {
     let (layout, _sha) = project_with_sandbox(root);
     write_series(
         &layout,
-        &[("0001-a.patch", patch_one()), ("0002-b.patch", patch_two())],
+        &[("a.patch", patch_one()), ("b.patch", patch_two())],
     );
     std::fs::write(
         layout.config_file(),

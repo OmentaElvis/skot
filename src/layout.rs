@@ -288,7 +288,7 @@ impl Layout {
     /// manifest.
     ///
     /// Derived state like the sandbox, but never touched by a default clean: these
-    /// directories hold edits that exist nowhere else until `edit-save` writes them into a
+    /// directories hold edits that exist nowhere else until `save` writes them into a
     /// patch file, so removing them is a decision the user makes explicitly
     /// (`clean --sessions`) rather than a side effect of tidying.
     pub fn work_dir(&self) -> PathBuf {
@@ -297,7 +297,7 @@ impl Layout {
 
     /// The worktree holding one patch's in-progress edits, in the active series.
     ///
-    /// The directory is named after the series entry verbatim (`sub/0002-fix.patch` keeps
+    /// The directory is named after the series entry verbatim (`sub/fix.patch` keeps
     /// its subdirectory), so what `list` shows and what a file manager opens are the same
     /// path. A name that would leave the work directory is refused rather than rewritten:
     /// a session found somewhere other than its own name would be invisible, and a
@@ -636,8 +636,8 @@ mod tests {
             l.lock_file(),
             l.state_file(),
             l.sessions_file(),
-            l.work_patch_dir("0001-a.patch").unwrap(),
-            l.work_patch_dir("sub/0002-b.patch").unwrap(),
+            l.work_patch_dir("a.patch").unwrap(),
+            l.work_patch_dir("sub/b.patch").unwrap(),
         ] {
             assert!(p.starts_with(l.root()), "{} escaped the root", p.display());
         }
@@ -656,7 +656,7 @@ mod tests {
         }
         // A subdirectory inside `work/` is a normal patch name, not an escape.
         assert!(
-            l.work_patch_dir("sub/0002-b.patch")
+            l.work_patch_dir("sub/b.patch")
                 .unwrap()
                 .starts_with(l.work_dir())
         );
@@ -868,9 +868,9 @@ mod tests {
         // `clean` and `reconcile` walk sessions from every series while the layout
         // still names the active one, so the path has to come from the session.
         let (_tmp, l) = layout();
-        let path = l.work_patch_dir_for("other", "sub/0001-a.patch").unwrap();
+        let path = l.work_patch_dir_for("other", "sub/a.patch").unwrap();
         assert!(path.starts_with(l.work_dir()));
-        assert!(path.ends_with("work/other/sub/0001-a.patch"));
+        assert!(path.ends_with("work/other/sub/a.patch"));
 
         // Containment is checked against the work directory for every series.
         assert!(l.work_patch_dir_for("..", "x").is_err());

@@ -111,7 +111,9 @@ impl Built {
     /// the text it should hold. The check afterwards is what makes the build
     /// trustworthy before a rename puts it where a series lives: each file is re-read
     /// and compared to what was meant to go in it, so a truncated or corrupt write dies
-    /// here, with the real series untouched.
+    /// here, with the real series untouched. Each patch is then read back as a patch,
+    /// because a file that is not one would otherwise be installed and only found to be
+    /// unreadable after the rename it should never have crossed.
     pub fn build(
         layout: &Layout,
         series: &str,
@@ -143,6 +145,14 @@ impl Built {
 
         verify(&dir, series_text, base_text, patches)?;
         Ok(Self { dir })
+    }
+
+    /// Where this build is waiting: the scratch directory a rename would move into place.
+    ///
+    /// The caller that has not renamed it yet has a series it can still read back, which
+    /// is what makes proving the result before installing it possible at all.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// Read a series directory into memory, ready to be rebuilt elsewhere.
@@ -229,9 +239,13 @@ impl Built {
 
 /// Read a built series back and check it against what was meant to go in.
 ///
-/// Two checks, and the second is the one that catches a mistake rather than a fault: a
-/// file that is not what was written is a disk problem, and a series file that lists a
-/// patch which is not beside it is a series that cannot be applied.
+/// Three checks, and the last two are the ones that catch a mistake rather than a fault:
+/// a file that is not what was written is a disk problem; a series file that lists a
+/// patch which is not beside it is a series that cannot be applied; and a listed patch
+/// that is not a patch is a series that cannot be read. The third is what makes the
+/// rename safe, because byte fidelity only proves the write landed: text libgit2
+/// refuses compares equal to what was meant to go in it, and would otherwise be
+/// installed and discovered to be unreadable after the rename it should never cross.
 fn verify(
     dir: &Path,
     series_text: &str,
@@ -259,13 +273,20 @@ fn verify(
 
     let listed = Series::parse(&dir.join(layout::SERIES_FILE), series_text);
     for name in listed.names() {
-        if !dir.join(name).is_file() {
+        let path = dir.join(name);
+        if !path.is_file() {
             bail!(
                 "{} lists `{}`, which is not beside it.",
                 dir.join(layout::SERIES_FILE).display(),
                 name
             );
         }
+        let text = std::fs::read_to_string(&path)
+            .context(format!("reading back {} to check it", path.display()))?;
+        git2::Diff::from_buffer(text.as_bytes()).context(format!(
+            "{} is not a patch skot can read; refusing to install it.",
+            path.display()
+        ))?;
     }
     Ok(())
 }
@@ -330,8 +351,22 @@ mod tests {
     /// Write a series directory by hand, standing in for whatever produced it.
     fn series_dir(path: &Path, patch: &str) {
         std::fs::create_dir_all(path).unwrap();
-        std::fs::write(path.join(layout::SERIES_FILE), "0001-a.patch\n").unwrap();
-        std::fs::write(path.join("0001-a.patch"), patch).unwrap();
+        std::fs::write(path.join(layout::SERIES_FILE), "a.patch\n").unwrap();
+        std::fs::write(path.join("a.patch"), patch).unwrap();
+    }
+
+    /// Text a build can install: every patch a build holds has to read back as one.
+    fn rebuilt() -> String {
+        "\
+diff --git a/f.txt b/f.txt
+index 1111111..2222222 100644
+--- a/f.txt
++++ b/f.txt
+@@ -1,1 +1,1 @@
+-base
++first
+"
+        .to_owned()
     }
 
     #[test]
@@ -351,7 +386,7 @@ mod tests {
         recover(&l).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(live.join("0001-a.patch")).unwrap(),
+            std::fs::read_to_string(live.join("a.patch")).unwrap(),
             "original\n",
             "the interrupted swap must restore the series, not prefer the scratch build"
         );
@@ -377,12 +412,12 @@ mod tests {
         recover(&l).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(live.join("0001-a.patch")).unwrap(),
+            std::fs::read_to_string(live.join("a.patch")).unwrap(),
             "rebuilt\n",
             "the live series is the completed swap and must not be rolled back"
         );
         assert_eq!(
-            std::fs::read_to_string(l.undo_entry().join("0001-a.patch")).unwrap(),
+            std::fs::read_to_string(l.undo_entry().join("a.patch")).unwrap(),
             "original\n",
             "the original belongs in the undo slot, where the interrupted hand-off left it"
         );
@@ -401,7 +436,7 @@ mod tests {
         recover(&l).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(l.patches_dir().join("0001-a.patch")).unwrap(),
+            std::fs::read_to_string(l.patches_dir().join("a.patch")).unwrap(),
             "live\n"
         );
         assert!(
@@ -420,9 +455,9 @@ mod tests {
         let built = Built::build(
             &l,
             "default",
-            "0001-a.patch\n",
+            "a.patch\n",
             None,
-            &[("0001-a.patch".to_owned(), "rebuilt\n".to_owned())],
+            &[("a.patch".to_owned(), rebuilt())],
         )
         .unwrap();
         // Kill the replacement so only the rename into place can fail, after the
@@ -432,7 +467,7 @@ mod tests {
         let err = built.replace(&l).unwrap_err();
         assert!(format!("{err:#}").contains("installing"), "{err:#}");
         assert_eq!(
-            std::fs::read_to_string(l.patches_dir().join("0001-a.patch")).unwrap(),
+            std::fs::read_to_string(l.patches_dir().join("a.patch")).unwrap(),
             "original\n",
             "the series must be back where it was, not left as scratch"
         );
@@ -452,12 +487,58 @@ mod tests {
         // the caller meant to write: a list without its patch is a series that cannot
         // be applied, and it must die in scratch.
         let (_tmp, l) = layout();
-        let err = Built::build(&l, "default", "0001-a.patch\n", None, &[]).unwrap_err();
-        assert!(format!("{err:#}").contains("0001-a.patch"), "{err:#}");
+        let err = Built::build(&l, "default", "a.patch\n", None, &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("a.patch"), "{err:#}");
         assert!(
             !l.patches_dir().exists() || !l.patches_dir().join("series").exists(),
             "the refused build never reaches the live path"
         );
+    }
+
+    #[test]
+    fn a_build_holding_a_patch_skot_cannot_read_is_refused_in_scratch() {
+        // What "verifies it" has to mean. Byte fidelity only proves the write landed:
+        // a file libgit2 refuses to read still matches the text it was meant to be given.
+        // The header rendered over an empty diff is exactly that shape, and it must die
+        // here rather than be renamed over the live series and discovered by whatever
+        // reads the series next.
+        let (_tmp, l) = layout();
+        series_dir(&l.patches_dir(), "original\n");
+
+        let header_only = "From: A U Thor <author@example.com>\n\
+                           Date: Thu, 1 Jan 2026 00:00:00 +0000\n\
+                           Subject: [PATCH] subject\n\n---\n\n";
+        let err = Built::build(
+            &l,
+            "default",
+            "a.patch\n",
+            None,
+            &[("a.patch".to_owned(), header_only.to_owned())],
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("a.patch"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(l.patches_dir().join("a.patch")).unwrap(),
+            "original\n",
+            "the live series must be untouched by a build that refused to install"
+        );
+    }
+
+    #[test]
+    fn an_empty_patch_is_still_a_patch_a_series_can_hold() {
+        // `patch new` writes a 0-byte file, and libgit2 reads it back as zero deltas: an
+        // empty patch applies as a no-op, so the check that refuses a header-only file
+        // must not refuse this one.
+        let (_tmp, l) = layout();
+        Built::build(
+            &l,
+            "default",
+            "a.patch\n",
+            None,
+            &[("a.patch".to_owned(), String::new())],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -468,7 +549,7 @@ mod tests {
         let err = undo_swap(&l).unwrap_err().to_string();
         assert!(err.contains("nothing to undo"), "got {err}");
         assert_eq!(
-            std::fs::read_to_string(l.patches_dir().join("0001-a.patch")).unwrap(),
+            std::fs::read_to_string(l.patches_dir().join("a.patch")).unwrap(),
             "live\n"
         );
     }
@@ -480,16 +561,16 @@ mod tests {
         let built = Built::build(
             &l,
             "default",
-            "0001-a.patch\n",
+            "a.patch\n",
             None,
-            &[("0001-a.patch".to_owned(), "rebuilt\n".to_owned())],
+            &[("a.patch".to_owned(), rebuilt())],
         )
         .unwrap();
 
         let err = built.install(&l).unwrap_err().to_string();
         assert!(err.contains("already exists"), "got {err}");
         assert_eq!(
-            std::fs::read_to_string(l.patches_dir().join("0001-a.patch")).unwrap(),
+            std::fs::read_to_string(l.patches_dir().join("a.patch")).unwrap(),
             "live\n"
         );
     }

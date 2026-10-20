@@ -21,6 +21,13 @@
 //! recoverable, and a series where the earlier patches were quietly rewritten on the way to the
 //! failure is not.
 //!
+//! Nothing that reads a rebuilt patch runs after the rename. The landing, which replays the
+//! applied set onto the new base, checks the sandbox out and records what it did, reads those
+//! files out of scratch while they are still scratch, so the rename is the last thing the
+//! command does. Every check runs on this side of it, and a failure anywhere reports a series
+//! that is exactly where it was, which is the whole reason the replacement is built somewhere
+//! else first.
+//!
 //! The rewrite is written to scratch and renamed into place, so the series on disk is either
 //! the old one or the new one, never a half-written mix. `--into` puts the result under a new
 //! name and leaves the original alone; without it the original becomes the undo entry that
@@ -138,7 +145,7 @@ pub fn run(ctx: &Ctx, arg: &RebaseArgs) -> Result<Exit> {
             "Resolve it by hand: `{}` puts the series in the sandbox, \
              and `{}` re-exports it against the new base.",
             skot_args("apply", &rebased.ref_name),
-            skot_args("edit-save", "<patch>")
+            skot_args("save", "<patch>")
         );
         return Ok(Exit::Failure);
     }
@@ -273,33 +280,40 @@ fn rebase(layout: &Layout, ref_name: Option<&str>, into: Option<&str>) -> Result
         &patches,
     )?;
 
-    let undo = match into {
+    // The landing is the proof of the rebuilt series, and it runs against the files in
+    // scratch, before the rename that makes them the series. Nothing that reads a patch
+    // may happen after that rename: the replay, the checkout and the record are the proof,
+    // and they belong on this side of the line. Once the rename has happened there is
+    // nothing left to read and nothing left to check, so the rename is the last thing the
+    // command does and a failure anywhere above it reports a series where it was.
+    let (undo, tree) = match into {
         Some(_) => {
             built.install(&target)?;
-            None
+            (None, None)
         }
-        None => Some(built.replace(layout)?),
-    };
-    drop(lock);
-
-    // The applied set follows the series onto the new base, but only when the series
-    // itself was replaced: `--into` leaves the sandbox and the pointer alone.
-    let tree = match undo {
-        Some(_) => {
+        None => {
             let state = State::load(layout)?;
+            let applied = state.applied(layout);
+            // The landing reads the patches themselves, so it reads them from scratch:
+            // the files about to be renamed in, not the ones being renamed out.
             let enabled: Vec<series::Entry> = entries
                 .iter()
-                .filter(|e| state.applied(layout).contains(&e.name))
-                .cloned()
+                .filter(|entry| applied.contains(&entry.name))
+                .map(|entry| series::Entry {
+                    name: entry.name.clone(),
+                    path: built.dir().join(&entry.name),
+                    line: entry.line,
+                })
                 .collect();
             let stack = Stack {
-                names: enabled.iter().map(|e| e.name.clone()).collect(),
+                names: enabled.iter().map(|entry| entry.name.clone()).collect(),
                 entries: enabled,
             };
-            Some(authoring::land(layout, &new_base, &sha, &stack)?)
+            let tree = authoring::land(layout, &new_base, &sha, &stack)?;
+            (Some(built.replace(layout)?), Some(tree))
         }
-        None => None,
     };
+    drop(lock);
 
     Ok(Rebased {
         ok: true,
@@ -507,6 +521,35 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_patch_stays_empty_through_a_rebase() {
+        // `patch new` writes a 0-byte patch: it applies as a no-op, so check, push and pop all
+        // take it. The rewrite used to render a header over that empty diff, producing a file
+        // libgit2 reads back as "no patch found": the rebase then corrupted the very series
+        // it was rewriting. An empty patch must round-trip as empty.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::landed_set(
+            tmp.path(),
+            &[("a.patch", ""), ("b.patch", testsupport::patch_one())],
+            &["a.patch", "b.patch"],
+        );
+
+        let rebased = rebase(&layout, None, None).unwrap();
+        assert!(rebased.ok, "{}", rebased.report.summary());
+
+        assert_eq!(
+            std::fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap(),
+            "",
+            "an empty patch must stay empty, not become an unparseable header"
+        );
+
+        // The whole series still reads back: nothing in it is a file skot cannot parse.
+        let repo = git2::Repository::open(layout.mirror_dir()).unwrap();
+        let entries = layout.project().unwrap().1.entries(&layout).unwrap();
+        let result = check::replay_series(&repo, &sha_of(&layout), &entries).unwrap();
+        assert!(result.report.ok, "{}", result.report.summary());
+    }
+
+    #[test]
     fn rebase_leaves_a_disabled_patch_disabled() {
         // Every patch file is rewritten against the new base, but the applied set is what
         // the sandbox holds: a patch the sandbox never had stays off, whatever rebase
@@ -515,11 +558,11 @@ mod tests {
         let (layout, _sha) = testsupport::landed_set(
             tmp.path(),
             &[
-                ("0001-a.patch", testsupport::patch_one()),
-                ("0002-b.patch", testsupport::patch_adds_g()),
-                ("0003-c.patch", testsupport::patch_three()),
+                ("a.patch", testsupport::patch_one()),
+                ("b.patch", testsupport::patch_adds_g()),
+                ("c.patch", testsupport::patch_three()),
             ],
-            &["0001-a.patch", "0003-c.patch"],
+            &["a.patch", "c.patch"],
         );
 
         rebase(&layout, None, None).unwrap();
@@ -527,7 +570,7 @@ mod tests {
         let state = crate::state::State::load(&layout).unwrap();
         assert_eq!(
             state.applied(&layout).to_vec(),
-            ["0001-a.patch", "0003-c.patch"],
+            ["a.patch", "c.patch"],
             "the hole must survive the rewrite"
         );
         assert!(
@@ -548,20 +591,13 @@ mod tests {
         let (layout, _sha) = testsupport::mirror_with_one_commit(tmp.path());
         let repo = git2::Repository::open(layout.mirror_dir()).unwrap();
 
+        std::fs::write(layout.patches_dir().join("a.patch"), body("base", "first")).unwrap();
         std::fs::write(
-            layout.patches_dir().join("0001-a.patch"),
-            body("base", "first"),
-        )
-        .unwrap();
-        std::fs::write(
-            layout.patches_dir().join("0002-b.patch"),
+            layout.patches_dir().join("b.patch"),
             body("first", "second"),
         )
         .unwrap();
-        let entries = vec![
-            entry(&layout, "0001-a.patch"),
-            entry(&layout, "0002-b.patch"),
-        ];
+        let entries = vec![entry(&layout, "a.patch"), entry(&layout, "b.patch")];
 
         let result = check::replay_series(&repo, &sha_of(&layout), &entries).unwrap();
         assert!(result.report.ok, "{}", result.report.summary());
@@ -585,12 +621,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (layout, sha) = testsupport::mirror_with_one_commit(tmp.path());
         let repo = git2::Repository::open(layout.mirror_dir()).unwrap();
-        std::fs::write(
-            layout.patches_dir().join("0001-a.patch"),
-            body("base", "first"),
-        )
-        .unwrap();
-        let entries = vec![entry(&layout, "0001-a.patch")];
+        std::fs::write(layout.patches_dir().join("a.patch"), body("base", "first")).unwrap();
+        let entries = vec![entry(&layout, "a.patch")];
 
         let result = check::replay_series(&repo, &sha, &entries).unwrap();
         let out = rewrite(&repo, &entries, &result).unwrap();
@@ -625,8 +657,8 @@ mod tests {
              \n{}",
             body("base", "first")
         );
-        std::fs::write(layout.patches_dir().join("0001-a.patch"), &original).unwrap();
-        let entries = vec![entry(&layout, "0001-a.patch")];
+        std::fs::write(layout.patches_dir().join("a.patch"), &original).unwrap();
+        let entries = vec![entry(&layout, "a.patch")];
 
         let result = check::replay_series(&repo, &sha, &entries).unwrap();
         let out = rewrite(&repo, &entries, &result).unwrap();
@@ -653,8 +685,8 @@ mod tests {
         let (layout, sha) = testsupport::mirror_with_one_commit(tmp.path());
         let repo = git2::Repository::open(layout.mirror_dir()).unwrap();
         let original = body("base", "first");
-        std::fs::write(layout.patches_dir().join("0001-a.patch"), &original).unwrap();
-        let entries = vec![entry(&layout, "0001-a.patch")];
+        std::fs::write(layout.patches_dir().join("a.patch"), &original).unwrap();
+        let entries = vec![entry(&layout, "a.patch")];
 
         let result = check::replay_series(&repo, &sha, &entries).unwrap();
         let out = rewrite(&repo, &entries, &result).unwrap();
@@ -679,29 +711,62 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (layout, sha) = testsupport::mirror_with_one_commit(tmp.path());
         let repo = git2::Repository::open(layout.mirror_dir()).unwrap();
+        std::fs::write(layout.patches_dir().join("a.patch"), body("base", "first")).unwrap();
         std::fs::write(
-            layout.patches_dir().join("0001-a.patch"),
-            body("base", "first"),
-        )
-        .unwrap();
-        std::fs::write(
-            layout.patches_dir().join("0002-b.patch"),
+            layout.patches_dir().join("b.patch"),
             body("nothing", "second"),
         )
         .unwrap();
-        let entries = vec![
-            entry(&layout, "0001-a.patch"),
-            entry(&layout, "0002-b.patch"),
-        ];
+        let entries = vec![entry(&layout, "a.patch"), entry(&layout, "b.patch")];
 
         let result = check::replay_series(&repo, &sha, &entries).unwrap();
         assert!(!result.report.ok);
         // `rewrite` refuses rather than producing a partial series.
         assert!(rewrite(&repo, &entries, &result).is_err());
         assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0001-a.patch")).unwrap(),
+            std::fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap(),
             body("base", "first"),
             "the first patch must not be touched when the second fails"
+        );
+    }
+
+    #[test]
+    fn a_landing_that_cannot_be_recorded_leaves_the_series_where_it_was() {
+        // The landing is where the rebuilt series is proved: replay it onto the new base,
+        // check it out, record it. It used to run after the rename that installed the
+        // rebuilt series, so it could report a failure with the rewrite already on disk,
+        // which is the one thing the rename exists to prevent. Blocking the write that
+        // records the landing must leave the series exactly as it was.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::landed_set(
+            tmp.path(),
+            &[
+                ("a.patch", testsupport::patch_one()),
+                ("b.patch", testsupport::patch_two()),
+            ],
+            &["a.patch", "b.patch"],
+        );
+        // The landing's record is written here, and nothing else in a rebase writes here.
+        std::fs::create_dir(layout.state_file().with_extension("json.tmp")).unwrap();
+
+        let err = rebase(&layout, None, None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("state.json.tmp"),
+            "the failure must be the one that was blocked, got {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap(),
+            testsupport::patch_one(),
+            "the series must be untouched by a rebase that failed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(layout.patches_dir().join("b.patch")).unwrap(),
+            testsupport::patch_two(),
+            "every patch, not only the first"
+        );
+        assert!(
+            !layout.undo_entry().exists(),
+            "nothing was replaced, so nothing may be waiting in the undo slot"
         );
     }
 
@@ -710,20 +775,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (layout, sha) = testsupport::mirror_with_one_commit(tmp.path());
         let repo = git2::Repository::open(layout.mirror_dir()).unwrap();
+        std::fs::write(layout.patches_dir().join("a.patch"), body("base", "first")).unwrap();
         std::fs::write(
-            layout.patches_dir().join("0001-a.patch"),
-            body("base", "first"),
-        )
-        .unwrap();
-        std::fs::write(
-            layout.patches_dir().join("0002-b.patch"),
+            layout.patches_dir().join("b.patch"),
             body("first", "second"),
         )
         .unwrap();
-        let entries = vec![
-            entry(&layout, "0001-a.patch"),
-            entry(&layout, "0002-b.patch"),
-        ];
+        let entries = vec![entry(&layout, "a.patch"), entry(&layout, "b.patch")];
 
         let result = check::replay_series(&repo, &sha, &entries).unwrap();
         assert_eq!(result.per_patch.len(), 2);
@@ -738,8 +796,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (layout, sha) = testsupport::mirror_with_one_commit(tmp.path());
         let repo = git2::Repository::open(layout.mirror_dir()).unwrap();
-        std::fs::write(layout.patches_dir().join("0001-a.patch"), body("nope", "x")).unwrap();
-        let entries = vec![entry(&layout, "0001-a.patch")];
+        std::fs::write(layout.patches_dir().join("a.patch"), body("nope", "x")).unwrap();
+        let entries = vec![entry(&layout, "a.patch")];
 
         let result = check::replay_series(&repo, &sha, &entries).unwrap();
         assert_eq!(result.per_patch, vec![None]);
@@ -754,7 +812,7 @@ mod tests {
     #[test]
     fn rebase_needs_a_ref_to_replay_onto() {
         let (_tmp, layout) = testsupport::project();
-        testsupport::write_series(&layout, &[("0001-a.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", "")]);
 
         let err = rebase(&layout, None, None).unwrap_err().to_string();
         assert!(err.contains("no ref"), "got {err}");
@@ -767,8 +825,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = testsupport::landed_set(
             tmp.path(),
-            &[("0001-a.patch", testsupport::patch_one())],
-            &["0001-a.patch"],
+            &[("a.patch", testsupport::patch_one())],
+            &["a.patch"],
         );
 
         let rebased = rebase(&layout, None, None).unwrap();
@@ -777,13 +835,13 @@ mod tests {
         let undo = rebased.undo.expect("a rebase keeps the old series");
         assert_eq!(undo, layout.undo_entry());
         assert_eq!(
-            std::fs::read_to_string(undo.join("0001-a.patch")).unwrap(),
+            std::fs::read_to_string(undo.join("a.patch")).unwrap(),
             testsupport::patch_one(),
             "the undo entry holds the patches as they were"
         );
         assert_eq!(
             std::fs::read_to_string(undo.join("series")).unwrap(),
-            "0001-a.patch\n"
+            "a.patch\n"
         );
         // Nothing was written to scratch and left there.
         assert!(
@@ -801,10 +859,10 @@ mod tests {
         let (layout, _sha) = testsupport::landed_set(
             tmp.path(),
             &[
-                ("0001-a.patch", testsupport::patch_one()),
-                ("0002-b.patch", "not a patch\n"),
+                ("a.patch", testsupport::patch_one()),
+                ("b.patch", "not a patch\n"),
             ],
-            &["0001-a.patch"],
+            &["a.patch"],
         );
 
         let rebased = rebase(&layout, None, None).unwrap();
@@ -829,8 +887,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = testsupport::landed_set(
             tmp.path(),
-            &[("0001-a.patch", testsupport::patch_one())],
-            &["0001-a.patch"],
+            &[("a.patch", testsupport::patch_one())],
+            &["a.patch"],
         );
 
         let first = rebase(&layout, None, None).unwrap();
@@ -856,10 +914,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = testsupport::landed_set(
             tmp.path(),
-            &[("0001-a.patch", testsupport::patch_one())],
-            &["0001-a.patch"],
+            &[("a.patch", testsupport::patch_one())],
+            &["a.patch"],
         );
-        let before = std::fs::read_to_string(layout.patches_dir().join("0001-a.patch")).unwrap();
+        let before = std::fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap();
 
         let rebased = rebase(&layout, None, Some("experiment")).unwrap();
         assert!(rebased.ok);
@@ -867,7 +925,7 @@ mod tests {
 
         // The original is byte-for-byte what it was, and holds its own base.
         assert_eq!(
-            std::fs::read_to_string(layout.patches_dir().join("0001-a.patch")).unwrap(),
+            std::fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap(),
             before,
             "the series --into was asked not to touch was touched"
         );
@@ -878,7 +936,7 @@ mod tests {
 
         // The new series holds the rebased patches and the new base, and is not active.
         let target = layout.with_series("experiment").unwrap();
-        assert!(target.patches_dir().join("0001-a.patch").is_file());
+        assert!(target.patches_dir().join("a.patch").is_file());
         assert_eq!(
             std::fs::read_to_string(target.base_file())
                 .unwrap()
@@ -895,12 +953,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = testsupport::landed_set(
             tmp.path(),
-            &[("0001-a.patch", testsupport::patch_one())],
-            &["0001-a.patch"],
+            &[("a.patch", testsupport::patch_one())],
+            &["a.patch"],
         );
         let taken = layout.with_series("taken").unwrap();
         std::fs::create_dir_all(taken.patches_dir()).unwrap();
-        testsupport::write_series(&taken, &[("0001-a.patch", "x\n")]);
+        testsupport::write_series(&taken, &[("a.patch", "x\n")]);
 
         let err = rebase(&layout, None, Some("taken")).unwrap_err();
         let text = format!("{err:#}");
@@ -911,7 +969,7 @@ mod tests {
                     .with_series("taken")
                     .unwrap()
                     .patches_dir()
-                    .join("0001-a.patch")
+                    .join("a.patch")
             )
             .unwrap(),
             "x\n",

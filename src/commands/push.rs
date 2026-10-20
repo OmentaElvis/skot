@@ -96,7 +96,7 @@ pub fn run(ctx: &Ctx, arg: &PatchArg) -> Result<Exit> {
         pushed.ref_name, pushed.sha
     );
     Hints::new("next")
-        .entry(skot("edit-save"), "save what you change next")
+        .entry(skot("save"), "save what you change next")
         .entry(skot("pop"), "take a patch off")
         .print();
     Ok(verdict)
@@ -194,32 +194,20 @@ mod tests {
     }
 
     #[test]
-    fn a_serial_prefix_pushes_that_patch_and_everything_below() {
-        // The shared `[PATCH]` reading reaches `push` too: `0003` names the patch
+    fn a_name_prefix_pushes_that_patch_and_everything_below() {
+        // The shared `[PATCH]` reading reaches `push` too: `c` names the patch
         // whose file starts with it, and the set below it comes with it.
         let (_tmp, layout) = testsupport::project();
         testsupport::write_series(
             &layout,
-            &[
-                ("0001-a.patch", ""),
-                ("0002-b.patch", ""),
-                ("0003-c.patch", ""),
-            ],
+            &[("a.patch", ""), ("b.patch", ""), ("c.patch", "")],
         );
         let series = layout.project().unwrap().1;
 
-        let stack = authoring::resolve_stack(
-            &layout,
-            &series,
-            &State::default(),
-            Some("0003"),
-            Move::Deeper,
-        )
-        .unwrap();
-        assert_eq!(
-            stack.names,
-            vec!["0001-a.patch", "0002-b.patch", "0003-c.patch"]
-        );
+        let stack =
+            authoring::resolve_stack(&layout, &series, &State::default(), Some("c"), Move::Deeper)
+                .unwrap();
+        assert_eq!(stack.names, vec!["a.patch", "b.patch", "c.patch"]);
     }
 
     #[test]
@@ -227,23 +215,19 @@ mod tests {
         let (_tmp, layout) = testsupport::project();
         testsupport::write_series(
             &layout,
-            &[
-                ("0001-a.patch", ""),
-                ("0002-b.patch", ""),
-                ("0003-c.patch", ""),
-            ],
+            &[("a.patch", ""), ("b.patch", ""), ("c.patch", "")],
         );
         let series = layout.project().unwrap().1;
 
         let stack = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&layout, &["0001-a.patch"]),
+            &state_of(&layout, &["a.patch"]),
             None,
             Move::Deeper,
         )
         .unwrap();
-        assert_eq!(stack.names, vec!["0001-a.patch", "0002-b.patch"]);
+        assert_eq!(stack.names, vec!["a.patch", "b.patch"]);
     }
 
     #[test]
@@ -254,10 +238,10 @@ mod tests {
         testsupport::write_series(
             &layout,
             &[
-                ("0001-a.patch", ""),
-                ("0002-b.patch", ""),
-                ("0003-c.patch", ""),
-                ("0004-d.patch", ""),
+                ("a.patch", ""),
+                ("b.patch", ""),
+                ("c.patch", ""),
+                ("d.patch", ""),
             ],
         );
         let series = layout.project().unwrap().1;
@@ -265,38 +249,34 @@ mod tests {
         let stack = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&layout, &["0003-c.patch"]),
+            &state_of(&layout, &["c.patch"]),
             None,
             Move::Deeper,
         )
         .unwrap();
-        assert_eq!(stack.names, vec!["0003-c.patch", "0004-d.patch"]);
+        assert_eq!(stack.names, vec!["c.patch", "d.patch"]);
     }
 
     #[test]
     fn push_from_empty_applies_only_the_one_named() {
         let (_tmp, layout) = testsupport::project();
-        testsupport::write_series(&layout, &[("0001-a.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", "")]);
         let series = layout.project().unwrap().1;
 
         let stack =
             authoring::resolve_stack(&layout, &series, &State::default(), None, Move::Deeper)
                 .unwrap();
-        assert_eq!(stack.names, vec!["0001-a.patch"]);
+        assert_eq!(stack.names, vec!["a.patch"]);
     }
 
     #[test]
     fn push_of_a_named_patch_replays_everything_below_it() {
-        // The reason `push` replays everything below it rather than one file: 0003 is
-        // meaningless alone.
+        // The reason `push` replays everything below it rather than one file: a patch on
+        // its own does not say what it stacks on.
         let (_tmp, layout) = testsupport::project();
         testsupport::write_series(
             &layout,
-            &[
-                ("0001-a.patch", ""),
-                ("0002-b.patch", ""),
-                ("0003-c.patch", ""),
-            ],
+            &[("a.patch", ""), ("b.patch", ""), ("c.patch", "")],
         );
         let series = layout.project().unwrap().1;
 
@@ -304,26 +284,23 @@ mod tests {
             &layout,
             &series,
             &State::default(),
-            Some("0003-c.patch"),
+            Some("c.patch"),
             Move::Deeper,
         )
         .unwrap();
-        assert_eq!(
-            stack.names,
-            vec!["0001-a.patch", "0002-b.patch", "0003-c.patch"]
-        );
+        assert_eq!(stack.names, vec!["a.patch", "b.patch", "c.patch"]);
     }
 
     #[test]
     fn push_past_the_end_says_to_start_a_new_patch() {
         let (_tmp, layout) = testsupport::project();
-        testsupport::write_series(&layout, &[("0001-a.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", "")]);
         let series = layout.project().unwrap().1;
 
         let err = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&layout, &["0001-a.patch"]),
+            &state_of(&layout, &["a.patch"]),
             None,
             Move::Deeper,
         )
@@ -335,14 +312,14 @@ mod tests {
     #[test]
     fn pushing_something_already_applied_points_at_pop() {
         let (_tmp, layout) = testsupport::project();
-        testsupport::write_series(&layout, &[("0001-a.patch", ""), ("0002-b.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", ""), ("b.patch", "")]);
         let series = layout.project().unwrap().1;
 
         let err = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&layout, &["0001-a.patch"]),
-            Some("0001-a.patch"),
+            &state_of(&layout, &["a.patch"]),
+            Some("a.patch"),
             Move::Deeper,
         )
         .unwrap_err()
@@ -353,7 +330,7 @@ mod tests {
     #[test]
     fn pushing_a_patch_that_is_not_in_the_series_lists_the_ones_that_are() {
         let (_tmp, layout) = testsupport::project();
-        testsupport::write_series(&layout, &[("0001-a.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", "")]);
         let series = layout.project().unwrap().1;
 
         let err = authoring::resolve_stack(
@@ -365,7 +342,7 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("0001-a.patch"), "got {err}");
+        assert!(err.contains("a.patch"), "got {err}");
     }
 
     #[test]
@@ -381,28 +358,24 @@ mod tests {
     #[test]
     fn push_named_fills_a_hole_below_without_silencing_one_above() {
         // A set with holes is legitimate, so the refusal tests are about names, not shape.
-        // Pushing 0001 with 0003 on heals the hole under it (0003 already sits above
-        // everything) and leaves the hole at 0002 exactly where it was.
+        // Pushing a with c on heals the hole under it (c already sits above everything) and
+        // leaves the hole at b exactly where it was.
         let (_tmp, layout) = testsupport::project();
         testsupport::write_series(
             &layout,
-            &[
-                ("0001-a.patch", ""),
-                ("0002-b.patch", ""),
-                ("0003-c.patch", ""),
-            ],
+            &[("a.patch", ""), ("b.patch", ""), ("c.patch", "")],
         );
         let series = layout.project().unwrap().1;
 
         let stack = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&layout, &["0003-c.patch"]),
-            Some("0001-a.patch"),
+            &state_of(&layout, &["c.patch"]),
+            Some("a.patch"),
             Move::Deeper,
         )
         .unwrap();
-        assert_eq!(stack.names, vec!["0001-a.patch", "0003-c.patch"]);
+        assert_eq!(stack.names, vec!["a.patch", "c.patch"]);
     }
 
     #[test]
@@ -410,20 +383,20 @@ mod tests {
         // Membership is the only shape rule: a name the series does not know means every
         // command would be guessing, so it is refused with the command that repairs it.
         let (_tmp, layout) = testsupport::project();
-        testsupport::write_series(&layout, &[("0001-a.patch", ""), ("0002-b.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", ""), ("b.patch", "")]);
         let series = layout.project().unwrap().1;
 
         let err = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&layout, &["0001-a.patch", "0009-gone.patch"]),
+            &state_of(&layout, &["a.patch", "gone.patch"]),
             None,
             Move::Deeper,
         )
         .unwrap_err()
         .to_string();
         assert!(
-            err.contains("0009-gone.patch"),
+            err.contains("gone.patch"),
             "the stale name should be named: {err}"
         );
         assert!(
@@ -439,19 +412,19 @@ mod tests {
     #[test]
     fn a_recorded_set_longer_than_the_series_is_refused() {
         let (_tmp, layout) = testsupport::project();
-        testsupport::write_series(&layout, &[("0001-a.patch", "")]);
+        testsupport::write_series(&layout, &[("a.patch", "")]);
         let series = layout.project().unwrap().1;
 
         let err = authoring::resolve_stack(
             &layout,
             &series,
-            &state_of(&layout, &["0001-a.patch", "0002-gone.patch"]),
+            &state_of(&layout, &["a.patch", "gone.patch"]),
             None,
             Move::Deeper,
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("0002-gone.patch"), "got {err}");
+        assert!(err.contains("gone.patch"), "got {err}");
         assert!(err.contains("does not list"), "got {err}");
     }
 
@@ -465,8 +438,8 @@ mod tests {
         testsupport::write_series(
             &layout,
             &[
-                ("0001-a.patch", testsupport::patch_one()),
-                ("0002-b.patch", testsupport::patch_two()),
+                ("a.patch", testsupport::patch_one()),
+                ("b.patch", testsupport::patch_two()),
             ],
         );
         std::fs::write(
@@ -478,8 +451,8 @@ mod tests {
 
         let pushed = push(&layout, None).unwrap();
 
-        assert_eq!(pushed.added, Some("0001-a.patch".to_owned()));
-        assert_eq!(pushed.names, ["0001-a.patch"]);
+        assert_eq!(pushed.added, Some("a.patch".to_owned()));
+        assert_eq!(pushed.names, ["a.patch"]);
         assert!(sandbox::is_repository(&layout));
     }
 
@@ -493,7 +466,7 @@ mod tests {
         let pushed = push(&layout, None).unwrap();
 
         assert_eq!(pushed.added, None);
-        assert_eq!(pushed.names, ["0001-a.patch", "0002-b.patch"]);
+        assert_eq!(pushed.names, ["a.patch", "b.patch"]);
     }
 
     #[test]

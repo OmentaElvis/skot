@@ -76,6 +76,15 @@ impl Ctx {
         self.layout.project()
     }
 
+    /// Who is there to answer this run's questions.
+    ///
+    /// Built from the invocation itself, once per question: `--json` and `--yes`
+    /// both mean nobody is waiting at the prompt, and every prompt in this crate
+    /// goes through the answer it hands back rather than probing the terminal again.
+    pub fn asker(&self) -> crate::prompt::Asker {
+        crate::prompt::Asker::for_run(self.cli.json, self.yes)
+    }
+
     /// Take the sandbox lock for commands that mutate it.
     pub fn lock(&self) -> Result<crate::layout::SandboxLock> {
         self.layout.lock()
@@ -219,7 +228,7 @@ pub fn run(ctx: Ctx) -> Result<Exit> {
         Command::Patch(patch) => match patch {
             PatchCommand::New(args) => new::run(&ctx, args),
             PatchCommand::Import(args) => import::run(&ctx, args),
-            PatchCommand::EditSave(args) => edit_save::run(&ctx, args),
+            PatchCommand::Save(args) => edit_save::run(&ctx, args),
             PatchCommand::Edit(args) => edit::run(&ctx, args),
             PatchCommand::Apply(args) => apply::run(&ctx, args),
             PatchCommand::Unapply => apply::unapply(&ctx),

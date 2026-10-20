@@ -8,6 +8,7 @@ use crate::hints::Hints;
 use crate::invocation::{skot, skot_args};
 use crate::layout::{self, DEFAULT_SERIES, Layout};
 use crate::phase::HookPoint;
+use crate::prompt::{Fallback, PromptError};
 use crate::state::State;
 
 const PLACEHOLDER_URL: &str = "url = \"https://github.com/example/project\"";
@@ -268,25 +269,30 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
         );
     }
 
-    let ask = !ctx.cli.json && crate::ui::stdin_is_terminal();
+    // Every question below goes through this: `--json`, `--yes` and a missing
+    // terminal all mean the same silent run, which takes each default.
+    let asker = ctx.asker();
 
     // The first series: a flag or a question decide its name, and the layout points at
     // it from here on, so every file init writes lands in that series' directory. A
     // name that is not a single path component is refused now, before anything is made.
     let series = match &ctx.cli.series {
         Some(name) => name.clone(),
-        None if ask => {
-            let answer = inquire::Text::new("First series name")
-                .with_help_message(
-                    "Where your patches live: a directory under patches/. \
-                     Leave empty for the default series.",
+        None => {
+            let answer = asker
+                .text(
+                    "First series name",
+                    Some(
+                        "Where your patches live: a directory under patches/. \
+                         Leave empty for the default series.",
+                    ),
+                    Some(DEFAULT_SERIES),
+                    Fallback::Default(String::new()),
+                    None,
                 )
-                .with_placeholder(DEFAULT_SERIES)
-                .prompt()
                 .context("asking for the first series name")?;
             non_empty(answer).unwrap_or_else(|| DEFAULT_SERIES.to_owned())
         }
-        None => DEFAULT_SERIES.to_owned(),
     };
     let layout = layout.with_series(&series)?;
     // Init writes the template, and the template declares the default scope, so the
@@ -303,128 +309,150 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
         hooks.push((name, cmd));
     }
 
+    // The one question with no default: a URL is a fact about the project, so a run
+    // that cannot ask is refused with the flag rather than left with a guess.
     let url = match &args.url {
-        Some(url) => Some(url.clone()),
-        None if ask => Some(
-            inquire::Text::new("Upstream repository URL")
-                .with_help_message(
+        Some(url) => non_empty(url.clone()),
+        None => non_empty(
+            asker.text(
+                "Upstream repository URL",
+                Some(
                     "The repository your patches apply to: an https URL, an ssh remote, or a local path.",
-                )
-                .with_placeholder("https://github.com/you/project")
-                .prompt()
-                .context("asking for the upstream repository URL")?,
+                ),
+                Some("https://github.com/you/project"),
+                Fallback::Flag("--url <URL>".to_owned()),
+                None,
+            )
+            .context("asking for the upstream repository URL")?,
         ),
-        None => None,
     };
-    let url = non_empty(url.unwrap_or_default());
 
     let default_ref = match &args.default_ref {
         Some(ref_name) => Some(ref_name.clone()),
-        None if ask => {
-            let answer = inquire::Text::new("Default ref")
-                .with_help_message(
-                    "Branch or tag commands use when you pass none. Leave empty to set it later.",
-                )
-                .prompt()
-                .context("asking for the default ref")?;
-            non_empty(answer)
-        }
-        None => None,
+        None => non_empty(
+            asker.text(
+                "Default ref",
+                Some("Branch or tag commands use when you pass none. Leave empty to set it later."),
+                None,
+                Fallback::Default(String::new()),
+                None,
+            )
+            .context("asking for the default ref")?,
+        ),
     };
 
     let policy = match args.policy {
         Some(choice) => Some(choice.policy()),
-        None if ask => {
-            let answer = inquire::Select::new(
+        None => {
+            let chosen = asker.select(
                 "Sandbox policy",
+                None,
                 vec![
-                    "persistent — kept between runs; a ref change resets it (right locally)",
-                    "ephemeral — created and destroyed every run (right for CI)",
+                    "persistent: kept between runs; a ref change resets it (right locally)",
+                    "ephemeral: created and destroyed every run (right for CI)",
                 ],
-            )
-            .prompt()
-            .context("asking for the sandbox policy")?;
+                Fallback::Default("persistent".to_owned()),
+                None,
+                None,
+            );
+            let answer = chosen.context("asking for the sandbox policy")?;
             Some(if answer.starts_with("ephemeral") {
                 SandboxPolicy::Ephemeral
             } else {
                 SandboxPolicy::Persistent
             })
         }
-        None => None,
     };
 
     let keep = if !args.keep.is_empty() {
         Some(args.keep.clone())
-    } else if ask {
+    } else {
         let candidates = keep_candidates(layout.root());
         if candidates.is_empty() {
             None
         } else {
-            let all: Vec<usize> = (0..candidates.len()).collect();
-            let selected =
-                inquire::MultiSelect::new("Paths that must survive a ref change", candidates)
-                    .with_default(&all)
-                    .prompt()
-                    .context("asking which paths to protect")?;
-            if selected.is_empty() {
-                None
-            } else {
-                Some(selected)
-            }
+            let selected = asker
+                .multi(
+                    "Paths that must survive a ref change",
+                    None,
+                    candidates.clone(),
+                    Fallback::Default(candidates),
+                )
+                .context("asking which paths to protect")?;
+            (!selected.is_empty()).then_some(selected)
         }
-    } else {
-        None
     };
 
     // Hooks are a table of stages, not one stray question about "build": one yes/no, then
-    // a menu where a stage is picked, answered, and returned to until `done`. A no finishes
-    // the init with every slot empty, which is a finished project too, and the template's
-    // comments explain each slot to whoever edits the file later.
-    if ask {
-        let configure = inquire::Confirm::new("Configure hooks?")
-            .with_default(false)
-            .with_help_message(&format!(
-                "The [hooks] table: what runs at each stage of `{}`. \
-                 All optional, all editable later.",
-                skot("build")
-            ))
-            .prompt()
+    // a menu where a stage is picked, answered, and returned to until `done` or Esc. A no
+    // finishes the init with every slot empty, which is a finished project too, and the
+    // template's comments explain each slot to whoever edits the file later. `--hook` has
+    // already named a stage, so the question it would have asked does not exist.
+    let configure = !args.hook.is_empty()
+        || asker
+            .confirm(
+                "Configure hooks?",
+                Some(&format!(
+                    "The [hooks] table: what runs at each stage of `{}`. \
+                     All optional, all editable later.",
+                    skot("build")
+                )),
+                Fallback::Default(false),
+            )
             .context("asking whether to configure hooks")?;
-        if configure {
-            // Reaching one hook must not cost a walk through the other six, so the menu
-            // comes back after every answer wearing the new value.
-            loop {
-                let options: Vec<String> = HookPoint::ALL
-                    .iter()
-                    .map(|point| {
-                        let key = point.toml_key();
-                        match hooks.iter().find(|(name, _)| name == key) {
-                            Some((_, cmd)) => format!("{key} = {}", one_line(cmd)),
-                            None => format!("{key} (unset)"),
-                        }
-                    })
-                    .chain(std::iter::once("done".to_owned()))
-                    .collect();
-                let chosen = inquire::Select::new("Which hook to configure", options)
-                    .prompt()
-                    .context("asking which hook to configure")?;
-                let key = chosen.split([' ', '(']).next().unwrap_or("");
-                let Some(point) = HookPoint::ALL.iter().find(|p| p.toml_key() == key) else {
-                    break; // `done`
-                };
-                let label = format!("Configure `{key}`");
-                let mut prompt = inquire::Text::new(&label).with_help_message(stage_help(*point));
-                if let Some(example) = stage_example(*point) {
-                    prompt = prompt.with_placeholder(example);
-                }
-                let answer = prompt
-                    .prompt()
-                    .context(format!("asking for the `{key}` hook"))?;
-                if let Some(cmd) = non_empty(answer) {
-                    match hooks.iter_mut().find(|(name, _)| name == key) {
-                        Some(slot) => slot.1 = cmd,
-                        None => hooks.push((key.to_owned(), cmd)),
+    if configure {
+        // Reaching one hook must not cost a walk through the other six, so the menu
+        // comes back after every answer wearing the new value. Esc at the menu finishes
+        // the wizard with what has been set; at a value it goes back, value unchanged.
+        loop {
+            // `done (finish)` is the first item and Enter lands on it: a run that wants
+            // out of the wizard is out in one keystroke, and the list holds all eight
+            // options at once so the exit is on screen without any scrolling.
+            let options: Vec<String> = std::iter::once("done (finish)".to_owned())
+                .chain(HookPoint::ALL.iter().map(|point| {
+                    let key = point.toml_key();
+                    match hooks.iter().find(|(name, _)| name == key) {
+                        Some((_, cmd)) => format!("{key} = {}", one_line(cmd)),
+                        None => format!("{key} (unset)"),
                     }
+                }))
+                .collect();
+            let chosen = asker.select(
+                "Which hook to configure",
+                Some("Enter finishes; pick a hook to set it. Esc finishes, too."),
+                options.clone(),
+                Fallback::Default("done (finish)".to_owned()),
+                Some(options.len()),
+                Some("<done>"),
+            );
+            let chosen = match chosen {
+                Ok(chosen) => chosen,
+                // Esc finishes the same way Enter on the first item does.
+                Err(PromptError::Cancelled) => break,
+                Err(err) => return Err(err).context("asking which hook to configure"),
+            };
+            let key = chosen.split([' ', '(']).next().unwrap_or("");
+            let Some(point) = HookPoint::ALL.iter().find(|p| p.toml_key() == key) else {
+                break; // `done`
+            };
+            let label = format!("Configure `{key}`");
+            let answer = asker.text(
+                &label,
+                Some(stage_help(*point)),
+                stage_example(*point),
+                Fallback::Default(String::new()),
+                Some("<back>"),
+            );
+            let answer = match answer {
+                Ok(answer) => answer,
+                // Esc goes back to the menu, the value as it stands.
+                Err(PromptError::Cancelled) => continue,
+                Err(err) => return Err(err).context(format!("asking for the `{key}` hook")),
+            };
+            if let Some(cmd) = non_empty(answer) {
+                match hooks.iter_mut().find(|(name, _)| name == key) {
+                    Some(slot) => slot.1 = cmd,
+                    None => hooks.push((key.to_owned(), cmd)),
                 }
             }
         }
@@ -455,24 +483,20 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
     }
 
     // The vite question: offer the step that makes the project usable rather than
-    // leaving a freshly scaffolded directory to be figured out.
+    // leaving a freshly scaffolded directory to be figured out. The default is yes: a
+    // run that cannot ask takes it, the same way pressing Enter would.
     let want_sync = plan.url.is_some()
-        && if ctx.cli.json {
-            args.sync
-        } else if args.sync || ctx.yes {
-            true
-        } else if ask {
-            inquire::Confirm::new("Mirror the upstream repository now?")
-                .with_default(true)
-                .with_help_message(&format!(
-                    "Fetches it into the local mirror so `{}` can start a patch.",
-                    skot("new")
-                ))
-                .prompt()
-                .context("asking whether to mirror the repository")?
-        } else {
-            false
-        };
+        && (args.sync
+            || asker
+                .confirm(
+                    "Mirror the upstream repository now?",
+                    Some(&format!(
+                        "Fetches it into the local mirror so `{}` can start a patch.",
+                        skot("new")
+                    )),
+                    Fallback::Default(true),
+                )
+                .context("asking whether to mirror the repository")?);
 
     let mut sync = None;
     if want_sync {
@@ -762,14 +786,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = Layout::new(tmp.path());
         std::fs::create_dir_all(layout.patches_dir()).unwrap();
-        std::fs::write(layout.series_file(), "0001-kept.patch\n").unwrap();
+        std::fs::write(layout.series_file(), "kept.patch\n").unwrap();
 
         scaffold(&layout, &plan("https://example.invalid/proj")).unwrap();
         // Re-running init is how you pick up new skot settings; it must not silently
         // discard the list of patches that is the entire point of the project.
         assert_eq!(
             std::fs::read_to_string(layout.series_file()).unwrap(),
-            "0001-kept.patch\n"
+            "kept.patch\n"
         );
     }
 
