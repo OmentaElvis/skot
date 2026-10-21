@@ -623,7 +623,7 @@ mod tests {
 
         assert_eq!(exit, Exit::Success);
         assert!(
-            !layout.work_patch_dir("b.patch").unwrap().exists(),
+            !layout.work_patch_dir("b").unwrap().exists(),
             "the work area went with the patch"
         );
         assert!(
@@ -664,7 +664,7 @@ mod tests {
 
         assert_eq!(exit, Exit::Success);
         assert!(
-            layout.work_patch_dir("a.patch").unwrap().exists(),
+            layout.work_patch_dir("a").unwrap().exists(),
             "the unrelated work area must survive"
         );
         assert!(

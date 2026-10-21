@@ -544,7 +544,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = session_on_b(tmp.path());
 
-        let dir = layout.work_patch_dir("b.patch").unwrap();
+        let dir = layout.work_patch_dir("b").unwrap();
         std::fs::write(dir.join("f.txt"), "edited\n").unwrap();
 
         save(&layout, Some("b.patch"), None, false, false).unwrap();
@@ -587,7 +587,7 @@ mod tests {
         let layout = session_pair(tmp.path());
         let before = std::fs::read_to_string(layout.patches_dir().join("b.patch")).unwrap();
 
-        let one = layout.work_patch_dir("a.patch").unwrap();
+        let one = layout.work_patch_dir("a").unwrap();
         std::fs::write(one.join("f.txt"), "from the bottom\n").unwrap();
         save(&layout, Some("a.patch"), None, false, false).unwrap();
 
@@ -637,7 +637,7 @@ mod tests {
     fn saving_a_new_file_adds_it_as_the_patch_content() {
         let tmp = tempfile::tempdir().unwrap();
         let layout = session_on_b(tmp.path());
-        let dir = layout.work_patch_dir("b.patch").unwrap();
+        let dir = layout.work_patch_dir("b").unwrap();
         std::fs::write(dir.join("extra.txt"), "a new file\n").unwrap();
 
         save(&layout, Some("b.patch"), None, false, false).unwrap();
@@ -667,7 +667,7 @@ mod tests {
         let layout = session_on_b(tmp.path());
         let before = std::fs::read_to_string(layout.series_file()).unwrap();
 
-        let dir = layout.work_patch_dir("b.patch").unwrap();
+        let dir = layout.work_patch_dir("b").unwrap();
         std::fs::write(dir.join("f.txt"), "edited\n").unwrap();
         save(&layout, Some("b.patch"), None, false, false).unwrap();
 
@@ -686,7 +686,7 @@ mod tests {
         // what the loop looks like in practice.
         let tmp = tempfile::tempdir().unwrap();
         let layout = session_on_b(tmp.path());
-        let dir = layout.work_patch_dir("b.patch").unwrap();
+        let dir = layout.work_patch_dir("b").unwrap();
 
         std::fs::write(dir.join("f.txt"), "one\n").unwrap();
         save(&layout, Some("b.patch"), None, false, false).unwrap();
@@ -798,7 +798,7 @@ mod tests {
         let plan = crate::session::plan(&layout, "main", &[], Some(&entries[0])).unwrap();
         crate::session::materialise(&layout, "a.patch", &plan).unwrap();
 
-        let dir = layout.work_patch_dir("a.patch").unwrap();
+        let dir = layout.work_patch_dir("a").unwrap();
         std::fs::write(dir.join("f.txt"), "base\n").unwrap();
         let before = std::fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap();
 
@@ -838,7 +838,7 @@ mod tests {
         let plan = crate::session::plan(&layout, "main", &entries[..1], Some(&entries[1])).unwrap();
         crate::session::materialise(&layout, "b.patch", &plan).unwrap();
 
-        let dir = layout.work_patch_dir("b.patch").unwrap();
+        let dir = layout.work_patch_dir("b").unwrap();
         std::fs::write(dir.join("f.txt"), "edited\n").unwrap();
         save(&layout, Some("b.patch"), None, false, false).unwrap();
 
@@ -943,7 +943,7 @@ index 1111111..9999999 100644
         // the exported patch can see where the extra sections came from.
         let tmp = tempfile::tempdir().unwrap();
         let layout = session_with_directories(tmp.path());
-        let dir = layout.work_patch_dir("p1.patch").unwrap();
+        let dir = layout.work_patch_dir("p1").unwrap();
 
         let repo = git2::Repository::open(&dir).unwrap();
         let statuses = repo
@@ -971,7 +971,7 @@ index 1111111..9999999 100644
         let tmp = tempfile::tempdir().unwrap();
         let layout = session_with_directories(tmp.path());
 
-        let dir = layout.work_patch_dir("p1.patch").unwrap();
+        let dir = layout.work_patch_dir("p1").unwrap();
         let f = dir.join("f.txt");
         let mut text = std::fs::read_to_string(&f).unwrap();
         text.push_str("// edit1\n");

@@ -344,6 +344,18 @@ pub fn plan(
     })
 }
 
+/// The directory a work area lives in, under `.skot/work/<series>/`: the patch's name
+/// without the `.patch` its series entry carries. The series already says what the file
+/// beside it is, and a directory that ends in `.patch` reads as the file it is not.
+fn work_area_dir_name(patch: &str) -> &str {
+    match patch.strip_suffix(".patch") {
+        // A patch called `.patch` would strip to nothing and would name the series
+        // directory itself: keep such a name whole instead.
+        Some("") | None => patch,
+        Some(stem) => stem,
+    }
+}
+
 /// Create the session's worktree from `plan` and record it. The caller holds the lock.
 ///
 /// The order is deliberate and mirrors [`plan`]'s: everything that can fail because of the
@@ -352,8 +364,12 @@ pub fn plan(
 /// worktree that was never finished would strand the user in a dead directory, while a
 /// worktree with no entry is recognised as a husk and replaced by the next attempt.
 pub fn materialise(layout: &Layout, patch: &str, plan: &Plan) -> Result<Session> {
-    let dir = layout.work_patch_dir(patch)?;
-    let name = sandbox::session_worktree_name(layout.series(), patch);
+    // The one place a patch name becomes a directory name. `dir` is stored from here on,
+    // and every later read resolves it verbatim, so a record written before this existed
+    // still finds its directory exactly where it was left.
+    let dir_name = work_area_dir_name(patch);
+    let dir = layout.work_patch_dir(dir_name)?;
+    let name = sandbox::session_worktree_name(layout.series(), dir_name);
     let mut manifest = Manifest::load(layout)?;
     if manifest.get(layout, patch).is_some() {
         bail!(
@@ -390,7 +406,7 @@ pub fn materialise(layout: &Layout, patch: &str, plan: &Plan) -> Result<Session>
     let session = Session {
         series: layout.series().to_owned(),
         patch: patch.to_owned(),
-        dir: patch.to_owned(),
+        dir: dir_name.to_owned(),
         ref_name: plan.ref_name.clone(),
         base_sha: plan.base_sha.clone(),
         base_tree: plan.base_tree.to_string(),
@@ -655,7 +671,7 @@ index 1111111..2222222 100644
         let for_second = plan(&layout, "main", &entries[..1], None).unwrap();
         let session = materialise(&layout, "b.patch", &for_second).unwrap();
 
-        let dir = layout.work_patch_dir("b.patch").unwrap();
+        let dir = layout.work_patch_dir("b").unwrap();
         assert!(dir.join(".git").is_file(), "a linked worktree, not a clone");
         assert_eq!(
             std::fs::read_to_string(dir.join("f.txt")).unwrap(),
@@ -722,8 +738,8 @@ index 1111111..2222222 100644
             Manifest::load(&layout).unwrap().patches(&layout),
             ["a.patch", "b.patch"]
         );
-        let one = layout.work_patch_dir("a.patch").unwrap();
-        let two = layout.work_patch_dir("b.patch").unwrap();
+        let one = layout.work_patch_dir("a").unwrap();
+        let two = layout.work_patch_dir("b").unwrap();
         assert_eq!(
             std::fs::read_to_string(one.join("f.txt")).unwrap(),
             "base\n"
@@ -771,7 +787,7 @@ index 1111111..2222222 100644
         assert_eq!(Manifest::load(&layout).unwrap().patches(&exp), ["a.patch"]);
         // Different directories, both openable: the names in the mirror did not collide.
         assert_ne!(
-            layout.work_patch_dir("a.patch").unwrap(),
+            layout.work_patch_dir("a").unwrap(),
             session.dir_path(&exp).unwrap()
         );
         open(
@@ -811,9 +827,15 @@ index 1111111..2222222 100644
         // "worktree already exists".
         let tmp = tempfile::tempdir().unwrap();
         let (layout, _sha) = project(tmp.path());
-        let dir = layout.work_patch_dir("a.patch").unwrap();
+        let dir = layout.work_patch_dir("a").unwrap();
         let mirror = Mirror::open(&layout).unwrap();
-        sandbox::add(&mirror, "a.patch", &dir, "remedy").unwrap();
+        sandbox::add(
+            &mirror,
+            &sandbox::session_worktree_name(layout.series(), "a"),
+            &dir,
+            "remedy",
+        )
+        .unwrap();
         std::fs::write(dir.join("leftover.txt"), b"half-finished edit").unwrap();
 
         let plan = plan(&layout, "main", &[], None).unwrap();
@@ -913,11 +935,13 @@ index 1111111..2222222 100644
         let plan = plan(&layout, "main", &[], None).unwrap();
         materialise(&layout, "a.patch", &plan).unwrap();
 
-        let dir = layout.work_patch_dir("a.patch").unwrap();
+        let dir = layout.work_patch_dir("a").unwrap();
 
         let reconciled = reconcile(&layout).unwrap();
         let session = reconciled.get(&layout, "a.patch").unwrap();
-        assert_eq!(session.dir_name(), "a.patch");
+        // The directory is the patch's name without the suffix: the file already says
+        // what kind of thing `a.patch` is, and the directory beside it is a directory.
+        assert_eq!(session.dir_name(), "a");
         assert_eq!(session.base_sha, sha);
         assert!(dir.exists(), "reconcile must not touch a live work area");
     }

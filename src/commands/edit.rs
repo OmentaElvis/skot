@@ -215,7 +215,7 @@ mod tests {
         assert!(!discarded);
         assert_eq!(session.patch, "b.patch");
         assert_eq!(session.ref_name, "main");
-        let dir = layout.work_patch_dir("b.patch").unwrap();
+        let dir = layout.work_patch_dir("b").unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("f.txt")).unwrap(),
             "second\n",
@@ -236,7 +236,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = series_only(tmp.path());
         let (session, _, _) = open(&layout, "a.patch", None, false).unwrap();
-        let dir = layout.work_patch_dir("a.patch").unwrap();
+        let dir = layout.work_patch_dir("a").unwrap();
         std::fs::write(dir.join("f.txt"), "work in progress\n").unwrap();
 
         let err = open(&layout, "a.patch", None, false).unwrap_err();
@@ -264,7 +264,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let layout = series_only(tmp.path());
         open(&layout, "a.patch", None, false).unwrap();
-        let dir = layout.work_patch_dir("a.patch").unwrap();
+        let dir = layout.work_patch_dir("a").unwrap();
         std::fs::write(dir.join("f.txt"), "work in progress\n").unwrap();
 
         let (session, opened, discarded) = open(&layout, "a.patch", None, true).unwrap();
@@ -359,7 +359,7 @@ mod tests {
 
         assert!(opened);
         assert_eq!(session.patch, "a.patch");
-        let dir = layout.work_patch_dir("a.patch").unwrap();
+        let dir = layout.work_patch_dir("a").unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("f.txt")).unwrap(),
             "base\n",

@@ -474,10 +474,10 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>();
             let plan = session::plan(&l, "main", &below, Some(entry)).unwrap();
-            session::materialise(&l, &entry.name, &plan).unwrap();
+            let session = session::materialise(&l, &entry.name, &plan).unwrap();
             // Something the patch file does not have, so the work area counts as unsaved
             // and is protected rather than reaped as derived state.
-            let dir = l.work_patch_dir(&entry.name).unwrap();
+            let dir = session.dir_path(&l).unwrap();
             std::fs::write(dir.join("unsaved.txt"), "work in progress\n").unwrap();
         }
         l
@@ -534,7 +534,7 @@ mod tests {
             remove_one(&l, label, path).unwrap();
         }
         assert!(
-            !l.work_patch_dir("a.patch").unwrap().exists(),
+            !l.work_patch_dir("a").unwrap().exists(),
             "the work area is gone"
         );
         assert!(

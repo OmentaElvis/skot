@@ -297,8 +297,10 @@ impl Layout {
 
     /// The worktree holding one patch's in-progress edits, in the active series.
     ///
-    /// The directory is named after the series entry verbatim (`sub/fix.patch` keeps
-    /// its subdirectory), so what `list` shows and what a file manager opens are the same
+    /// The argument is a directory name, not a patch name: an open session's is
+    /// [`Session::dir_name`](crate::session::Session::dir_name), the patch's own name
+    /// without the `.patch` its series entry carries (`sub/fix.patch` keeps its
+    /// subdirectory), so what `list` shows and what a file manager opens are the same
     /// path. A name that would leave the work directory is refused rather than rewritten:
     /// a session found somewhere other than its own name would be invisible, and a
     /// manifest pointing outside `work/` would be a delete waiting to happen.
