@@ -37,6 +37,16 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "NAME", env = "SKOT_SERIES")]
     pub series: Option<String>,
 
+    /// Contact the upstream even when the mirror already has the ref: the fetch phase
+    /// of whatever command this run is, not only `sync`'s.
+    #[arg(long, global = true)]
+    pub refresh: bool,
+
+    /// Never contact the network. The mirror already on disk, and local directories,
+    /// are the whole answer; anything else is refused rather than fetched.
+    #[arg(long, global = true)]
+    pub offline: bool,
+
     /// Machine-readable output on stdout.
     #[arg(long, global = true)]
     pub json: bool,
@@ -91,7 +101,10 @@ pub enum Command {
     Rebase(RebaseArgs),
 
     /// Mirror a remote and keep its refs current.
-    Sync(SyncArgs),
+    ///
+    /// Without `--refresh` (a global flag) the mirror's own refs answer when they can:
+    /// no connection, no failure because the network happens to be down.
+    Sync(RefArg),
 
     /// Free disk, in levels. Dry run unless --yes.
     Clean(CleanArgs),
@@ -595,20 +608,6 @@ pub struct RebaseArgs {
     pub into: Option<String>,
 }
 
-/// Deliberately not [`RefArg`]: `skot sync --refresh` contacts the upstream even when the
-/// mirror already has the ref, and putting that flag on the shared type would hand it to
-/// `skot patch apply --refresh` too, where it could only mean something the apply path does
-/// not do.
-#[derive(Debug, Clone, Args)]
-pub struct SyncArgs {
-    /// Ref: a tag, a branch, or a commit. Defaults to `upstream.default-ref`.
-    #[arg(value_name = "REF")]
-    pub ref_name: Option<String>,
-    /// Contact the upstream even when the mirror already has the ref.
-    #[arg(long)]
-    pub refresh: bool,
-}
-
 /// A patch name, for the commands that act on the stack rather than on a ref.
 ///
 /// Deliberately not [`RefArg`]: `skot patch pop fix` takes a *patch*, and the ref it
@@ -804,6 +803,14 @@ mod tests {
         assert_eq!(cli.series.as_deref(), Some("exp"));
         let cli = Cli::try_parse_from(["skot", "--series", "exp", "status"]).unwrap();
         assert_eq!(cli.series.as_deref(), Some("exp"));
+        let cli = Cli::try_parse_from(["skot", "build", "--refresh"]).unwrap();
+        assert!(cli.refresh);
+        let cli = Cli::try_parse_from(["skot", "--refresh", "sync"]).unwrap();
+        assert!(cli.refresh);
+        let cli = Cli::try_parse_from(["skot", "sync", "--offline"]).unwrap();
+        assert!(cli.offline);
+        let cli = Cli::try_parse_from(["skot", "--offline", "patch", "list"]).unwrap();
+        assert!(cli.offline);
     }
 
     #[test]

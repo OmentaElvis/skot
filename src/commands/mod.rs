@@ -192,6 +192,10 @@ fn series_for(cli: &Cli, layout: Layout) -> Result<Layout> {
         }
     };
     let layout = layout.with_series(&name)?;
+    // `--refresh` and `--offline` ride on the layout too: they describe this run, not
+    // one command's arguments, and the fetch path is deep enough below here that
+    // threading a flag down to it would touch every command for one pair of booleans.
+    let layout = layout.with_refresh(cli.refresh).with_offline(cli.offline);
     if needs_current && !creates_current && !layout.patches_dir().is_dir() {
         bail!(
             "the series `{name}` does not exist in {}.\n\
@@ -299,6 +303,28 @@ mod tests {
 
         let resolved = series_for(&cli(&["skot", "build"]), layout).unwrap();
         assert_eq!(resolved.series(), "alpha");
+    }
+
+    #[test]
+    fn refresh_and_offline_are_run_flags_and_land_on_the_layout() {
+        // The flags describe the run, so `series_for` folds them the way it folds the
+        // series: once here, and every fetch below reads them off the layout.
+        let (_tmp, layout) = crate::commands::testsupport::project();
+
+        let resolved = series_for(
+            &cli(&["skot", "--refresh", "--offline", "build"]),
+            layout.clone(),
+        )
+        .unwrap();
+        assert!(resolved.refresh());
+        assert!(resolved.offline());
+
+        let resolved = series_for(&cli(&["skot", "build", "--refresh"]), layout).unwrap();
+        assert!(resolved.refresh(), "after the subcommand counts too");
+        assert!(
+            !resolved.offline(),
+            "and nothing inherits a flag it was not given"
+        );
     }
 
     #[test]

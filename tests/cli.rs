@@ -788,3 +788,28 @@ fn a_json_usage_error_is_a_document_and_exits_two() {
     let message = doc["error"].as_str().expect("the message is a string");
     assert!(message.contains("answer it with"), "{message}");
 }
+
+/// The mirror already holds everything the import reads, and its origin names a network
+/// transport. Every fetch would learn the same `--offline` refusal and say it again, so
+/// the origin is asked once for the whole run: one refusal, then the mirror speaks.
+#[test]
+fn an_offline_pull_request_import_refuses_the_upstream_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = bare_project(tmp.path());
+    let repo = git2::Repository::open_bare(layout.mirror_dir()).unwrap();
+    let main = repo.refname_to_id("refs/heads/main").unwrap();
+    repo.reference("refs/pull/726/head", main, true, "fixture")
+        .unwrap();
+    repo.remote("origin", "https://example.invalid/jansson.git")
+        .unwrap();
+    drop(repo);
+
+    let out = skot(tmp.path(), &["patch", "import", "--pr", "726", "--offline"]);
+
+    let err = stderr(&out);
+    assert_eq!(
+        err.matches("is not being contacted").count(),
+        1,
+        "one refusal for the whole run:\n{err}"
+    );
+}

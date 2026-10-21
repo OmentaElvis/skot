@@ -9,19 +9,25 @@
 //!
 //! * [`ensure`] is the local-first one: if the mirror can already serve the ref, nothing
 //!   is fetched: no connection, no negotiation, no failure because the network happens
-//!   to be down. This is what `build`'s sync phase runs, and what bare `skot sync` runs.
-//!   A ref the mirror lacks is fetched on the spot, narrowed to that ref.
-//! * [`fetch`] always contacts the upstream: `skot sync --refresh`, and the first fetch
-//!   of a project. It reports what it found, and refuses a ref the upstream does not
-//!   have rather than reporting a silent success.
+//!   to be down. A run that asked for `--refresh` refreshes anyway: the flag is read in
+//!   [`sync`], once, so every caller of `ensure` gets it. This is what `build`'s sync
+//!   phase runs, and what bare `skot sync` runs. A ref the mirror lacks is fetched on
+//!   the spot, narrowed to that ref.
+//! * [`fetch`] always contacts the upstream: the first fetch of a project, and any
+//!   caller that means "update now" regardless of what the run asked for. It reports
+//!   what it found, and refuses a ref the upstream does not have rather than reporting
+//!   a silent success.
 //! * [`resolve_in_mirror`] is what every ref-reading command goes through: it calls
 //!   [`ensure`] and then resolves, so a command reads what it needs instead of stopping
 //!   to tell the user to run this one first, the same way a build tool synchronizes a
 //!   missing dependency rather than refusing to compile.
-//! * [`run`] is the command. It picks between the first two from `--refresh`, then
-//!   decides presentation: the one JSON document if `--json`, the "what to do next"
-//!   advice if not. `build` calls `ensure` directly and keeps its own narration; there
-//!   is no quiet-mode flag asking a callee to guess what its caller intends to print.
+//! * [`run`] is the command: presentation, and nothing else about fetching. `build`
+//!   calls `ensure` directly and keeps its own narration; there is no quiet-mode flag
+//!   asking a callee to guess what its caller intends to print.
+//!
+//! `--offline` is read deeper down, where the network itself is (see
+//! [`crate::git::mirror`]): the warm path above never reaches it, and a fetch that
+//! would cross the network is refused there, at the one place that could start it.
 //!
 //! All the work functions take a [`Layout`] and a ref name (the only two things they act
 //! on) so they are testable without a `Ctx`, a `Cli`, or a clap parser anywhere near
@@ -31,7 +37,7 @@
 use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
 
-use crate::cli::SyncArgs;
+use crate::cli::RefArg;
 use crate::commands::{Ctx, Exit, emit_json};
 use crate::git::mirror::{self, Mirror};
 use crate::hints::Hints;
@@ -54,8 +60,9 @@ pub struct SyncOutcome {
 }
 
 /// Fetch from `upstream.url`, creating the mirror on the first run, and contacting the
-/// upstream even when the mirror is already warm. This is the explicit "update me":
-/// `skot sync --refresh`, and the first fetch of a project.
+/// upstream even when the mirror is already warm: the explicit "update me", for callers
+/// that mean it regardless of what the run asked for. This is the first fetch of a
+/// project, and any refusal to guess "warm enough".
 ///
 /// A ref the upstream does not have is an error here, not a silent success: the caller
 /// asked for an update, so "there is nothing to update to" is the answer it needs.
@@ -67,7 +74,8 @@ pub fn fetch(layout: &Layout, ref_name: Option<&str>) -> Result<SyncOutcome> {
 ///
 /// With the ref in the mirror there is no network call at all: no connection, nothing to
 /// negotiate, and no failure when the connection would be down: the mirror is the local
-/// answer, which is exactly the state a warm build should run in. A missing ref (or a
+/// answer, which is exactly the state a warm build should run in. A run that asked for
+/// `--refresh` is the exception, read in the shared body below. A missing ref (or a
 /// missing mirror) fetches just that ref, narrowed by name.
 pub fn ensure(layout: &Layout, ref_name: Option<&str>) -> Result<SyncOutcome> {
     sync(layout, ref_name, false)
@@ -75,6 +83,9 @@ pub fn ensure(layout: &Layout, ref_name: Option<&str>) -> Result<SyncOutcome> {
 
 /// The shared body: decide whether the network is needed at all, then do or don't.
 fn sync(layout: &Layout, ref_name: Option<&str>, refresh: bool) -> Result<SyncOutcome> {
+    // `--refresh` describes the run, so it lives on the layout: whichever entry point
+    // got here, a run that asked for it refreshes.
+    let refresh = refresh || layout.refresh();
     let config = layout.config()?;
     // The URL is only needed to *start* a mirror: a warm one re-fetches from the URL its
     // own `origin` records, and a warm ref needs neither. So a missing `upstream.url` is
@@ -228,12 +239,11 @@ fn report(mirror: &Mirror, url: Option<&str>, created: bool, fetched: bool) -> R
 
 /// `skot sync`: fetch what is missing (or, with `--refresh`, everything), then present.
 /// The only place a document reaches stdout.
-pub fn run(ctx: &Ctx, args: &SyncArgs) -> Result<Exit> {
-    let out = if args.refresh {
-        fetch(&ctx.layout, args.ref_name.as_deref())?
-    } else {
-        ensure(&ctx.layout, args.ref_name.as_deref())?
-    };
+///
+/// The fetch itself is [`ensure`]: a run's `--refresh` is already on the layout, which
+/// is where the shared body reads it.
+pub fn run(ctx: &Ctx, args: &RefArg) -> Result<Exit> {
+    let out = ensure(&ctx.layout, args.ref_name.as_deref())?;
 
     if ctx.cli.json {
         emit_json(&out)?;
@@ -517,12 +527,121 @@ mod tests {
             panic!("expected sync")
         };
         assert!(s.ref_name.is_none());
-        assert!(!s.refresh, "without --refresh sync is the local-first one");
+        assert!(
+            !cli.refresh,
+            "without --refresh sync is the local-first one"
+        );
         let cli = Cli::parse_from(["skot", "sync", "--refresh", "release/2.0"]);
         let Command::Sync(s) = cli.command else {
             panic!("expected sync")
         };
         assert_eq!(s.ref_name.as_deref(), Some("release/2.0"));
-        assert!(s.refresh);
+        assert!(cli.refresh, "--refresh belongs to the run, not to sync");
+    }
+
+    #[test]
+    fn ensure_refreshes_when_the_run_asked_for_it() {
+        // `--refresh` rides on the layout, so the fetch phase refreshes wherever it runs:
+        // the mirror is warm, then its own `origin` points somewhere that cannot answer,
+        // and a loud failure is the only proof that the fetch was attempted at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let url = upstream(tmp.path());
+        let layout = fixture(&tmp.path().join("proj"), &url);
+        fetch(&layout, Some("main")).unwrap();
+        git2::Repository::open_bare(layout.mirror_dir())
+            .unwrap()
+            .remote_set_url("origin", "/nonexistent/never.git")
+            .unwrap();
+
+        let err = ensure(&layout.with_refresh(true), Some("main"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("never.git"), "the fetch must run: {err}");
+    }
+
+    #[test]
+    fn offline_will_not_fetch_from_a_url_on_the_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = fixture(
+            &tmp.path().join("proj"),
+            "https://example.invalid/upstream.git",
+        );
+
+        let err = fetch(&layout.with_offline(true), None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("--offline"), "the flag is named: {err}");
+        assert!(err.contains("example.invalid"), "and so is the URL: {err}");
+        assert!(
+            !layout.mirror_dir().exists(),
+            "refused before anything was written"
+        );
+    }
+
+    #[test]
+    fn offline_still_fetches_from_a_local_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = upstream(tmp.path());
+        let layout = fixture(&tmp.path().join("proj"), &url);
+
+        let out = fetch(&layout.with_offline(true), None).unwrap();
+
+        assert!(out.created, "a local directory is not the network");
+        assert_eq!(out.branches, ["main"]);
+    }
+
+    #[test]
+    fn offline_serves_from_the_mirror_it_already_has() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = upstream(tmp.path());
+        let layout = fixture(&tmp.path().join("proj"), &url);
+        fetch(&layout, Some("main")).unwrap();
+        std::fs::write(
+            layout.config_file(),
+            "[upstream]\nurl = \"https://example.invalid/upstream.git\"\ndefault-ref = \"main\"\n",
+        )
+        .unwrap();
+
+        let out = ensure(&layout.with_offline(true), Some("main")).unwrap();
+
+        assert!(!out.fetched, "the cached mirror is the whole answer");
+        assert_eq!(out.branches, ["main"]);
+    }
+
+    #[test]
+    fn offline_wins_over_refresh_for_a_url_on_the_network() {
+        // Both flags, warm mirror, origin on the network: `--refresh` skips the warm
+        // path and `--offline` refuses what that uncovers. No connection either way,
+        // and the refusal is the whole answer rather than a fetch that half-happens.
+        let tmp = tempfile::tempdir().unwrap();
+        let url = upstream(tmp.path());
+        let layout = fixture(&tmp.path().join("proj"), &url);
+        fetch(&layout, Some("main")).unwrap();
+        git2::Repository::open_bare(layout.mirror_dir())
+            .unwrap()
+            .remote_set_url("origin", "https://example.invalid/upstream.git")
+            .unwrap();
+
+        let err = ensure(&layout.with_refresh(true).with_offline(true), Some("main"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("--offline"), "got {err}");
+        assert!(err.contains("example.invalid"), "and the URL: {err}");
+    }
+
+    #[test]
+    fn refresh_and_offline_together_still_read_a_local_directory() {
+        // The pair is only a contradiction for a network transport: a local directory
+        // can be re-read as often as the run likes.
+        let tmp = tempfile::tempdir().unwrap();
+        let url = upstream(tmp.path());
+        let layout = fixture(&tmp.path().join("proj"), &url);
+
+        let out = ensure(&layout.with_refresh(true).with_offline(true), Some("main")).unwrap();
+
+        assert!(out.fetched, "a local re-read is still a fetch");
     }
 }

@@ -233,30 +233,57 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     // otherwise the range's own refs are enough.
     let wildcard =
         !by_id.is_empty() && (shallow || by_id.iter().any(|n| mirror.try_resolve(n).is_none()));
-    if let Ok(url) = mirror.remote_url() {
-        let refspecs: Vec<String> = if wildcard {
-            vec![
-                "+refs/heads/*:refs/heads/*".into(),
-                "+refs/tags/*:refs/tags/*".into(),
-            ]
-        } else {
-            fetchable
-                .iter()
-                .flat_map(|name| refspecs_for(name, false))
-                .collect()
-        };
-        if !refspecs.is_empty() {
-            let held = needed.iter().all(|n| mirror.try_resolve(n).is_some());
-            fetch_or_fall_back(
-                &mirror,
-                &url,
-                "origin",
-                &refspecs,
-                "fetching what the range needs",
-                held,
-                format!("fetching the range's refs from {url}"),
-            )?;
+    // The origin is asked once for everything this run reads from it: the range's own
+    // refs, and the pull request head when there is one. One fetch, so an origin that
+    // cannot be reached is an answer said once for the run instead of once per ref.
+    let pull_ref = request
+        .pull
+        .map(|number| format!("+refs/pull/{number}/head:refs/pull/{number}/head"));
+    match mirror.remote_url() {
+        Ok(url) => {
+            let mut refspecs: Vec<String> = if wildcard {
+                vec![
+                    "+refs/heads/*:refs/heads/*".into(),
+                    "+refs/tags/*:refs/tags/*".into(),
+                ]
+            } else {
+                fetchable
+                    .iter()
+                    .flat_map(|name| refspecs_for(name, false))
+                    .collect()
+            };
+            let mut held = needed.iter().all(|n| mirror.try_resolve(n).is_some());
+            if let Some(spec) = &pull_ref {
+                refspecs.push(spec.clone());
+                held = held
+                    && request.pull.is_some_and(|number| {
+                        mirror
+                            .try_resolve(&format!("refs/pull/{number}/head"))
+                            .is_some()
+                    });
+            }
+            if !refspecs.is_empty() {
+                fetch_or_fall_back(
+                    &mirror,
+                    &url,
+                    "origin",
+                    &refspecs,
+                    "fetching what the range needs",
+                    held,
+                    format!("fetching the range's refs from {url}"),
+                )?;
+            }
         }
+        // No `origin` and a pull request means nowhere to fetch it from. A range alone
+        // keeps reading the mirror as it stands, which is what it has always done.
+        Err(err) if pull_ref.is_some() => {
+            return Err(err).context(format!(
+                "the mirror records no `origin`, so there is nowhere to fetch the pull request \
+                 from.\nRun `{}` first.",
+                skot("sync")
+            ));
+        }
+        Err(_) => {}
     }
 
     if let Some(source) = args.repo.as_deref() {
@@ -280,25 +307,6 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
             "fetching the source repository",
             held,
             format!("fetching from {source}"),
-        )?;
-    }
-    if let Some(number) = request.pull {
-        let url = mirror.remote_url().context(format!(
-            "the mirror records no `origin`, so there is nowhere to fetch the pull request \
-             from.\nRun `{}` first.",
-            skot("sync")
-        ))?;
-        let held = mirror
-            .try_resolve(&format!("refs/pull/{number}/head"))
-            .is_some();
-        fetch_or_fall_back(
-            &mirror,
-            &url,
-            "origin",
-            &[format!("+refs/pull/{number}/head:refs/pull/{number}/head")],
-            &format!("fetching pull request {number}"),
-            held,
-            format!("fetching `refs/pull/{number}/head` from {url}"),
         )?;
     }
 
@@ -1863,6 +1871,34 @@ mod tests {
         assert!(
             text.contains("X-Skot-Import: pr:7 "),
             "the patch must record where it came from:\n{text}"
+        );
+    }
+
+    #[test]
+    fn an_offline_pull_request_import_falls_back_on_the_mirror() {
+        // The shape `--offline` leaves: the mirror already holds the base and the pull
+        // request, the origin names a network transport, and neither fetch is allowed
+        // to happen. The import still answers, from what is on disk.
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, _sha) = pull_request_source(tmp.path());
+        let layout = synced_project(tmp.path(), &source);
+        let request = ImportArgs {
+            at: None,
+            pr: Some(7),
+            ..args(None)
+        };
+        import(&layout, &request).unwrap();
+        git2::Repository::open_bare(layout.mirror_dir())
+            .unwrap()
+            .remote_set_url("origin", "https://example.invalid/upstream.git")
+            .unwrap();
+
+        let done = import(&layout.with_offline(true), &request).unwrap();
+
+        assert_eq!(
+            done.outcome,
+            Outcome::Unchanged,
+            "the mirror held everything, so nothing needed asking"
         );
     }
 

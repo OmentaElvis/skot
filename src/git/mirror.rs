@@ -2,11 +2,13 @@
 //!
 //! This is the only thing in skot that touches the network. Everything else reads
 //! from it, which is what makes `check` and `status` work offline and cost seconds
-//! rather than minutes.
+//! rather than minutes. Being the only thing, it is also where `--offline` is kept:
+//! a fetch from a remote transport is refused here, before anything connects, and a
+//! local directory or the mirror already on disk keeps working.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use log::debug;
 
 use super::{Sha, resolve_ref};
@@ -20,6 +22,9 @@ use crate::ui;
 pub struct Mirror {
     repo: git2::Repository,
     path: PathBuf,
+    /// Whether this run promised not to use the network, read from the layout the
+    /// mirror was opened with.
+    offline: bool,
 }
 
 impl Mirror {
@@ -29,7 +34,11 @@ impl Mirror {
         let repo = git2::Repository::open_bare(&path)
             .context(format!("opening the mirror at {}", path.display()))?;
 
-        Ok(Self { repo, path })
+        Ok(Self {
+            repo,
+            path,
+            offline: layout.offline(),
+        })
     }
 
     /// Open the mirror, creating it from `url` if it is not there yet.
@@ -37,10 +46,18 @@ impl Mirror {
         if layout.mirror_dir().join("HEAD").is_file() {
             return Self::open(layout);
         }
-        let repo = Self::fetch(url, &layout.mirror_dir(), ref_name, "fetching upstream")?;
+        let offline = layout.offline();
+        let repo = Self::fetch(
+            url,
+            &layout.mirror_dir(),
+            ref_name,
+            "fetching upstream",
+            offline,
+        )?;
         Ok(Self {
             repo,
             path: layout.mirror_dir(),
+            offline,
         })
     }
 
@@ -55,7 +72,14 @@ impl Mirror {
             Ok(url) => url,
             Err(err) => fallback.map(str::to_owned).ok_or(err)?,
         };
-        Self::fetch(&url, &self.path, ref_name, "fetching upstream").map(|_| ())
+        Self::fetch(
+            &url,
+            &self.path,
+            ref_name,
+            "fetching upstream",
+            self.offline,
+        )
+        .map(|_| ())
     }
 
     /// Fetch `refspecs` from `url` through the mirror's remote called `remote_name`,
@@ -79,7 +103,17 @@ impl Mirror {
         message: &str,
         depth: i32,
     ) -> Result<()> {
-        Self::transfer(url, &self.path, remote_name, refspecs, message, None, depth).map(|_| ())
+        Self::transfer(
+            url,
+            &self.path,
+            remote_name,
+            refspecs,
+            message,
+            None,
+            depth,
+            self.offline,
+        )
+        .map(|_| ())
     }
 
     /// Whether the mirror holds truncated history: a shallow fetch over a network
@@ -101,6 +135,7 @@ impl Mirror {
         path: &Path,
         ref_name: Option<&str>,
         message: &str,
+        offline: bool,
     ) -> Result<git2::Repository> {
         // Take the ref you are working on and nothing else. The mirror is a cache, not a
         // clone: a ref that a later command needs is fetched when it is asked for
@@ -144,10 +179,17 @@ impl Mirror {
             message,
             ref_name,
             FETCH_DEPTH,
+            offline,
         )
     }
 
     /// The one network call, shared by the initial fetch, every later `sync`, and `import`.
+    ///
+    /// Every byte skot transfers to or from a remote passes through here, which is what
+    /// makes this the place for two things that must not be per command: `--offline` is
+    /// checked at the door below, before anything connects or is written, and a
+    /// staleness probe (does the upstream have anything this mirror lacks?) would sit
+    /// beside the fetch when it is wanted, one call instead of one per command.
     ///
     /// There is deliberately no `RepoBuilder::clone` shortcut for a mirror that does not exist
     /// yet. `clone` takes its refspecs from the remote's config, which means the first
@@ -161,6 +203,9 @@ impl Mirror {
     /// the spinner is drawn is decided where a spinner is made, from the process's own
     /// situation (`--json`, not a terminal) — not handed in as an instruction from a caller.
     /// See `ui::Spinner`.
+    // One network function on purpose, so the arguments are its whole shape: a struct
+    // would name the same eight values one indirection further away.
+    #[allow(clippy::too_many_arguments)]
     fn transfer(
         url: &str,
         path: &Path,
@@ -169,7 +214,16 @@ impl Mirror {
         message: &str,
         wanted: Option<&str>,
         depth: i32,
+        offline: bool,
     ) -> Result<git2::Repository> {
+        // Before the repo, before the spinner: `--offline` promised no connection, so
+        // the refusal costs nothing and leaves nothing half-written behind it.
+        if offline && !is_local_url(url) {
+            bail!(
+                "`--offline`, so {url} is not being contacted.\n\
+                 Drop `--offline` for this run, or serve the source from a local directory."
+            );
+        }
         let repo = if path.join("HEAD").is_file() {
             git2::Repository::open_bare(path)
                 .context(format!("opening the mirror at {}", path.display()))?

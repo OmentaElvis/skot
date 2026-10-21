@@ -40,6 +40,12 @@ pub struct Layout {
     series: String,
     /// Whether each series owns its sandbox worktree (`sandbox.per-series` in the config).
     per_series_sandbox: bool,
+    /// Whether this run refreshes the fetch path even when the mirror has the ref
+    /// (`--refresh`). On the layout, like the series, so every work function sees it
+    /// without each command threading a flag through to the fetch.
+    refresh: bool,
+    /// Whether this run refuses the network (`--offline`). See [`Layout::offline`].
+    offline: bool,
 }
 
 impl Layout {
@@ -55,6 +61,8 @@ impl Layout {
             root: root.into(),
             series: DEFAULT_SERIES.to_owned(),
             per_series_sandbox: false,
+            refresh: false,
+            offline: false,
         }
     }
 
@@ -94,6 +102,36 @@ impl Layout {
             per_series_sandbox: per_series,
             ..self.clone()
         }
+    }
+
+    /// The same layout, asking this run to refresh the fetch path (`--refresh`).
+    pub fn with_refresh(&self, refresh: bool) -> Self {
+        Self {
+            refresh,
+            ..self.clone()
+        }
+    }
+
+    /// The same layout, refusing this run the network (`--offline`).
+    ///
+    /// The mirror already on disk keeps answering, and a fetch from a local directory is
+    /// still allowed; anything a remote transport would carry is refused at the one place
+    /// skot touches the network, before anything connects or is written.
+    pub fn with_offline(&self, offline: bool) -> Self {
+        Self {
+            offline,
+            ..self.clone()
+        }
+    }
+
+    /// Whether the fetch path refreshes even when the mirror already has the ref.
+    pub fn refresh(&self) -> bool {
+        self.refresh
+    }
+
+    /// Whether this run refuses the network. See [`Layout::with_offline`].
+    pub fn offline(&self) -> bool {
+        self.offline
     }
 
     pub fn root(&self) -> &Path {
