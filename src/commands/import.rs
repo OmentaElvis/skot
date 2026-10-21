@@ -721,10 +721,17 @@ fn fetch_or_fall_back(
     match mirror.fetch_refspecs(url, remote_name, refspecs, message, i32::MAX) {
         Ok(()) => Ok(()),
         Err(fetch_err) if held => {
+            // Two facts, two lines: the upstream is unreachable, and what skot does
+            // about it. The fetch's own diagnosis names the failed fetch, so the
+            // root cause is quoted rather than that wrapper.
             warn!(
                 target: "import",
-                "the upstream at {url} could not be reached; using the mirror as it \
-                 stands: {fetch_err}"
+                "the upstream at {url} could not be reached: {}",
+                fetch_err.root_cause()
+            );
+            warn!(
+                target: "import",
+                "using the local mirror as it stands"
             );
             Ok(())
         }

@@ -159,10 +159,12 @@ pub enum PatchCommand {
     #[command(visible_alias = "rm")]
     Drop(DropArgs),
 
-    /// Copy a patch file from another series into this one.
+    /// Copy a patch file between series, in either direction.
     ///
-    /// The patch keeps its name and lands at the end of the series, or wherever `--at`
-    /// puts it. What it does on this series' base is `skot check`'s answer to give.
+    /// `--into <series>` takes the patch from the active series to another;
+    /// `--from <series>` brings one across into the active series. The patch keeps
+    /// its name and lands at the end of the series, or wherever `--at` puts it. What
+    /// it does on the target's base is `skot check`'s answer to give.
     Copy(PatchCopyArgs),
 }
 
@@ -258,15 +260,24 @@ pub struct SeriesRenameArgs {
     pub name: String,
 }
 
-/// `skot patch copy <patch> --from <series>`.
+/// `skot patch copy <patch> --into <series>`, or `--from <series>` the other way.
 #[derive(Debug, Clone, Args)]
 pub struct PatchCopyArgs {
     /// Patch to copy, named as it is in the source series.
     pub patch: String,
 
-    /// Series to copy the patch from.
+    /// Series to copy the patch from; the patch lands in the active series.
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with = "into",
+        required_unless_present = "into"
+    )]
+    pub from: Option<String>,
+
+    /// Series to copy the patch into; the patch comes from the active series.
     #[arg(long, value_name = "NAME")]
-    pub from: String,
+    pub into: Option<String>,
 
     /// Where to put it: a position in the series, counting from 1. The end, by default.
     #[arg(long, value_name = "N")]
@@ -462,7 +473,7 @@ pub struct CheckArgs {
     pub applied: bool,
 
     /// Report every patch, not just the ones that failed.
-    #[arg(long, short = 'q', conflicts_with = "first_only")]
+    #[arg(long, short = 'a', conflicts_with = "first_only")]
     pub all: bool,
 
     /// Stop at the first failing patch. The default.
@@ -698,8 +709,11 @@ pub struct EditArgs {
     pub base: Option<String>,
 
     /// Discard the unsaved changes in the work area and start over from the patch.
+    ///
+    /// Deliberately not `--yes`: the global `-y` skips confirmations, while this one
+    /// throws work away, and one flag should not mean both.
     #[arg(long)]
-    pub yes: bool,
+    pub discard: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -745,7 +759,11 @@ pub struct MoveArgs {
 
     /// Where the patch should end up: a 1-based position, or an existing patch to land
     /// before (by name or prefix). Left out, the new position is asked for.
-    #[arg(long, value_name = "PATCH|N")]
+    #[arg(value_name = "PATCH|N", conflicts_with = "to")]
+    pub dest: Option<String>,
+
+    /// Same as the destination argument, spelled as a flag.
+    #[arg(long, value_name = "PATCH|N", hide = true)]
     pub to: Option<String>,
 }
 

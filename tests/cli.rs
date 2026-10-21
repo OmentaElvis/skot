@@ -731,11 +731,13 @@ fn patch_show_json_carries_the_text_and_the_counts() {
     let out = skot(tmp.path(), &["patch", "show", "a.patch", "--json"]);
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(doc["series_name"], "default");
     let patch = &doc["patches"][0];
     assert_eq!(patch["text"], patch_one());
     assert_eq!(patch["added"], 1);
     assert_eq!(patch["removed"], 1);
     assert_eq!(patch["enabled"], true);
+    assert_eq!(patch["position"], 1);
 }
 
 #[test]
@@ -747,4 +749,42 @@ fn patch_show_without_a_name_needs_an_open_work_area() {
     let out = skot(tmp.path(), &["patch", "show"]);
     assert_ne!(out.status.code(), Some(0), "stdout: {}", stdout(&out));
     assert!(stderr(&out).contains("name the patch"), "{}", stderr(&out));
+}
+
+/// Under `--json` a failure is a document, not a swallowed log line: the logger is
+/// off (stdout carries the machine's output), so without this an agent would learn
+/// only "exit 1". This is the highest-impact bug every evaluation hit.
+#[test]
+fn a_json_failure_is_one_document_with_the_advice() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = bare_project(tmp.path());
+    write_series(&layout, "a.patch", patch_one());
+
+    let out = skot(tmp.path(), &["patch", "show", "nope", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    let doc: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("stdout is one JSON document: {err}: {text}"));
+    assert_eq!(doc["ok"], serde_json::json!(false));
+    let message = doc["error"].as_str().expect("the message is a string");
+    assert!(message.contains("nope"), "{message}");
+}
+
+/// A question only a flag can answer is a usage error (exit 2) in human mode; under
+/// `--json` it is the same envelope, so the refusal is still readable by a script.
+#[test]
+fn a_json_usage_error_is_a_document_and_exits_two() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = bare_project(tmp.path());
+    write_series(&layout, "a.patch", patch_one());
+
+    // No name and no terminal: `move` cannot ask which patch to move.
+    let out = skot(tmp.path(), &["patch", "move", "--json"]);
+    assert_eq!(out.status.code(), Some(2), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    let doc: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|err| panic!("stdout is one JSON document: {err}: {text}"));
+    assert_eq!(doc["ok"], serde_json::json!(false));
+    let message = doc["error"].as_str().expect("the message is a string");
+    assert!(message.contains("answer it with"), "{message}");
 }

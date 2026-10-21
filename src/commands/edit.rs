@@ -11,7 +11,7 @@
 //! - A work area that already exists is never reopened. Opening means *resetting* to the
 //!   recorded base, which is exactly the thing that would throw away the edits the user
 //!   came back for, so `edit` on a work area with unsaved changes reports that and stops.
-//!   `--yes` is the informed override: discard the unsaved changes and start over.
+//!   `--discard` is the informed override: throw the unsaved changes away and start over.
 //! - A work area that matches its patch is not a complaint, it is just where the user was.
 //!   `edit` returns to it without ceremony: being clean costs nothing, and it is what
 //!   every freshly opened work area looks like before the first change.
@@ -31,7 +31,7 @@ use crate::state::State;
 
 pub fn run(ctx: &Ctx, args: &EditArgs) -> Result<Exit> {
     let (session, opened, discarded) =
-        open(&ctx.layout, &args.patch, args.base.as_deref(), args.yes)?;
+        open(&ctx.layout, &args.patch, args.base.as_deref(), args.discard)?;
     let dir = session.dir_path(&ctx.layout)?;
 
     if ctx.cli.json {
@@ -81,7 +81,7 @@ fn open(
     layout: &Layout,
     patch: &str,
     base: Option<&str>,
-    yes: bool,
+    discard: bool,
 ) -> Result<(Session, bool, bool)> {
     let _lock = layout.lock()?;
     let manifest = session::reconcile(layout)?;
@@ -91,13 +91,13 @@ fn open(
             // Matches the patch: not a complaint, just where the user was. Return to it.
             return Ok((existing.clone(), false, false));
         }
-        if !yes {
+        if !discard {
             bail!(
                 "{} has unsaved changes.\n\
                  `{}` saves them; `{}` discards them and starts over.",
                 existing.patch,
                 skot_args("save", &existing.patch),
-                skot_args("edit", &format!("--yes {patch}"))
+                skot_args("edit", &format!("--discard {patch}"))
             );
         }
         // The informed override. `end` takes the worktree and the record; the patch file
@@ -385,8 +385,16 @@ mod tests {
         };
         assert_eq!(args.patch, "a.patch");
         assert!(args.base.is_none());
-        assert!(!args.yes);
+        assert!(!args.discard);
         assert!(Cli::try_parse_from(["skot", "patch", "edit", "x", "--base", "v2"]).is_ok());
-        assert!(Cli::try_parse_from(["skot", "patch", "edit", "x", "--yes"]).is_ok());
+        assert!(Cli::try_parse_from(["skot", "patch", "edit", "x", "--discard"]).is_ok());
+        let cli = Cli::try_parse_from(["skot", "patch", "edit", "x", "--yes"]).unwrap();
+        let Command::Patch(PatchCommand::Edit(args)) = cli.command else {
+            panic!("expected edit")
+        };
+        assert!(
+            !args.discard,
+            "the global --yes skips questions; it no longer doubles as a discard"
+        );
     }
 }

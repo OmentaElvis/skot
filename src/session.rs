@@ -424,7 +424,7 @@ pub fn open(layout: &Layout, session: &Session) -> Result<git2::Repository> {
 ///
 /// What goes is the worktree, not the patch: the file and the series line stay exactly as
 /// they are. Anything the worktree held that was never saved goes with it, which is why
-/// `edit` checks for exactly that first and why `--yes` is the thing that overrides it.
+/// `edit` checks for exactly that first and why `--discard` is the thing that overrides it.
 /// The manifest is written last, so an interrupted end leaves a record that still points
 /// at a worktree (recognised, retried) rather than a directory nobody owns (deleted as a
 /// husk, edits and all).

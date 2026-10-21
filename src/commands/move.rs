@@ -6,10 +6,12 @@
 //! set is a tree the sandbox is holding, and reordering what it is made of would make
 //! the next apply disagree with what is on disk, so `skot patch pop` puts it down first.
 //!
-//! The destination is a final position (`--to 3` means "become the third patch"), or an
-//! existing patch name to land before. Left unnamed, the patch is picked from a list and
-//! the position is typed: positions are what `patch list` shows and what the series
-//! holds, and a script gets told to name both rather than a default it did not ask for.
+//! The destination is a second argument: a final position (`move a.patch 3` means
+//! "become the third patch"), or an existing patch name to land before. `--to` spells
+//! the same destination as a flag for the scripts that were written before the
+//! argument existed. Left unnamed, the patch is picked from a list and the position
+//! is typed: positions are what `patch list` shows and what the series holds, and a
+//! script gets told to name both rather than a default it did not ask for.
 
 use anyhow::{Context, Result, bail};
 use log::info;
@@ -65,7 +67,7 @@ pub fn run(ctx: &Ctx, args: &MoveArgs) -> Result<Exit> {
     let from = resolve_position(&names, &universe, &want)?;
     let name = names[from].clone();
 
-    let to = match &args.to {
+    let to = match args.dest.as_ref().or(args.to.as_ref()) {
         Some(at) => resolve_destination(&names, at, &name)?,
         None => ask_position(&asker, &names, &name)?,
     };
@@ -76,7 +78,9 @@ pub fn run(ctx: &Ctx, args: &MoveArgs) -> Result<Exit> {
             "{name} is already at position {}; nothing moved",
             from + 1
         );
-        return Ok(Exit::Failure);
+        // The state asked for holds, so this is a success the way `enable` on an
+        // enabled patch is: a script must not read "already so" as a failure.
+        return Ok(Exit::Success);
     }
 
     let moved = relocate(&ctx.layout, &name, to)?;
@@ -151,12 +155,12 @@ fn resolve_position(names: &[String], all: &[&str], want: &str) -> Result<usize>
     })
 }
 
-/// Resolve `--to`: a 1-based final position, or the name (or prefix) of an enabled
-/// patch to land before.
+/// Resolve the destination: a 1-based final position, or the name (or prefix) of an
+/// enabled patch to land before.
 fn resolve_destination(names: &[String], at: &str, moving: &str) -> Result<usize> {
     if let Ok(position) = at.parse::<usize>() {
         if position == 0 {
-            bail!("positions are 1-based: `--to 1` is the front of the series");
+            bail!("positions are 1-based: position 1 is the front of the series");
         }
         if position > names.len() {
             bail!(
@@ -205,7 +209,7 @@ fn pick_patch(asker: &Asker, names: &[String], applied: &[String]) -> Result<Str
         "Which patch to move",
         Some("A patch that is applied cannot move; pop it first."),
         labels,
-        Fallback::Flag(skot_args("move", "<patch> --to <patch|N>")),
+        Fallback::Flag(skot_args("move", "<patch> <patch|N>")),
         None,
         None,
     )?;
@@ -229,7 +233,7 @@ fn ask_position(asker: &Asker, names: &[String], moving: &str) -> Result<usize> 
     let answer = asker.text_validated(
         &question,
         Some("The number the patch should have after the move. Esc cancels."),
-        Fallback::Flag(skot_args("move", "<patch> --to <patch|N>")),
+        Fallback::Flag(skot_args("move", "<patch> <patch|N>")),
         move |input: &str| parse_position(input, count).map(|_| ()),
     )?;
     Ok(parse_position(&answer, count).expect("the validator admitted this") - 1)
@@ -441,7 +445,57 @@ mod tests {
             &ctx,
             &MoveArgs {
                 patch: Some("a.patch".to_owned()),
+                dest: None,
                 to: Some("3".to_owned()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(exit, Exit::Success);
+        drop(tmp);
+    }
+
+    #[test]
+    fn a_move_to_where_the_patch_already_is_is_a_success() {
+        let (tmp, layout) = three_patches();
+        let cli = Cli::try_parse_from(["skot", "patch", "move", "a.patch", "1"]).unwrap();
+        let ctx = Ctx {
+            layout,
+            cli,
+            yes: false,
+        };
+
+        // Already there: the state asked for holds, so a script must see success.
+        let exit = run(
+            &ctx,
+            &MoveArgs {
+                patch: Some("a.patch".to_owned()),
+                dest: Some("1".to_owned()),
+                to: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(exit, Exit::Success);
+        drop(tmp);
+    }
+
+    #[test]
+    fn the_destination_is_the_second_argument() {
+        let (tmp, layout) = three_patches();
+        let cli = Cli::try_parse_from(["skot", "patch", "move", "a.patch", "3"]).unwrap();
+        let ctx = Ctx {
+            layout,
+            cli,
+            yes: false,
+        };
+
+        let exit = run(
+            &ctx,
+            &MoveArgs {
+                patch: Some("a.patch".to_owned()),
+                dest: Some("3".to_owned()),
+                to: None,
             },
         )
         .unwrap();
@@ -466,6 +520,7 @@ mod tests {
             &ctx,
             &MoveArgs {
                 patch: None,
+                dest: None,
                 to: None,
             },
         )
@@ -474,7 +529,7 @@ mod tests {
 
         assert!(err.contains("cannot ask"), "{err}");
         assert!(
-            err.contains(&skot_args("move", "<patch> --to <patch|N>")),
+            err.contains(&skot_args("move", "<patch> <patch|N>")),
             "{err}"
         );
         drop(tmp);

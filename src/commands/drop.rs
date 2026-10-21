@@ -207,8 +207,7 @@ fn confirmed(ctx: &Ctx, name: &str, work_area: Option<&session::Session>) -> Res
         ),
         None => (
             format!("Drop {name} and delete its file?"),
-            "Its line leaves the series; every other patch keeps its name and its place. \
-             Esc keeps it.",
+            "Nothing else moves; only this patch and its file go. Esc keeps it.",
         ),
     };
     Ok(ctx.asker().confirm(

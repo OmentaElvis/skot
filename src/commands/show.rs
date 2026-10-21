@@ -24,7 +24,6 @@ use crate::ui::{Styled, stdout_is_terminal};
 struct Chosen {
     name: String,
     path: std::path::PathBuf,
-    line: usize,
     series: String,
     /// 1-based among the enabled patches; `None` for a disabled one.
     position: Option<usize>,
@@ -76,9 +75,9 @@ fn emit(ctx: &Ctx, args: &ShowArgs, out: &mut dyn Write, tty: bool) -> Result<Ex
         if ctx.cli.json {
             documents.push(json!({
                 "name": picked.name,
-                "series": picked.series,
-                "index": picked.position.map(|p| p - 1),
-                "line": picked.line,
+                // The series is the document's own business, not each patch's; the
+                // position is 1-based the way every other command counts.
+                "position": picked.position,
                 "enabled": picked.enabled,
                 "applied": picked.applied,
                 "work_area": picked.work_area.as_ref().map(|p| p.display().to_string()),
@@ -117,7 +116,9 @@ fn emit(ctx: &Ctx, args: &ShowArgs, out: &mut dyn Write, tty: bool) -> Result<Ex
             out,
             "{}",
             serde_json::to_string_pretty(&json!({
-                "series": series.path().display().to_string(),
+                // The same word the other inspect commands use for the series name, so
+                // a script reads one meaning out of every document it holds.
+                "series_name": ctx.layout.series(),
                 "patches": documents,
             }))?
         )?;
@@ -194,7 +195,6 @@ fn one(
         return Ok(Chosen {
             name: entry.name.clone(),
             path: entry.path.clone(),
-            line: entry.line,
             series: ctx.layout.series().to_owned(),
             position: Some(position + 1),
             total: entries.len(),
@@ -204,11 +204,10 @@ fn one(
             unsaved,
         });
     }
-    if let Some((line, _)) = disabled.iter().find(|(_, n)| n == name) {
+    if let Some((_, _)) = disabled.iter().find(|(_, n)| n == name) {
         return Ok(Chosen {
             name: name.to_owned(),
             path: ctx.layout.patches_dir().join(name),
-            line: *line,
             series: ctx.layout.series().to_owned(),
             position: None,
             total: entries.len(),
@@ -731,13 +730,14 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let patch = &doc["patches"][0];
         assert_eq!(patch["name"], "a.patch");
+        assert_eq!(doc["series_name"], "default");
         assert_eq!(patch["text"], PATCH);
         assert_eq!(patch["added"], 1);
         assert_eq!(patch["removed"], 1);
         assert_eq!(patch["files"][0]["path"], "f.txt");
         assert_eq!(patch["enabled"], true);
         assert_eq!(patch["applied"], false);
-        assert_eq!(patch["index"], 0);
+        assert_eq!(patch["position"], 1);
     }
 
     #[test]

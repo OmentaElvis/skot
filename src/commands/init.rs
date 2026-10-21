@@ -184,7 +184,8 @@ fn scaffold(layout: &Layout, plan: &Plan) -> Result<()> {
     }
     // Whole lines only: `build = ""` is a substring of both `pre-build = ""` and
     // `post-build = ""`, so a bare substring replace would write one answer over every
-    // slot whose name ends in it.
+    // slot whose name ends in it. The slots with no answer are commented out rather than
+    // left as empty strings: an uncommented `build = ""` parses as a real, empty build.
     let filled: Vec<(String, String)> = plan
         .hooks
         .iter()
@@ -195,6 +196,7 @@ fn scaffold(layout: &Layout, plan: &Plan) -> Result<()> {
         .map(
             |line| match filled.iter().find(|(wanted, _)| line == wanted) {
                 Some((_, replacement)) => replacement.clone(),
+                None if line.ends_with("= \"\"") => format!("# {line}"),
                 None => line.to_owned(),
             },
         )
@@ -696,13 +698,17 @@ mod tests {
         assert_eq!(parsed.hooks.build.as_deref(), Some("make"));
         assert_eq!(
             parsed.hooks.post_build.as_deref(),
-            Some(""),
+            None,
             "one answer must not plaster itself over the slots it is a substring of"
         );
         assert_eq!(
             parsed.hooks.pre_sync.as_deref(),
-            Some(""),
-            "the hooks that were not asked about keep their empty line"
+            None,
+            "the hooks that were not asked about are commented out, not empty strings"
+        );
+        assert!(
+            written.contains("# post-build = \"\""),
+            "an unconfigured hook is still there to be noticed: {written}"
         );
     }
 

@@ -22,6 +22,9 @@ fn main() -> ExitCode {
 
     // The one place a command's verdict becomes a process status. `Err` is a
     // malfunction and says so on stderr; `Exit` is a command that ran and answered.
+    // Under `--json` the verdict goes to stdout as one document either way: the
+    // logger is off (stdout is carrying a machine's output), so a failure that only
+    // logged would vanish, and an agent would learn nothing but the exit code.
     match run(&cli) {
         Ok(Exit::Success) => ExitCode::SUCCESS,
         Ok(Exit::Failure) => ExitCode::FAILURE,
@@ -38,7 +41,16 @@ fn main() -> ExitCode {
                         _ => None,
                     });
             if let Some((question, instead)) = no_answer {
+                if cli.json {
+                    return json_failure(
+                        &format!("cannot ask {question} here; answer it with: {instead}"),
+                        2,
+                    );
+                }
                 return usage_error(&path, question, instead);
+            }
+            if cli.json {
+                return json_failure(&format!("{err:?}"), 1);
             }
             log::error!("Error: {:?}", err);
             for cause in err.chain().skip(1) {
@@ -47,6 +59,21 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// A failure under `--json`: one document on stdout, and the exit code the failure
+/// would have had in human mode (1 for a malfunction, 2 for a usage error).
+///
+/// The message is the same text a person would have seen, causes included: an agent
+/// is owed the advice, not just the verdict.
+fn json_failure(message: &str, code: u8) -> ExitCode {
+    use std::io::Write as _;
+
+    let doc = serde_json::json!({ "ok": false, "error": message });
+    // Best effort: a stdout that cannot take the document cannot be reported to
+    // either, and the exit code is the answer that survives.
+    let _ = writeln!(std::io::stdout(), "{doc}");
+    ExitCode::from(code)
 }
 
 /// A question nobody could answer, printed the way clap refuses a missing flag: the

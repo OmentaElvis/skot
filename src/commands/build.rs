@@ -102,7 +102,10 @@ pub fn run(ctx: &Ctx, args: &BuildArgs) -> Result<Exit> {
                 "selected_phases": phases.iter().map(|p| p.name()).collect::<Vec<_>>(),
                 "error": format!("{e:#}"),
             }))?;
-            return Err(e);
+            // The document is the report, so the verdict is an exit code rather than
+            // another error: `main` would otherwise append a second document.
+            debug!(target: "build", "failed: {e:#}");
+            return Ok(Exit::Failure);
         }
         Err(e) => return Err(e),
     };

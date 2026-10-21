@@ -91,7 +91,10 @@ fn print_series(layout: &Layout, series: Option<&crate::series::Series>, applied
     report::section(&format!("series {} ({})", layout.series(), entries.len()));
     report::field(
         "base",
-        layout.base_ref().as_deref().unwrap_or("(not recorded)"),
+        layout.base_ref().as_deref().unwrap_or(
+            // Not an error: a fresh project has no base until something records one.
+            "(not recorded: building records it)",
+        ),
     );
     for (i, entry) in entries.iter().enumerate() {
         // `!` (not on disk) outranks `[x]`: a patch cannot be on if its file is gone. The
@@ -218,12 +221,9 @@ fn print_config(config: Option<&crate::config::Config>, layout: &Layout) {
         None => report::field("upstream", &report::absent("not set")),
     }
     report::field("policy", &config.sandbox.policy.to_string());
-    if config.sandbox.keep.is_empty() {
-        report::note(&format!(
-            "{} no keep globs: dependency state will not survive a reset",
-            report::warn("warning:")
-        ));
-    } else {
+    // No keep globs is the normal shape for a project with nothing to protect, not a
+    // problem to warn about: an untracked cache already survives a reset on its own.
+    if !config.sandbox.keep.is_empty() {
         report::field("keep", &config.sandbox.keep.join(" "));
     }
     let hooks = config.configured_hooks();
