@@ -13,7 +13,7 @@ use log::{debug, error, info};
 
 use crate::cli::{
     SeriesArgs, SeriesCommand, SeriesCopyArgs, SeriesCreateArgs, SeriesDropArgs, SeriesRenameArgs,
-    SeriesUndoArgs, SeriesUseArgs,
+    SeriesSwitchArgs, SeriesUndoArgs,
 };
 use crate::commands::apply::Applied;
 use crate::commands::{Ctx, Exit, apply, emit_json};
@@ -32,7 +32,7 @@ pub fn run(ctx: &Ctx, args: &SeriesArgs) -> Result<Exit> {
     match &args.command {
         None => list(ctx),
         Some(SeriesCommand::Create(args)) => create(ctx, args),
-        Some(SeriesCommand::Use(args)) => use_(ctx, args),
+        Some(SeriesCommand::Switch(args)) => switch(ctx, args),
         Some(SeriesCommand::Copy(args)) => copy(ctx, args),
         Some(SeriesCommand::Undo(args)) => undo(ctx, args),
         Some(SeriesCommand::Drop(args)) => drop_series(ctx, args),
@@ -120,7 +120,7 @@ fn create(ctx: &Ctx, args: &SeriesCreateArgs) -> Result<Exit> {
         bail!(
             "the series `{}` already exists.\n`{}` switches to it.",
             args.name,
-            skot_args("series", &format!("use {}", args.name))
+            skot_args("series", &format!("switch {}", args.name))
         );
     }
     refuse_case_clash(&ctx.layout, &args.name)?;
@@ -243,8 +243,8 @@ fn copy_series_files(source: &Layout, target: &Layout) -> Result<usize> {
     Ok(count)
 }
 
-/// `skot series use <name>`: point everything at another series.
-fn use_(ctx: &Ctx, args: &SeriesUseArgs) -> Result<Exit> {
+/// `skot series switch <name>`: point everything at another series.
+fn switch(ctx: &Ctx, args: &SeriesSwitchArgs) -> Result<Exit> {
     let target = ctx.layout.with_series(&args.name)?;
     if !target.patches_dir().is_dir() {
         bail!(
@@ -257,7 +257,7 @@ fn use_(ctx: &Ctx, args: &SeriesUseArgs) -> Result<Exit> {
 
     let mut state = State::load(&ctx.layout)?;
     // The pointer decides "already there", not this run's resolution: with the
-    // pointer lost, `series use` is the command that records it again, and it must
+    // pointer lost, `series switch` is the command that records it again, and it must
     // not talk its way out of that.
     if state.active_series() == Some(args.name.as_str()) {
         // Already there. Rebuilding the sandbox would redo work for nothing, and a
@@ -329,7 +329,7 @@ fn copy(ctx: &Ctx, args: &SeriesCopyArgs) -> Result<Exit> {
         bail!(
             "the series `{}` already exists.\n`{}` switches to it.",
             args.name,
-            skot_args("series", &format!("use {}", args.name))
+            skot_args("series", &format!("switch {}", args.name))
         );
     }
     refuse_case_clash(&ctx.layout, &args.name)?;
@@ -357,7 +357,7 @@ fn copy(ctx: &Ctx, args: &SeriesCopyArgs) -> Result<Exit> {
         );
         Hints::new("next")
             .entry(
-                skot_args("series", &format!("use {}", args.name)),
+                skot_args("series", &format!("switch {}", args.name)),
                 "switch to the copy when you want it",
             )
             .print();
@@ -447,7 +447,7 @@ fn drop_series(ctx: &Ctx, args: &SeriesDropArgs) -> Result<Exit> {
             skot("series")
         );
     }
-    // The pointer decides "active", the same way `series use` reads it: with the
+    // The pointer decides "active", the same way `series switch` reads it: with the
     // pointer lost, this run's resolution is a guess and a guess cannot decide a delete.
     let active = State::load(&ctx.layout)
         .ok()
@@ -458,7 +458,7 @@ fn drop_series(ctx: &Ctx, args: &SeriesDropArgs) -> Result<Exit> {
             "`{}` is the active series, so skot will not remove it.\n\
              `{}` to another series first, then drop this one.",
             args.name,
-            skot_args("series", "use <name>")
+            skot_args("series", "switch <name>")
         );
     }
 
@@ -585,7 +585,7 @@ fn rename(ctx: &Ctx, args: &SeriesRenameArgs) -> Result<Exit> {
             "the series `{}` already exists.\n`{}` switches to it; to replace it, \
              `{}` first.",
             args.name,
-            skot_args("series", &format!("use {}", args.name)),
+            skot_args("series", &format!("switch {}", args.name)),
             skot_args("series", &format!("drop {}", args.name))
         );
     }
@@ -862,7 +862,7 @@ mod tests {
     use super::*;
     use crate::cli::{
         Cli, SeriesCommand, SeriesCopyArgs, SeriesCreateArgs, SeriesDropArgs, SeriesRenameArgs,
-        SeriesUseArgs,
+        SeriesSwitchArgs,
     };
     use crate::commands::testsupport::write_series;
     use crate::layout::DEFAULT_SERIES;
@@ -890,10 +890,10 @@ mod tests {
         )
     }
 
-    fn use_(ctx: &Ctx, name: &str) -> Result<Exit> {
+    fn switch(ctx: &Ctx, name: &str) -> Result<Exit> {
         call(
             ctx,
-            Some(SeriesCommand::Use(SeriesUseArgs {
+            Some(SeriesCommand::Switch(SeriesSwitchArgs {
                 name: name.to_owned(),
             })),
         )
@@ -940,7 +940,7 @@ mod tests {
         let err = create(&ctx, "exp").unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("already exists"), "got {text}");
-        assert!(text.contains("use exp"), "got {text}");
+        assert!(text.contains("switch exp"), "got {text}");
     }
 
     /// The context the next invocation would get: the pointer decides the series.
@@ -958,19 +958,19 @@ mod tests {
         create(&ctx_for(&layout), "exp").unwrap();
 
         // Back to the default, then over to exp, then again for the no-op.
-        use_(&ctx_now(&layout), DEFAULT_SERIES).unwrap();
+        switch(&ctx_now(&layout), DEFAULT_SERIES).unwrap();
         assert_eq!(
             State::load(&layout).unwrap().active_series(),
             Some(DEFAULT_SERIES)
         );
-        use_(&ctx_now(&layout), "exp").unwrap();
+        switch(&ctx_now(&layout), "exp").unwrap();
         assert_eq!(State::load(&layout).unwrap().active_series(), Some("exp"));
         assert!(matches!(
-            use_(&ctx_now(&layout), "exp").unwrap(),
+            switch(&ctx_now(&layout), "exp").unwrap(),
             Exit::Success
         ));
 
-        let err = use_(&ctx_now(&layout), "nowhere").unwrap_err();
+        let err = switch(&ctx_now(&layout), "nowhere").unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("no series `nowhere`"), "got {text}");
         assert!(text.contains(&skot("series")), "got {text}");
@@ -978,18 +978,19 @@ mod tests {
 
     #[test]
     fn switching_records_the_pointer_even_under_a_one_shot_flag() {
-        // A lost pointer is fixed by `series use`, so the command must record even
+        // A lost pointer is fixed by `series switch`, so the command must record even
         // when `--series` already named the target for this run: the no-op branch
         // answers to the pointer, not to the resolution above it.
         let (_tmp, layout) = crate::commands::testsupport::project();
         fs::create_dir_all(layout.series_root().join("exp")).unwrap();
         let ctx = Ctx {
             layout: layout.with_series("exp").unwrap(),
-            cli: Cli::try_parse_from(["skot", "--series", "exp", "series", "use", "exp"]).unwrap(),
+            cli: Cli::try_parse_from(["skot", "--series", "exp", "series", "switch", "exp"])
+                .unwrap(),
             yes: false,
         };
 
-        use_(&ctx, "exp").unwrap();
+        switch(&ctx, "exp").unwrap();
 
         assert_eq!(
             State::load(&layout).unwrap().active_series(),
@@ -1081,7 +1082,7 @@ mod tests {
         write_series(&layout.with_series("exp").unwrap(), &[("a.patch", "a\n")]);
         // Back on the default series: the pointer, not this run's layout, is what
         // decides "active" for a drop.
-        use_(
+        switch(
             &ctx_for(&layout.with_series("exp").unwrap()),
             DEFAULT_SERIES,
         )
@@ -1129,7 +1130,7 @@ mod tests {
         write_series(&layout.with_series("exp").unwrap(), &[("a.patch", "a\n")]);
         // Back on the default, so `exp` is droppable and only the question stands
         // between it and the delete.
-        use_(
+        switch(
             &ctx_for(&layout.with_series("exp").unwrap()),
             DEFAULT_SERIES,
         )
@@ -1299,7 +1300,7 @@ mod tests {
         create(&ctx, "exp").unwrap();
 
         // No mirror yet: the rebuild has nowhere to apply against.
-        use_(&ctx, DEFAULT_SERIES).unwrap();
+        switch(&ctx, DEFAULT_SERIES).unwrap();
         assert!(State::load(&layout).unwrap().sandbox(&layout).is_none());
 
         // With the sandbox policy asking to keep, a switch never rebuilds either.
@@ -1308,7 +1309,7 @@ mod tests {
             "[upstream]\nurl = \"unused\"\n[sandbox]\non-switch = \"keep\"\n",
         )
         .unwrap();
-        use_(&ctx, "exp").unwrap();
+        switch(&ctx, "exp").unwrap();
         assert!(State::load(&layout).unwrap().sandbox(&layout).is_none());
     }
 

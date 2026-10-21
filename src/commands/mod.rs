@@ -124,7 +124,7 @@ impl Ctx {
 ///
 /// A resolved name does not have to exist on disk for every command: `init` has not
 /// created the project yet and names its own series, and `series create` is about to
-/// create the series it names. `series list` and `series use` never read the current
+/// create the series it names. `series list` and `series switch` never read the current
 /// series' patches either, so for them a name is bookkeeping, and a lost pointer must
 /// not be a wall they cannot open to fix it.
 fn series_for(cli: &Cli, layout: Layout) -> Result<Layout> {
@@ -154,7 +154,7 @@ fn series_for(cli: &Cli, layout: Layout) -> Result<Layout> {
     let (needs_current, creates_current) = match &cli.command {
         Command::Init(_) => (false, true),
         Command::Series(args) => match &args.command {
-            None | Some(SeriesCommand::Use(_)) | Some(SeriesCommand::Drop(_)) => (false, false),
+            None | Some(SeriesCommand::Switch(_)) | Some(SeriesCommand::Drop(_)) => (false, false),
             Some(SeriesCommand::Create(_)) => (true, true),
             Some(SeriesCommand::Copy(_))
             | Some(SeriesCommand::Rename(_))
@@ -182,7 +182,7 @@ fn series_for(cli: &Cli, layout: Layout) -> Result<Layout> {
                          give the project a default with `series = \"<name>\"` in {}, or record \
                          the active series with `{}`.",
                         layout.config_file().display(),
-                        crate::invocation::skot_args("series", "use <name>")
+                        crate::invocation::skot_args("series", "switch <name>")
                     );
                 }
                 // For a command that does not read the series, any valid name will do
@@ -366,12 +366,12 @@ mod tests {
     #[test]
     fn listing_and_switching_survive_a_lost_pointer() {
         // They never read the current series' patches, so the wall has to come down
-        // for them: `series use` is how a lost pointer gets recorded again.
+        // for them: `series switch` is how a lost pointer gets recorded again.
         let (_tmp, layout) = crate::commands::testsupport::project();
         with_series_dirs(&layout, &["alpha", "exp"]);
 
         series_for(&cli(&["skot", "series"]), layout.clone()).unwrap();
-        series_for(&cli(&["skot", "series", "use", "exp"]), layout.clone()).unwrap();
+        series_for(&cli(&["skot", "series", "switch", "exp"]), layout.clone()).unwrap();
         series_for(&cli(&["skot", "init"]), layout).unwrap();
     }
 

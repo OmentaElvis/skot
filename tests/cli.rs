@@ -620,7 +620,7 @@ fn a_question_nothing_can_answer_is_a_usage_error() {
     std::fs::write(layout.series_file(), "a.patch\n#!b.patch\n").unwrap();
     // The pointer first: a second series without one would refuse every command for
     // ambiguity instead of reaching its question.
-    let used = skot(tmp.path(), &["series", "use", "default"]);
+    let used = skot(tmp.path(), &["series", "switch", "default"]);
     assert_eq!(used.status.code(), Some(0), "fixture: {}", stderr(&used));
     // `series drop` needs a series that is not active; `series undo` needs an undo
     // buffer, which is checked before the question is reached at all.

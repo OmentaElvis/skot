@@ -186,13 +186,13 @@ pub enum SeriesCommand {
     Create(SeriesCreateArgs),
 
     /// Switch to an existing series.
-    Use(SeriesUseArgs),
+    Switch(SeriesSwitchArgs),
 
     /// Copy a series to a new name, leaving the active one alone.
     ///
     /// A snapshot: every patch file, the list and the base, under a new name, so an
     /// experiment can be split off or a series kept as it stands. The switch is a
-    /// separate decision (`skot series use <name>`).
+    /// separate decision (`skot series switch <name>`).
     Copy(SeriesCopyArgs),
 
     /// Swap the active series with the version the last successful rebase replaced.
@@ -226,7 +226,7 @@ pub struct SeriesCreateArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-pub struct SeriesUseArgs {
+pub struct SeriesSwitchArgs {
     /// Series to switch to.
     pub name: String,
 }
@@ -590,7 +590,7 @@ pub struct RebaseArgs {
     ///
     /// The series named by `--series` stays exactly as it is: the rewritten series is
     /// built and installed as a new one, so a rebase can be tried without risking the
-    /// series it started from. The new series is not switched to; `series use` does that.
+    /// series it started from. The new series is not switched to; `series switch` does that.
     #[arg(long, value_name = "NAME")]
     pub into: Option<String>,
 }
@@ -826,14 +826,14 @@ mod tests {
         };
         assert_eq!(create.name, "exp");
 
-        let cli = Cli::try_parse_from(["skot", "series", "use", "exp"]).unwrap();
+        let cli = Cli::try_parse_from(["skot", "series", "switch", "exp"]).unwrap();
         let Command::Series(args) = cli.command else {
             panic!("expected series");
         };
-        let Some(SeriesCommand::Use(use_)) = args.command else {
-            panic!("expected series use");
+        let Some(SeriesCommand::Switch(switch)) = args.command else {
+            panic!("expected series switch");
         };
-        assert_eq!(use_.name, "exp");
+        assert_eq!(switch.name, "exp");
 
         let cli = Cli::try_parse_from(["skot", "series", "copy", "checkpoint"]).unwrap();
         let Command::Series(args) = cli.command else {
@@ -856,7 +856,7 @@ mod tests {
 
         for missing in [
             ["skot", "series", "create"],
-            ["skot", "series", "use"],
+            ["skot", "series", "switch"],
             ["skot", "series", "copy"],
         ] {
             assert!(

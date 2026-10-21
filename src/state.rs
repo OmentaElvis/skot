@@ -113,7 +113,7 @@ impl State {
         self.active_series.as_deref()
     }
 
-    /// Point commands at `series`. Written by `init`, `series create` and `series use`.
+    /// Point commands at `series`. Written by `init`, `series create` and `series switch`.
     pub fn set_active_series(&mut self, layout: &Layout, series: &str) -> Result<()> {
         self.active_series = Some(series.to_owned());
         self.save(layout)
