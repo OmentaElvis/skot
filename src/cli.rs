@@ -138,6 +138,9 @@ pub enum PatchCommand {
     #[command(visible_alias = "ls")]
     List(ListArgs),
 
+    /// Print a patch: a preview on a terminal, the exact patch bytes on a pipe.
+    Show(ShowArgs),
+
     /// Include a patch when applying (picker if none named).
     Enable(EnableArgs),
 
@@ -300,7 +303,7 @@ const PATCH_GROUPS: &[(&str, &[&str])] = &[
     ("Author", &["new", "edit", "save", "import"]),
     ("Arrange", &["enable", "disable", "move", "drop", "copy"]),
     ("Apply", &["apply", "unapply", "push", "pop"]),
-    ("Inspect", &["list"]),
+    ("Inspect", &["list", "show"]),
 ];
 
 /// clap's own description of its `help` subcommand, appended after the groups. The test
@@ -432,6 +435,16 @@ pub struct ListArgs {
     /// Also show whether each patch file exists on disk.
     #[arg(long)]
     pub paths: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ShowArgs {
+    /// Patches to print. Without names: the one open work area.
+    pub patches: Vec<String>,
+
+    /// Only the header and the per-file counts, not the diff itself.
+    #[arg(long)]
+    pub stat: bool,
 }
 
 #[derive(Debug, Clone, Args)]

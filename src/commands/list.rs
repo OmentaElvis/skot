@@ -140,7 +140,6 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
     if had_rows {
         report::section("key");
         report::field("[x]", "applied to the sandbox");
-        report::field("[x]", "applied to the sandbox");
         report::field("[ ]", "not applied");
         report::field("#", "disabled");
         report::field("(unsaved)", "unsaved work-area changes");
@@ -153,7 +152,7 @@ pub fn run(ctx: &Ctx, args: &ListArgs) -> Result<Exit> {
 ///
 /// Read-only and lockless: a missing manifest or a work area that will not open means
 /// nothing is unsaved, which is all a marker needs to know.
-fn unsaved_work_areas(layout: &crate::layout::Layout) -> Vec<String> {
+pub(crate) fn unsaved_work_areas(layout: &crate::layout::Layout) -> Vec<String> {
     session::Manifest::load(layout)
         .map(|m| {
             m.sessions

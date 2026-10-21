@@ -28,6 +28,22 @@ pub fn stderr_is_terminal() -> bool {
     }
 }
 
+/// True when stdout is a terminal, i.e. `patch show` should print a preview rather
+/// than the patch's exact bytes.
+///
+/// Always false in tests so a piped run stays byte-exact and `cargo test` stays quiet.
+pub fn stdout_is_terminal() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        use std::io::IsTerminal as _;
+        std::io::stdout().is_terminal()
+    }
+}
+
 /// Install the process logger.
 ///
 /// `RUST_LOG` still wins when set. Otherwise `-v` picks the default: `-v` is `debug`, `-vv`
@@ -177,6 +193,12 @@ impl Styled {
     /// Something that is not fatal but is not fine either.
     pub fn yellow(mut self) -> Self {
         self.style = self.style.yellow().bright();
+        self
+    }
+
+    /// A boundary: file headers in a diff, where a section of content begins.
+    pub fn cyan(mut self) -> Self {
+        self.style = self.style.cyan().bright();
         self
     }
 

@@ -693,3 +693,58 @@ fn the_hook_flag_lands_without_a_wizard() {
         "the hook from the flag: {config}"
     );
 }
+
+/// On a pipe, `show` is the patch file: same bytes, nothing added, so it can be
+/// redirected into a file or a pager and land exactly where it came from.
+#[test]
+fn patch_show_pipes_the_exact_patch_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = bare_project(tmp.path());
+    write_series(&layout, "a.patch", patch_one());
+
+    let out = skot(tmp.path(), &["patch", "show", "a.patch"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), patch_one());
+}
+
+#[test]
+fn patch_show_stat_counts_the_files_without_printing_the_diff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = bare_project(tmp.path());
+    write_series(&layout, "a.patch", patch_one());
+
+    let out = skot(tmp.path(), &["patch", "show", "a.patch", "--stat"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("1 file changed"), "{text}");
+    assert!(text.contains("1 insertion(+)"), "{text}");
+    assert!(text.contains("1 deletion(-)"), "{text}");
+    assert!(!text.contains("@@"), "--stat leaves the body out: {text}");
+}
+
+#[test]
+fn patch_show_json_carries_the_text_and_the_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = bare_project(tmp.path());
+    write_series(&layout, "a.patch", patch_one());
+
+    let out = skot(tmp.path(), &["patch", "show", "a.patch", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let patch = &doc["patches"][0];
+    assert_eq!(patch["text"], patch_one());
+    assert_eq!(patch["added"], 1);
+    assert_eq!(patch["removed"], 1);
+    assert_eq!(patch["enabled"], true);
+}
+
+#[test]
+fn patch_show_without_a_name_needs_an_open_work_area() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = bare_project(tmp.path());
+    write_series(&layout, "a.patch", patch_one());
+
+    let out = skot(tmp.path(), &["patch", "show"]);
+    assert_ne!(out.status.code(), Some(0), "stdout: {}", stdout(&out));
+    assert!(stderr(&out).contains("name the patch"), "{}", stderr(&out));
+}

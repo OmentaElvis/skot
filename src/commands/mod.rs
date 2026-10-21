@@ -26,6 +26,7 @@ mod push;
 mod rebase;
 mod run;
 mod series;
+mod show;
 mod status;
 pub(crate) mod sync;
 #[cfg(test)]
@@ -235,6 +236,7 @@ pub fn run(ctx: Ctx) -> Result<Exit> {
             PatchCommand::Push(args) => push::run(&ctx, args),
             PatchCommand::Pop(args) => pop::run(&ctx, args),
             PatchCommand::List(args) => list::run(&ctx, args),
+            PatchCommand::Show(args) => show::run(&ctx, args),
             PatchCommand::Enable(args) => enable::run(&ctx, args),
             PatchCommand::Disable(args) => disable::run(&ctx, args),
             PatchCommand::Move(args) => r#move::run(&ctx, args),
