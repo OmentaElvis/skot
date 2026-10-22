@@ -632,9 +632,11 @@ pub struct ImportArgs {
     #[arg(long, value_name = "REF")]
     pub from: Option<String>,
 
-    /// Import pull request N, by fetching `refs/pull/N/head` from `upstream.url`.
-    #[arg(long, value_name = "N", conflicts_with = "range")]
-    pub pr: Option<u64>,
+    /// Import a pull request: a number, which is read against the forge's own ref
+    /// namespace from the domain of the repository being asked, or the full ref name
+    /// as written (for a forge skot does not know).
+    #[arg(long, value_name = "N|REF", conflicts_with = "range")]
+    pub pr: Option<String>,
 
     /// Fetch the range from this repository (a URL or a local clone). Refs are looked up
     /// there first, so a range named against that repository resolves as written.
@@ -999,8 +1001,15 @@ mod tests {
         let Command::Patch(PatchCommand::Import(args)) = cli.command else {
             panic!("expected import")
         };
-        assert_eq!(args.pr, Some(42));
+        assert_eq!(args.pr.as_deref(), Some("42"));
         assert_eq!(args.name.as_deref(), Some("fix"));
+
+        let cli = Cli::try_parse_from(["skot", "patch", "import", "--pr", "refs/changes/12/345/1"])
+            .unwrap();
+        let Command::Patch(PatchCommand::Import(args)) = cli.command else {
+            panic!("expected import")
+        };
+        assert_eq!(args.pr.as_deref(), Some("refs/changes/12/345/1"));
 
         let cli =
             Cli::try_parse_from(["skot", "patch", "import", "--repo", "../fork", "main..feat"])

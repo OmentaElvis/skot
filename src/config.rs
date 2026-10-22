@@ -26,6 +26,14 @@ pub struct Config {
     /// Extra environment for every hook, in addition to the injected `SKOT_*` vars.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Pull request ref namespaces by forge host, for `skot patch import --pr N`.
+    ///
+    /// Key is a host, or `*.` followed by a domain whose subdomains match (the domain
+    /// itself does not: `*.corp.example` covers `git.corp.example`, never `corp.example`).
+    /// Value is the ref template, with `{n}` standing for the number. The big forges are
+    /// already known; this table names the rest, and overrides any of them.
+    #[serde(default)]
+    pub pr_refs: BTreeMap<String, String>,
     #[serde(default)]
     pub hooks: Hooks,
     /// Named hooks for anything outside the fixed lifecycle.
@@ -41,7 +49,32 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        toml::from_str(text).map_err(|err| anyhow::anyhow!("{err}"))
+        let mut config: Self = toml::from_str(text).map_err(|err| anyhow::anyhow!("{err}"))?;
+        // `[pr-refs]` keys are hosts, and hosts match the way a remote spells them
+        // (lowercased, the way a parser reads a URL): lowercasing the keys once here
+        // is what lets `GitLab.corp.example` match `gitlab.corp.example` later.
+        let mut pr_refs = BTreeMap::new();
+        for (key, template) in std::mem::take(&mut config.pr_refs) {
+            if !template.contains("{n}") {
+                anyhow::bail!(
+                    "[pr-refs] \"{key}\" must contain {{n}} for the number, \
+                     as in \"refs/merge-requests/{{n}}/head\""
+                );
+            }
+            if !template.starts_with("refs/") {
+                anyhow::bail!("[pr-refs] \"{key}\" must name a ref, starting with \"refs/\"");
+            }
+            let host = key.to_ascii_lowercase();
+            if pr_refs.contains_key(&host) {
+                anyhow::bail!(
+                    "[pr-refs] \"{key}\" names the same host as another entry once case \
+                     is ignored; keep one of them"
+                );
+            }
+            pr_refs.insert(host, template);
+        }
+        config.pr_refs = pr_refs;
+        Ok(config)
     }
 
     /// The command configured at a lifecycle hook point, if any.
@@ -305,6 +338,47 @@ mod tests {
         let cfg = Config::parse("series = \"stable\"\n").unwrap();
         assert_eq!(cfg.series.as_deref(), Some("stable"));
         assert_eq!(Config::parse("").unwrap().series, None);
+    }
+
+    #[test]
+    fn a_pull_request_namespace_table_is_read_and_must_place_the_number() {
+        let cfg = Config::parse(
+            "[pr-refs]\n\"gitlab.corp.example\" = \"refs/merge-requests/{n}/head\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.pr_refs.get("gitlab.corp.example").map(String::as_str),
+            Some("refs/merge-requests/{n}/head")
+        );
+
+        let err = Config::parse("[pr-refs]\n\"x.example\" = \"refs/requests/head\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("x.example") && err.contains("{n}"),
+            "got: {err}"
+        );
+
+        let err = Config::parse("[pr-refs]\n\"x.example\" = \"pull/{n}/head\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("refs/"), "got: {err}");
+    }
+
+    #[test]
+    fn pr_refs_keys_match_the_host_the_way_a_remote_spells_it() {
+        let cfg = Config::parse(
+            "[pr-refs]\n\"GitLab.Corp.Example\" = \"refs/merge-requests/{n}/head\"\n",
+        )
+        .unwrap();
+        assert!(cfg.pr_refs.contains_key("gitlab.corp.example"));
+
+        let err = Config::parse(
+            "[pr-refs]\n\"Host.example\" = \"refs/a/{n}\"\n\"host.EXAMPLE\" = \"refs/b/{n}\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("case"), "got: {err}");
     }
 
     #[test]

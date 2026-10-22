@@ -26,6 +26,16 @@ url = "https://github.com/example/project"
 # Ref used when a command is not given one.
 default-ref = "v1.0.0"
 
+# Pull request namespaces for `skot patch import --pr N`, by forge host. The big
+# forges (github.com, gitlab.com, bitbucket.org, codeberg.org, gitea.com) are known
+# already; this table names the rest (a self-hosted GitLab, a corporate forge). It can
+# also override any of them. `{n}` stands for the number, and a `*.` prefix on a key
+# matches subdomains of that domain (never the domain itself).
+#
+# [pr-refs]
+# "gitlab.corp.example" = "refs/merge-requests/{n}/head"
+# "*.corp.example" = "refs/merge-requests/{n}/head"
+
 [sandbox]
 # persistent  keep the sandbox between runs and reset it to a ref, so expensive
 #             dependency state survives a ref change. This is what you want locally.

@@ -5,8 +5,9 @@
 //! one diff between them, one patch file, one line in the series.
 //!
 //! The network stays in the mirror layer, as everywhere else. Every fetch (the range's
-//! own refs from the origin, the source behind `--repo`, and `refs/pull/N/head` behind
-//! `--pr`) goes into `.skot/mirror.git` through [`Mirror::fetch_refspecs`], so once the
+//! own refs from the origin, the source behind `--repo`, and the pull request behind
+//! `--pr`, a number read against the forge's own ref namespace or the full ref as
+//! written) goes into `.skot/mirror.git` through [`Mirror::fetch_refspecs`], so once the
 //! fetch finishes there is nothing external left to read from: the objects sit where
 //! every other command already looks for them, and `check` verifies the imported patch
 //! like any other.
@@ -90,12 +91,14 @@ impl Outcome {
 
 /// The two ends as written, before anything is resolved against the mirror.
 struct Request {
-    /// The `to` end: a ref name, or `refs/pull/N/head` for `--pr`.
+    /// The `to` end: a ref name, or the pull request's ref for `--pr` (the forge's
+    /// namespace resolved from a number, or the full ref as written).
     to: String,
     /// Where the patch's diff starts.
     base: Base,
-    /// The pull request to fetch, if that is what was asked for.
-    pull: Option<u64>,
+    /// The pull request to fetch, if that is what was asked for: the number as given,
+    /// or the full ref name for a forge the tables do not name.
+    pull: Option<String>,
 }
 
 /// How the `from` end is chosen.
@@ -186,14 +189,36 @@ pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<Exit> {
 /// should cost no network.
 fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     let (config, mut series) = layout.project()?;
-    let request = request(args)?;
+
+    // Opening the mirror is local, and the URL its `origin` records decides which forge
+    // a `--pr` number is read against, so the request is built after it. With no mirror
+    // yet, the origin the first `ensure` sets is the one in the config.
+    let existing = Mirror::open(layout).ok();
+    let pr_url = args
+        .repo
+        .clone()
+        .or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|mirror| mirror.remote_url().ok())
+        })
+        .or_else(|| config.upstream.url.clone());
+    let request = request(args, &config, pr_url.as_deref())?;
+    // What a failure says when a pull request number was read against a forge nothing
+    // knows: only a number can be misread that way, and only an unknown domain ends up
+    // assumed.
+    let teach = request
+        .pull
+        .as_deref()
+        .filter(|literal| literal.parse::<u64>().is_ok())
+        .and_then(|_| pr_teach_note(&config, pr_url.as_deref(), layout));
 
     // No mirror yet: start one, like every other command does, rather than sending the
     // user away to run `skot sync` and come back. The fetch takes the range's first
     // fetchable ref; the blocks below fill in whatever else the range reads.
-    let mirror = match Mirror::open(layout) {
-        Ok(mirror) => mirror,
-        Err(_) => {
+    let mirror = match existing {
+        Some(mirror) => mirror,
+        None => {
             let needed = needed_refs(&request, config.upstream.default_ref.as_deref());
             let wanted = needed
                 .iter()
@@ -234,11 +259,12 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     let wildcard =
         !by_id.is_empty() && (shallow || by_id.iter().any(|n| mirror.try_resolve(n).is_none()));
     // The origin is asked once for everything this run reads from it: the range's own
-    // refs, and the pull request head when there is one. One fetch, so an origin that
-    // cannot be reached is an answer said once for the run instead of once per ref.
-    let pull_ref = request
-        .pull
-        .map(|number| format!("+refs/pull/{number}/head:refs/pull/{number}/head"));
+    // refs, and the pull request head when there is one and no `--repo` says otherwise.
+    // One fetch, so an origin that cannot be reached is an answer said once for the
+    // run instead of once per ref. With `--repo` the pull request belongs to the source
+    // repository: that is the cross-forge case, a GitHub project taking a GitLab change.
+    let pull_ref = (request.pull.is_some() && args.repo.is_none())
+        .then(|| format!("+{}:{}", request.to, request.to));
     match mirror.remote_url() {
         Ok(url) => {
             let mut refspecs: Vec<String> = if wildcard {
@@ -255,14 +281,15 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
             let mut held = needed.iter().all(|n| mirror.try_resolve(n).is_some());
             if let Some(spec) = &pull_ref {
                 refspecs.push(spec.clone());
-                held = held
-                    && request.pull.is_some_and(|number| {
-                        mirror
-                            .try_resolve(&format!("refs/pull/{number}/head"))
-                            .is_some()
-                    });
+                held = held && mirror.try_resolve(&request.to).is_some();
             }
             if !refspecs.is_empty() {
+                let extra = args
+                    .repo
+                    .is_none()
+                    .then_some(teach.as_ref())
+                    .flatten()
+                    .map(|note| (request.to.as_str(), note.clone()));
                 fetch_or_fall_back(
                     &mirror,
                     &url,
@@ -271,6 +298,7 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
                     "fetching what the range needs",
                     held,
                     format!("fetching the range's refs from {url}"),
+                    extra,
                 )?;
             }
         }
@@ -288,13 +316,17 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
 
     if let Some(source) = args.repo.as_deref() {
         // The source is fetched for this range and nothing else: the names the range
-        // reads, under the namespace, at full depth: the merge base walks them. A
-        // branch the range does not name is not worth dragging across.
+        // reads, under the namespace, at full depth: the merge base walks them, and a
+        // pull request head under its own name when there is one. A branch the range
+        // does not name is not worth dragging across.
         let source_needed = needed_refs(&request, None);
-        let refspecs: Vec<String> = source_needed
+        let mut refspecs: Vec<String> = source_needed
             .iter()
             .flat_map(|name| refspecs_for(name, true))
             .collect();
+        if request.pull.is_some() {
+            refspecs.push(format!("+{}:{}", request.to, request.to));
+        }
         let held = refspecs.iter().all(|spec| {
             spec.split_once(':')
                 .is_some_and(|(_, dest)| mirror.try_resolve(dest).is_some())
@@ -307,6 +339,9 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
             "fetching the source repository",
             held,
             format!("fetching from {source}"),
+            teach
+                .as_ref()
+                .map(|note| (request.to.as_str(), note.clone())),
         )?;
     }
 
@@ -324,10 +359,17 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
             .into_iter()
             .find(|n| !is_commit_id(n) && mirror.try_resolve(n).is_none())
         {
-            bail!(
+            let mut message = format!(
                 "`{missing}` is not in the mirror, and the upstream does not have it either.\n\
                  Check the spelling; a ref published only just may need a moment."
             );
+            if let Some(note) = &teach
+                && missing == request.to
+            {
+                message.push('\n');
+                message.push_str(note);
+            }
+            bail!("{message}");
         }
     }
 
@@ -387,8 +429,9 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     // What to call it when the imported work has no single commit to speak for it: the
     // request as the user made it, not what it resolved to. `--pr 125` becomes
     // `Import PR 125`; a range stays the range as written.
-    let fallback = match request.pull {
-        Some(number) => format!("Import PR {number}"),
+    let fallback = match request.pull.as_deref() {
+        Some(literal) if literal.parse::<u64>().is_ok() => format!("Import PR {literal}"),
+        Some(literal) => format!("Import {literal}"),
         None => format!("Import {}", request_expression(&request)),
     };
     let derived = if args.reverse {
@@ -599,16 +642,35 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
 }
 
 /// Read the command line as a [`Request`], rejecting every shape that cannot become one.
-fn request(args: &ImportArgs) -> Result<Request> {
-    if let Some(number) = args.pr {
+///
+/// `pr_url` is the repository a `--pr` number is read against: the `--repo` source when
+/// there is one, else the mirror's origin. The domain of that URL picks the forge's
+/// namespace; a full ref as written needs no URL at all.
+fn request(
+    args: &ImportArgs,
+    config: &crate::config::Config,
+    pr_url: Option<&str>,
+) -> Result<Request> {
+    if let Some(literal) = &args.pr {
         let base = match &args.from {
             Some(from) => Base::Named(from.clone()),
             None => Base::MergeWithDefault,
         };
+        // A number is the forge's own ref for that request; a full ref is used as
+        // written, which is how a forge the tables do not name is asked (Gerrit's
+        // `refs/changes/…`, a private namespace).
+        let (to, pull) = match literal.parse::<u64>() {
+            Ok(number) => (pr_ref_for(pr_url, config, number), number.to_string()),
+            Err(_) if literal.starts_with("refs/") => (literal.clone(), literal.clone()),
+            Err(_) => bail!(
+                "`--pr {literal}` is neither a pull request number nor a ref name.\n\
+                 Give a number (`--pr 42`) or the full ref (`--pr refs/changes/12/345/1`)."
+            ),
+        };
         return Ok(Request {
-            to: format!("refs/pull/{number}/head"),
+            to,
             base,
-            pull: Some(number),
+            pull: Some(pull),
         });
     }
 
@@ -658,6 +720,114 @@ fn request(args: &ImportArgs) -> Result<Request> {
         base,
         pull: None,
     })
+}
+
+/// The namespace a pull request number is read against when nothing names one: the
+/// pattern GitHub publishes under, which most forges copied.
+const PR_TEMPLATE_DEFAULT: &str = "refs/pull/{n}/head";
+
+/// Where a template came from, so a failure can say whether the table needs a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrTemplateSource {
+    /// The `[pr-refs]` table in `skot.toml`.
+    Config,
+    /// One of the forges built into skot.
+    Builtin,
+    /// Nothing matched; the default was assumed.
+    Assumed,
+}
+
+/// The ref namespaces of the forges skot knows by name.
+fn builtin_pr_template(domain: &str) -> Option<&'static str> {
+    match domain {
+        "github.com" | "codeberg.org" | "gitea.com" => Some("refs/pull/{n}/head"),
+        "gitlab.com" => Some("refs/merge-requests/{n}/head"),
+        "bitbucket.org" => Some("refs/pull-requests/{n}/from"),
+        _ => None,
+    }
+}
+
+/// The host a fetch URL speaks to, or `None` for a location with none: a local path,
+/// a file URL, a remote helper, or anything git's own grammar rejects, which reads as
+/// "no host" rather than a failure, so the caller assumes the default namespace and
+/// no valid remote can choke here.
+///
+/// The grammar is git's, so the parsing is [`gix_url`]: scheme URLs with ports and
+/// bracketed IPv6, scp-like `host:path` with or without `user@`, local paths, remote
+/// helpers. Hosts come back in lookup form (DNS-like ASCII already lowercased); the
+/// last lowercasing keeps IPv6 hex and typed-in hosts on the same key either way.
+fn url_domain(url: &str) -> Option<String> {
+    let parsed = gix_url::parse(url).ok()?;
+    if parsed.scheme == gix_url::Scheme::File {
+        return None;
+    }
+    let host = parsed.host?.to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// The ref template for the forge behind `url`: the `[pr-refs]` table first (an exact
+/// host, then wildcards, the longest suffix winning), then the forges skot knows, then
+/// the default. Which URL is consulted is the caller's: `--repo` when given, else the
+/// origin, so the namespace and the fetch can never disagree.
+fn pr_template<'a>(
+    url: Option<&str>,
+    config: &'a crate::config::Config,
+) -> (Option<String>, &'a str, PrTemplateSource) {
+    let Some(domain) = url.and_then(url_domain) else {
+        return (None, PR_TEMPLATE_DEFAULT, PrTemplateSource::Assumed);
+    };
+    if let Some(template) = config.pr_refs.get(&domain) {
+        return (Some(domain), template, PrTemplateSource::Config);
+    }
+    let wildcard = config
+        .pr_refs
+        .iter()
+        .filter_map(|(key, template)| {
+            let base = key.strip_prefix("*.")?;
+            // Subdomains only: `*.corp.example` covers `git.corp.example`, never
+            // `corp.example` itself.
+            let matched = domain
+                .strip_suffix(base)
+                .is_some_and(|sub| sub.ends_with('.'));
+            matched.then_some((base.len(), template))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, template)| template);
+    if let Some(template) = wildcard {
+        return (Some(domain), template, PrTemplateSource::Config);
+    }
+    if let Some(template) = builtin_pr_template(&domain) {
+        return (Some(domain), template, PrTemplateSource::Builtin);
+    }
+    (Some(domain), PR_TEMPLATE_DEFAULT, PrTemplateSource::Assumed)
+}
+
+/// `--pr N` as the ref the forge publishes it under.
+fn pr_ref_for(url: Option<&str>, config: &crate::config::Config, number: u64) -> String {
+    let (_, template, _) = pr_template(url, config);
+    template.replace("{n}", &number.to_string())
+}
+
+/// What a failed pull request import says when its number was read against a forge
+/// nothing knows: which host, which namespace was assumed, and the two ways to fix it.
+fn pr_teach_note(
+    config: &crate::config::Config,
+    url: Option<&str>,
+    layout: &Layout,
+) -> Option<String> {
+    let (domain, template, source) = pr_template(url, config);
+    if source != PrTemplateSource::Assumed {
+        return None;
+    }
+    let domain = domain?;
+    Some(format!(
+        "`{domain}` was matched to no known forge, so `{template}` was assumed.\n\
+         If it is a different forge, add its namespace to {}:\n  \
+         [pr-refs]\n  \"{domain}\" = \"{template}\"\n\
+         or pass the full ref: `{}`.",
+        layout.config_file().display(),
+        skot_args("import", "--pr refs/...")
+    ))
 }
 
 /// What the range reads out of a repository: the `to` end, whatever the base names, and
@@ -717,6 +887,10 @@ fn refspecs_for(name: &str, into_ns: bool) -> Vec<String> {
 /// sync. When it cannot be reached, a mirror that already holds every destination
 /// (`held`) is enough to import from, said out loud, and when it does not, the
 /// failure is the answer.
+///
+/// `extra` is a note to append when the failure lands on `extra.0`'s needle: the
+/// diagnosis of a ref the forge does not publish, or of a run not allowed to ask.
+#[allow(clippy::too_many_arguments)]
 fn fetch_or_fall_back(
     mirror: &Mirror,
     url: &str,
@@ -725,6 +899,7 @@ fn fetch_or_fall_back(
     message: &str,
     held: bool,
     context: String,
+    extra: Option<(&str, String)>,
 ) -> Result<()> {
     match mirror.fetch_refspecs(url, remote_name, refspecs, message, i32::MAX) {
         Ok(()) => Ok(()),
@@ -743,7 +918,16 @@ fn fetch_or_fall_back(
             );
             Ok(())
         }
-        Err(fetch_err) => Err(fetch_err).context(context),
+        Err(fetch_err) => {
+            let mut err = fetch_err.context(context);
+            if let Some((needle, note)) = extra {
+                let names_the_ref = err.root_cause().to_string().contains(needle);
+                if names_the_ref || mirror.offline() {
+                    err = err.context(note);
+                }
+            }
+            Err(err)
+        }
     }
 }
 
@@ -863,8 +1047,8 @@ fn request_expression(request: &Request) -> String {
 /// forward and the reversed patch of one commit are two different things in the series.
 fn identity_of(request: &Request, repo: Option<&str>, reverse: bool) -> String {
     let kind = if reverse { "reversed:" } else { "" };
-    if let Some(number) = request.pull {
-        return format!("{kind}pr:{number}");
+    if let Some(literal) = &request.pull {
+        return format!("{kind}pr:{literal}");
     }
     let expression = request_expression(request);
     match repo {
@@ -1852,7 +2036,7 @@ mod tests {
             &layout,
             &ImportArgs {
                 at: None,
-                pr: Some(7),
+                pr: Some("7".to_owned()),
                 ..args(None)
             },
         )
@@ -1884,7 +2068,7 @@ mod tests {
         let layout = synced_project(tmp.path(), &source);
         let request = ImportArgs {
             at: None,
-            pr: Some(7),
+            pr: Some("7".to_owned()),
             ..args(None)
         };
         import(&layout, &request).unwrap();
@@ -1909,7 +2093,7 @@ mod tests {
         let layout = synced_project(tmp.path(), &source);
         let request = ImportArgs {
             at: None,
-            pr: Some(7),
+            pr: Some("7".to_owned()),
             ..args(None)
         };
 
@@ -1933,7 +2117,7 @@ mod tests {
         let layout = synced_project(tmp.path(), &source);
         let request = ImportArgs {
             at: None,
-            pr: Some(7),
+            pr: Some("7".to_owned()),
             ..args(None)
         };
         let first = import(&layout, &request).unwrap();
@@ -2000,7 +2184,7 @@ mod tests {
             &layout,
             &ImportArgs {
                 at: None,
-                pr: Some(7),
+                pr: Some("7".to_owned()),
                 ..args(None)
             },
         )
@@ -2011,6 +2195,448 @@ mod tests {
             done.patch, "import-pr-7.patch",
             "the request, not the resolved range, names a multi-commit import"
         );
+    }
+
+    #[test]
+    fn the_forges_people_use_know_their_own_namespace() {
+        let config = crate::config::Config::parse("").unwrap();
+        for (url, want) in [
+            ("https://github.com/o/r", "refs/pull/7/head"),
+            ("https://gitlab.com/o/r", "refs/merge-requests/7/head"),
+            ("https://bitbucket.org/o/r", "refs/pull-requests/7/from"),
+            ("https://codeberg.org/o/r", "refs/pull/7/head"),
+            ("https://gitea.com/o/r", "refs/pull/7/head"),
+            ("https://some-forge.example/o/r", "refs/pull/7/head"),
+            ("git@github.com:o/r.git", "refs/pull/7/head"),
+            ("../local/path", "refs/pull/7/head"),
+        ] {
+            assert_eq!(pr_ref_for(Some(url), &config, 7), want, "for {url}");
+        }
+        assert_eq!(pr_ref_for(None, &config, 7), "refs/pull/7/head");
+    }
+
+    #[test]
+    fn a_config_entry_names_a_forge_the_table_does_not_know() {
+        let config = crate::config::Config::parse(
+            "[pr-refs]\n\"forge.corp.example\" = \"refs/merge-requests/{n}/head\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            pr_ref_for(Some("https://forge.corp.example/o/r"), &config, 9),
+            "refs/merge-requests/9/head"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_entry_covers_the_subdomains_of_its_domain() {
+        let config =
+            crate::config::Config::parse("[pr-refs]\n\"*.corp.example\" = \"refs/mr/{n}/head\"\n")
+                .unwrap();
+        assert_eq!(
+            pr_ref_for(Some("https://git.corp.example/o/r"), &config, 9),
+            "refs/mr/9/head"
+        );
+        assert_eq!(
+            pr_ref_for(Some("https://a.git.corp.example/o/r"), &config, 9),
+            "refs/mr/9/head"
+        );
+        // Predictable: the wildcard covers subdomains, never the domain itself.
+        assert_eq!(
+            pr_ref_for(Some("https://corp.example/o/r"), &config, 9),
+            "refs/pull/9/head"
+        );
+        assert_eq!(
+            pr_ref_for(Some("https://notcorp.example/o/r"), &config, 9),
+            "refs/pull/9/head"
+        );
+    }
+
+    #[test]
+    fn an_exact_config_entry_beats_a_wildcard() {
+        let config = crate::config::Config::parse(
+            "[pr-refs]\n\"git.corp.example\" = \"refs/exact/{n}\"\n\"*.corp.example\" = \"refs/wild/{n}\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            pr_ref_for(Some("https://git.corp.example/o/r"), &config, 9),
+            "refs/exact/9"
+        );
+        assert_eq!(
+            pr_ref_for(Some("https://other.corp.example/o/r"), &config, 9),
+            "refs/wild/9"
+        );
+    }
+
+    #[test]
+    fn a_config_entry_can_override_a_forge_in_the_table() {
+        let config =
+            crate::config::Config::parse("[pr-refs]\n\"github.com\" = \"refs/mine/{n}\"\n")
+                .unwrap();
+        assert_eq!(
+            pr_ref_for(Some("https://github.com/o/r"), &config, 3),
+            "refs/mine/3"
+        );
+    }
+
+    #[test]
+    fn an_ip_remote_is_matched_by_its_ip() {
+        let config = crate::config::Config::parse(
+            "[pr-refs]\n\"127.0.0.1\" = \"refs/merge-requests/{n}/head\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            pr_ref_for(Some("http://127.0.0.1:8080/o/r"), &config, 5),
+            "refs/merge-requests/5/head"
+        );
+        assert_eq!(
+            pr_ref_for(Some("git@127.0.0.1:o/r.git"), &config, 5),
+            "refs/merge-requests/5/head"
+        );
+    }
+
+    #[test]
+    fn a_url_without_a_host_suggests_no_namespace() {
+        for url in [
+            "file:///tmp/o/r.git",
+            "/abs/path",
+            "../rel/path",
+            "./r",
+            "~/r",
+            "plain",
+        ] {
+            assert_eq!(url_domain(url).as_deref(), None, "for {url}");
+        }
+        assert_eq!(
+            url_domain("https://github.com/o/r").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            url_domain("https://github.com:8443/o/r").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            url_domain("ssh://git@github.com/o/r").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            url_domain("git@gitlab.com:o/r.git").as_deref(),
+            Some("gitlab.com")
+        );
+    }
+
+    #[test]
+    fn a_remote_url_with_a_port_or_brackets_keeps_only_the_host() {
+        // Ports and brackets never become part of the key: the host is what a remote
+        // is matched by, so an IPv6 address arrives as the bare address, which is
+        // `"::1"` as a quoted skot.toml key.
+        assert_eq!(url_domain("ssh://[::1]:2222/o/r").as_deref(), Some("::1"));
+        assert_eq!(
+            url_domain("ssh://user@[::1]:2222/o/r").as_deref(),
+            Some("::1")
+        );
+        assert_eq!(
+            url_domain("http://127.0.0.1:8080/o/r").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            url_domain("git@127.0.0.1:o/r.git").as_deref(),
+            Some("127.0.0.1")
+        );
+    }
+
+    #[test]
+    fn an_scp_remote_without_a_user_is_still_a_remote() {
+        // git reads a colon before the first slash as scp syntax whether or not there
+        // is a `user@` in front of it, so the host is still a host.
+        assert_eq!(
+            url_domain("127.0.0.1:o/r.git").as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            url_domain("github.com:o/r.git").as_deref(),
+            Some("github.com")
+        );
+    }
+
+    #[test]
+    fn a_host_is_matched_the_way_a_user_would_spell_it() {
+        // Hosts are case-insensitive everywhere they are looked up; the same goes for
+        // the side being looked up (`Config::parse` lowercases the keys).
+        assert_eq!(
+            url_domain("git@GitHub.COM:o/r.git").as_deref(),
+            Some("github.com")
+        );
+        assert_eq!(
+            url_domain("ssh://GitHub.COM/o/r").as_deref(),
+            Some("github.com")
+        );
+    }
+
+    #[test]
+    fn every_shape_a_remote_can_take_never_choke() {
+        // Whatever the answer, extraction cannot fail a command: no host means the
+        // default namespace, which is all a missing answer ever costs.
+        for url in [
+            "",
+            "git@[::1]:o/r.git",
+            "C:\\repo",
+            "C:/repo",
+            "file://gitlab.com/o/r",
+            "http://",
+            "https://user:p@ss@example.com/x",
+            "git://github.com/o/r",
+            "unknown-scheme://host.example/x",
+            "user@host:/abs/path",
+            "/abs/with:colon",
+        ] {
+            let _ = url_domain(url);
+        }
+        // A file URL speaks to no forge, host or not.
+        assert_eq!(url_domain("file://gitlab.com/o/r").as_deref(), None);
+        assert_eq!(
+            url_domain("git://github.com/o/r").as_deref(),
+            Some("github.com")
+        );
+    }
+
+    #[test]
+    fn a_pull_request_number_is_read_against_the_repository_being_asked() {
+        let config = crate::config::Config::parse("").unwrap();
+        let request = request(
+            &ImportArgs {
+                pr: Some("7".to_owned()),
+                ..args(None)
+            },
+            &config,
+            Some("https://gitlab.com/o/r"),
+        )
+        .unwrap();
+        assert_eq!(request.to, "refs/merge-requests/7/head");
+        assert_eq!(request.pull.as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn a_fully_qualified_pull_request_ref_is_used_as_written() {
+        let config = crate::config::Config::parse("").unwrap();
+        let request = request(
+            &ImportArgs {
+                pr: Some("refs/changes/12/345/1".to_owned()),
+                ..args(None)
+            },
+            &config,
+            Some("https://github.com/o/r"),
+        )
+        .unwrap();
+        assert_eq!(request.to, "refs/changes/12/345/1");
+        assert_eq!(request.pull.as_deref(), Some("refs/changes/12/345/1"));
+    }
+
+    #[test]
+    fn a_pull_request_argument_that_is_neither_a_number_nor_a_ref_is_refused() {
+        let config = crate::config::Config::parse("").unwrap();
+        let err = request(
+            &ImportArgs {
+                pr: Some("abc".to_owned()),
+                ..args(None)
+            },
+            &config,
+            None,
+        )
+        .err()
+        .expect("neither a number nor a ref is refused")
+        .to_string();
+        assert!(err.contains("--pr 42"), "both shapes, got: {err}");
+        assert!(err.contains("refs/changes"), "both shapes, got: {err}");
+    }
+
+    #[test]
+    fn a_fully_qualified_pull_request_ref_is_fetched_as_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, pr_sha) = pull_request_source(tmp.path());
+        let layout = synced_project(tmp.path(), &source);
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                pr: Some("refs/pull/7/head".to_owned()),
+                ..args(None)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.to, "refs/pull/7/head");
+        assert_eq!(done.to_sha, pr_sha);
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(
+            text.contains("X-Skot-Import: pr:refs/pull/7/head "),
+            "the full ref records as written:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_pull_request_comes_from_the_source_repository_when_one_is_given() {
+        // The cross-forge shape: the project's origin does not carry the request, the
+        // `--repo` repository does, and the request is fetched from there.
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, pr_sha) = pull_request_source(tmp.path());
+        let origin = tmp.path().join("origin-clone");
+        {
+            // The origin clone takes the history and not the request: the source repo's
+            // HEAD is unborn, so a plain clone transfers nothing, and the heads are
+            // fetched across by name.
+            let clone = git2::Repository::clone(source.to_str().unwrap(), &origin).unwrap();
+            let mut remote = clone.find_remote("origin").unwrap();
+            remote
+                .fetch(&["+refs/heads/*:refs/heads/*"], None, None)
+                .unwrap();
+        }
+        let layout = synced_project(tmp.path(), &origin);
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                pr: Some("7".to_owned()),
+                repo: Some(source.to_str().unwrap().to_owned()),
+                ..args(None)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.to, "refs/pull/7/head");
+        assert_eq!(done.to_sha, pr_sha);
+        assert_eq!(done.outcome, Outcome::Created);
+    }
+
+    #[test]
+    fn the_forge_of_the_repository_decides_the_pull_request_namespace() {
+        // The shape an offline run leaves: the mirror already holds the merge request
+        // under its forge's own name, origin names gitlab.com, nothing may be asked.
+        // The import can only succeed if the namespace came from the domain.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("src");
+        let mr = {
+            let repo = git2::Repository::init(&source).unwrap();
+            let main_oid = commit_file(&repo, "refs/heads/main", "main", b"base\n", &[]);
+            let main_commit = repo.find_commit(main_oid).unwrap();
+            commit_file(
+                &repo,
+                "refs/merge-requests/7/head",
+                "the merge request",
+                b"mr\n",
+                &[&main_commit],
+            )
+        };
+        let layout = synced_project(tmp.path(), &source);
+        {
+            let mirror_repo = git2::Repository::open_bare(layout.mirror_dir()).unwrap();
+            let mut seed = mirror_repo
+                .remote("seed", source.to_str().unwrap())
+                .unwrap();
+            seed.fetch(
+                &["+refs/merge-requests/7/head:refs/merge-requests/7/head"],
+                None,
+                None,
+            )
+            .unwrap();
+            drop(seed);
+            mirror_repo
+                .remote_set_url("origin", "https://gitlab.com/team/project.git")
+                .unwrap();
+        }
+
+        let done = import(
+            &layout.with_offline(true),
+            &ImportArgs {
+                pr: Some("7".to_owned()),
+                ..args(None)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.to, "refs/merge-requests/7/head");
+        assert_eq!(done.to_sha, mr.to_string());
+    }
+
+    #[test]
+    fn the_config_table_decides_the_namespace_for_a_forge_it_does_not_know() {
+        // The same offline shape, for a forge the built-in table cannot name: one line
+        // in skot.toml is enough.
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("src");
+        let mr = {
+            let repo = git2::Repository::init(&source).unwrap();
+            let main_oid = commit_file(&repo, "refs/heads/main", "main", b"base\n", &[]);
+            let main_commit = repo.find_commit(main_oid).unwrap();
+            commit_file(
+                &repo,
+                "refs/corp/requests/7/head",
+                "the change",
+                b"corp\n",
+                &[&main_commit],
+            )
+        };
+        let layout = synced_project(tmp.path(), &source);
+        std::fs::write(
+            layout.config_file(),
+            format!(
+                "[upstream]\nurl = \"{}\"\ndefault-ref = \"main\"\n\n\
+                 [pr-refs]\n\"forge.corp.example\" = \"refs/corp/requests/{{n}}/head\"\n",
+                source.display()
+            ),
+        )
+        .unwrap();
+        {
+            let mirror_repo = git2::Repository::open_bare(layout.mirror_dir()).unwrap();
+            let mut seed = mirror_repo
+                .remote("seed", source.to_str().unwrap())
+                .unwrap();
+            seed.fetch(
+                &["+refs/corp/requests/7/head:refs/corp/requests/7/head"],
+                None,
+                None,
+            )
+            .unwrap();
+            drop(seed);
+            mirror_repo
+                .remote_set_url("origin", "https://forge.corp.example/team/project.git")
+                .unwrap();
+        }
+
+        let done = import(
+            &layout.with_offline(true),
+            &ImportArgs {
+                pr: Some("7".to_owned()),
+                ..args(None)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.to, "refs/corp/requests/7/head");
+        assert_eq!(done.to_sha, mr.to_string());
+    }
+
+    #[test]
+    fn an_unknown_forge_is_told_how_to_name_its_namespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (source, _sha) = pull_request_source(tmp.path());
+        let layout = synced_project(tmp.path(), &source);
+        git2::Repository::open_bare(layout.mirror_dir())
+            .unwrap()
+            .remote_set_url("origin", "https://forge.unknown.example/o/r.git")
+            .unwrap();
+
+        let err = import(
+            &layout.with_offline(true),
+            &ImportArgs {
+                pr: Some("7".to_owned()),
+                ..args(None)
+            },
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("forge.unknown.example"), "got: {msg}");
+        assert!(msg.contains("[pr-refs]"), "got: {msg}");
+        assert!(msg.contains("refs/pull/{n}/head"), "got: {msg}");
     }
 }
 

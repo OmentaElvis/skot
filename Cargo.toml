@@ -54,6 +54,12 @@ git2 = { version = "0.21", features = ["https", "ssh"] }
 # The sandbox lock: flock(2) on unix, LockFileEx on Windows, issued directly rather than
 # through std's File::try_lock, which is not implemented on every target.
 fs4 = { version = "1", features = ["sync"] }
+# Reading a remote URL the way git reads it: scheme URLs, scp-like `host:path`, local
+# paths, remote helpers. `import --pr` needs the host of whatever the user gave, and
+# git's grammar has edge cases (ports, brackets, `user@` or not) that are not worth
+# reimplementing wrongly once -- gix-url is the gitoxide parser for exactly this, and
+# a location it rejects simply reads as having no host rather than failing a command.
+gix-url = "0.40.0"
 
 [dev-dependencies]
 tempfile = "3"

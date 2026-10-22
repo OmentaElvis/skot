@@ -382,6 +382,11 @@ impl Mirror {
         anyhow::Error::new(err).context(diagnosis)
     }
 
+    /// Whether this run refuses the network, as the layout said when the mirror opened.
+    pub fn offline(&self) -> bool {
+        self.offline
+    }
+
     /// The URL the mirror was cloned from, or the `remote.origin.url` from its config.
     pub fn remote_url(&self) -> Result<String> {
         let url = self
