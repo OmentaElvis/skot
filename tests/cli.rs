@@ -522,6 +522,25 @@ fn skot_series_environment_variable_names_the_series() {
     assert_eq!(doc["series_name"], "exp");
 }
 
+/// The environment names the project and asks for the document, with neither flag on
+/// the command line. The unit tests share one process, so the real binary, where the
+/// environment gets a clean one, is the only place this can be shown.
+#[test]
+fn the_environment_names_the_project_and_asks_for_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _layout = bare_project(tmp.path());
+
+    let out = Command::new(env!("CARGO_BIN_EXE_skot"))
+        .args(["check"])
+        .env("SKOT_DIR", tmp.path())
+        .env("SKOT_JSON", "1")
+        .output()
+        .expect("running skot");
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(doc.is_object(), "stdout: {}", stdout(&out));
+}
+
 /// A run that cannot ask refuses the one `init` question that has no default.
 ///
 /// An upstream URL is a fact about the project, not a value a default could stand for,

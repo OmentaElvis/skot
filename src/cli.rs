@@ -6,8 +6,8 @@
 
 use std::path::PathBuf;
 
-use clap::builder::StyledStr;
 use clap::builder::styling::{Style, Styles};
+use clap::builder::{BoolishValueParser, StyledStr};
 use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
 use crate::invocation::{skot, skot_args};
@@ -62,8 +62,9 @@ fn long_about() -> String {
     disable_help_subcommand = false
 )]
 pub struct Cli {
-    /// Project directory. Defaults to searching upwards for skot.toml.
-    #[arg(long, global = true, value_name = "PATH")]
+    /// Project directory. Defaults to searching upwards for skot.toml. Also read from
+    /// the SKOT_DIR environment variable, which the flag beats.
+    #[arg(long, global = true, value_name = "PATH", env = "SKOT_DIR")]
     pub dir: Option<PathBuf>,
 
     /// Series to work on for this run: one shot, the active one stays put. Also read
@@ -72,31 +73,69 @@ pub struct Cli {
     pub series: Option<String>,
 
     /// Contact the upstream even when the mirror already has the ref: the fetch phase
-    /// of whatever command this run is, not only `sync`'s.
-    #[arg(long, global = true)]
+    /// of whatever command this run is, not only `sync`'s. Also read from the
+    /// SKOT_REFRESH environment variable, which the flag beats.
+    #[arg(
+        long,
+        global = true,
+        env = "SKOT_REFRESH",
+        value_parser = BoolishValueParser::new()
+    )]
     pub refresh: bool,
 
     /// Never contact the network. The mirror already on disk, and local directories,
-    /// are the whole answer; anything else is refused rather than fetched.
-    #[arg(long, global = true)]
+    /// are the whole answer; anything else is refused rather than fetched. Also read
+    /// from the SKOT_OFFLINE environment variable, which the flag beats.
+    #[arg(
+        long,
+        global = true,
+        env = "SKOT_OFFLINE",
+        value_parser = BoolishValueParser::new()
+    )]
     pub offline: bool,
 
-    /// Machine-readable output on stdout.
-    #[arg(long, global = true)]
+    /// Machine-readable output on stdout. Also read from the SKOT_JSON environment
+    /// variable, which the flag beats.
+    #[arg(
+        long,
+        global = true,
+        env = "SKOT_JSON",
+        value_parser = BoolishValueParser::new()
+    )]
     pub json: bool,
 
-    /// Skip the next-step hints on stderr.
-    #[arg(long, global = true)]
+    /// Skip the next-step hints on stderr. Also read from the SKOT_NO_HINTS
+    /// environment variable, which the flag beats.
+    #[arg(
+        long,
+        global = true,
+        env = "SKOT_NO_HINTS",
+        value_parser = BoolishValueParser::new()
+    )]
     pub no_hints: bool,
 
     /// Do not ask: every question takes what Enter would give, a confirmation with
     /// nothing to give is answered yes, and any other question only a flag can answer
-    /// is refused with that flag.
-    #[arg(long, short = 'y', global = true)]
+    /// is refused with that flag. Also read from the SKOT_YES environment variable,
+    /// which the flag beats.
+    #[arg(
+        long,
+        short = 'y',
+        global = true,
+        env = "SKOT_YES",
+        value_parser = BoolishValueParser::new()
+    )]
     pub yes: bool,
 
-    /// More detail: `-v` debug, `-vv` trace. Repeat for more.
-    #[arg(long, short = 'v', global = true, action = ArgAction::Count)]
+    /// More detail: `-v` debug, `-vv` trace. Repeat for more. Also read from the
+    /// SKOT_VERBOSE environment variable as a number: `SKOT_VERBOSE=2` is `-vv`.
+    #[arg(
+        long,
+        short = 'v',
+        global = true,
+        action = ArgAction::Count,
+        env = "SKOT_VERBOSE"
+    )]
     pub verbose: u8,
 
     #[command(subcommand)]
