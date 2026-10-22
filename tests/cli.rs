@@ -832,3 +832,57 @@ fn an_offline_pull_request_import_refuses_the_upstream_once() {
         "one refusal for the whole run:\n{err}"
     );
 }
+
+/// `hooks` lists every lifecycle slot, configured or not: "not configured" and "not a
+/// slot" are different answers, and the report must not merge them into one silence.
+#[test]
+fn hooks_lists_every_lifecycle_slot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _layout = bare_project(tmp.path());
+
+    let out = skot(tmp.path(), &["hooks"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(text.contains("pre-sync"), "every slot is listed: {text}");
+    assert!(
+        text.contains("(not configured)"),
+        "an unset slot says so: {text}"
+    );
+
+    let out = skot(tmp.path(), &["hooks", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let doc: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap_or_else(|err| {
+        let text = stdout(&out);
+        panic!("stdout is one JSON document: {err}: {text}")
+    });
+    let lifecycle = doc["lifecycle"].as_array().expect("a list of slots");
+    assert_eq!(lifecycle.len(), 7, "every slot in the document: {doc}");
+    assert!(
+        lifecycle.iter().all(|slot| slot["cmd"].is_null()),
+        "an unset slot is null, not missing: {doc}"
+    );
+}
+
+/// A run nobody was present for takes every default without showing its work. Sandbox
+/// policy and keep are decisions, not scenery: the report says which ones it took.
+#[test]
+fn a_silent_init_reports_what_it_defaulted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = tmp.path().join("origin.git");
+    bare_with_one_commit(&origin);
+    let root = tmp.path().join("proj");
+    std::fs::create_dir_all(root.join("vendor")).unwrap();
+
+    let out = skot(
+        &root,
+        &["init", "--url", &origin.display().to_string(), "--yes"],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let log = stderr(&out);
+    assert!(
+        log.contains("sandbox policy defaulted to persistent"),
+        "{log}"
+    );
+    assert!(log.contains("keep defaulted to vendor"), "{log}");
+}

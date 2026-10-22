@@ -358,6 +358,10 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
                 None,
             );
             let answer = chosen.context("asking for the sandbox policy")?;
+            // A run nobody was present for took this without showing its work.
+            if !asker.is_interactive() && !ctx.cli.json {
+                info!(target: "init", "sandbox policy defaulted to persistent (pass --policy to choose)");
+            }
             Some(if answer.starts_with("ephemeral") {
                 SandboxPolicy::Ephemeral
             } else {
@@ -381,6 +385,9 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
                     Fallback::Default(candidates),
                 )
                 .context("asking which paths to protect")?;
+            if !asker.is_interactive() && !ctx.cli.json && !selected.is_empty() {
+                info!(target: "init", "keep defaulted to {} (pass --keep to choose)", selected.join(", "));
+            }
             (!selected.is_empty()).then_some(selected)
         }
     };

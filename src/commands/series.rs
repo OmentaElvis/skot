@@ -9,7 +9,7 @@
 use std::fs;
 
 use anyhow::{Context, Result, bail};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 
 use crate::cli::{
     SeriesArgs, SeriesCommand, SeriesCopyArgs, SeriesCreateArgs, SeriesDropArgs, SeriesRenameArgs,
@@ -515,6 +515,7 @@ fn drop_series(ctx: &Ctx, args: &SeriesDropArgs) -> Result<Exit> {
     }
     drop(lock);
 
+    follow_committed_default(ctx, &args.name, None);
     debug!(target: "series", "dropped `{}` ({patches} patches)", args.name);
     if ctx.cli.json {
         emit_json(&serde_json::json!({
@@ -566,6 +567,63 @@ fn remove_sandbox_tree(layout: &Layout) -> Result<()> {
         bail!("refusing to remove {}: not a sandbox tree.", dir.display());
     }
     fs::remove_dir_all(&dir).context(format!("removing {}", dir.display()))
+}
+
+/// Keep the committed default in `skot.toml` from naming a series that is gone. The
+/// field is the project's checked-in choice, and `rename` or `drop` just made the name
+/// it holds wrong. One line is rewritten, or commented out when the series is dropped,
+/// and nothing else in the file moves. The command behind it has already happened by
+/// the time this runs, so anything this cannot do is a log line, never a failure.
+fn follow_committed_default(ctx: &Ctx, from: &str, to: Option<&str>) {
+    let named = ctx
+        .config()
+        .is_ok_and(|config| config.series.as_deref() == Some(from));
+    if !named {
+        return;
+    }
+    let path = ctx.layout.config_file();
+    let Ok(text) = fs::read_to_string(&path) else {
+        return;
+    };
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let mut edited = false;
+    for line in &mut lines {
+        // The key lives at the top level: everything after the first table header
+        // belongs to that table.
+        if line.trim_start().starts_with('[') {
+            break;
+        }
+        let series_key = line
+            .trim_start()
+            .strip_prefix("series")
+            .is_some_and(|rest| rest.trim_start().starts_with('='));
+        if series_key {
+            *line = match to {
+                Some(name) => format!("series = {}", toml::Value::String(name.to_owned())),
+                None => format!("# {line}"),
+            };
+            edited = true;
+            break;
+        }
+    }
+    if !edited {
+        return;
+    }
+    let mut out = lines.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    if let Err(err) = fs::write(&path, &out) {
+        warn!(target: "series", "could not update {}: {err}", path.display());
+        return;
+    }
+    match to {
+        Some(name) => info!(target: "series", "the committed default series is now `{name}`"),
+        None => info!(
+            target: "series",
+            "the committed default named `{from}`; its line is commented out"
+        ),
+    }
 }
 
 /// `skot series rename <name>`: the active series under a new name.
@@ -667,6 +725,7 @@ fn rename(ctx: &Ctx, args: &SeriesRenameArgs) -> Result<Exit> {
     }
     drop(lock);
 
+    follow_committed_default(ctx, &from, Some(&args.name));
     debug!(
         target: "series",
         "renamed `{from}` to `{}` ({} work areas)",
@@ -1124,6 +1183,50 @@ mod tests {
     }
 
     #[test]
+    fn dropping_comments_out_a_committed_default_that_named_it() {
+        // The committed default must never name a series that is gone. Dropping the
+        // series it holds is that situation, so the line goes, not the rest of the file.
+        let (_tmp, layout) = crate::commands::testsupport::project();
+        create(&ctx_for(&layout), "exp").unwrap();
+        write_series(&layout.with_series("exp").unwrap(), &[("a.patch", "a\n")]);
+        fs::write(
+            layout.config_file(),
+            "# keep this comment\nseries = \"exp\"\n[upstream]\nurl = \"unused\"\n",
+        )
+        .unwrap();
+        // Back on the default: `exp` is droppable, and the committed default still
+        // names it, which is the situation the line-edit exists for. Switching is a
+        // local act and leaves that line alone.
+        switch(
+            &ctx_for(&layout.with_series("exp").unwrap()),
+            DEFAULT_SERIES,
+        )
+        .unwrap();
+        let ctx = Ctx {
+            layout: layout.with_series(DEFAULT_SERIES).unwrap(),
+            cli: Cli::try_parse_from(["skot", "series", "drop", "exp", "--yes"]).unwrap(),
+            yes: true,
+        };
+
+        call(
+            &ctx,
+            Some(SeriesCommand::Drop(SeriesDropArgs {
+                name: "exp".to_owned(),
+            })),
+        )
+        .unwrap();
+
+        let text = fs::read_to_string(layout.config_file()).unwrap();
+        assert!(text.contains("# series = \"exp\""), "{text}");
+        assert!(text.contains("# keep this comment"), "{text}");
+        assert_eq!(
+            crate::config::Config::parse(&text).unwrap().series,
+            None,
+            "no series named in the file any more"
+        );
+    }
+
+    #[test]
     fn dropping_without_yes_in_a_prompt_free_environment_is_told_how() {
         let (_tmp, layout) = crate::commands::testsupport::project();
         create(&ctx_for(&layout), "exp").unwrap();
@@ -1185,6 +1288,32 @@ mod tests {
             State::load(&layout).unwrap().active_series(),
             Some("renamed")
         );
+    }
+
+    #[test]
+    fn renaming_follows_the_committed_default_series_line() {
+        // The `series` field is the project's checked-in default. Renaming the series it
+        // names must not leave the line naming something that is gone.
+        let (_tmp, layout) = crate::commands::testsupport::project();
+        create(&ctx_for(&layout), "exp").unwrap();
+        fs::write(
+            layout.config_file(),
+            "# keep this comment\nseries = \"exp\"\n[upstream]\nurl = \"unused\"\n",
+        )
+        .unwrap();
+        let ctx = ctx_for(&layout.with_series("exp").unwrap());
+
+        call(
+            &ctx,
+            Some(SeriesCommand::Rename(SeriesRenameArgs {
+                name: "renamed".to_owned(),
+            })),
+        )
+        .unwrap();
+
+        let text = fs::read_to_string(layout.config_file()).unwrap();
+        assert!(text.contains("series = \"renamed\""), "{text}");
+        assert!(text.contains("# keep this comment"), "{text}");
     }
 
     #[test]

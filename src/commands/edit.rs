@@ -21,11 +21,11 @@ use log::{debug, info};
 use serde_json::json;
 
 use crate::cli::EditArgs;
+use crate::commands::authoring;
 use crate::commands::{Ctx, Exit, emit_json};
 use crate::hints::Hints;
 use crate::invocation::skot_args;
 use crate::layout::Layout;
-use crate::series::Series;
 use crate::session::{self, Session};
 use crate::state::State;
 
@@ -86,31 +86,33 @@ fn open(
     let _lock = layout.lock()?;
     let manifest = session::reconcile(layout)?;
     let mut discarded = false;
-    if let Some(existing) = find(layout, &manifest, patch) {
-        if !session::unsaved(layout, existing)? {
-            // Matches the patch: not a complaint, just where the user was. Return to it.
-            return Ok((existing.clone(), false, false));
+
+    // An exact name or file name: the common way back to work, answered before the
+    // series is read, so a work area the user already has stays reachable even if the
+    // series itself has since become unreadable.
+    let exact = find(layout, &manifest, patch);
+    if let Some(existing) = exact {
+        match resume_or_discard(layout, existing, patch, discard)? {
+            Some(answer) => return Ok(answer),
+            None => discarded = true,
         }
-        if !discard {
-            bail!(
-                "{} has unsaved changes.\n\
-                 `{}` saves them; `{}` discards them and starts over.",
-                existing.patch,
-                skot_args("save", &existing.patch),
-                skot_args("edit", &format!("--discard {patch}"))
-            );
-        }
-        // The informed override. `end` takes the worktree and the record; the patch file
-        // is untouched either way, because unsaved changes live only in the worktree.
-        session::end(layout, existing)?;
-        discarded = true;
     }
 
     let (config, series) = layout.project()?;
     let entries = series.entries_lenient(layout);
-    let Some(index) = position(&entries, patch) else {
-        bail!("{}", not_in_series(&series, &entries, patch));
-    };
+    let index = position(&entries, patch)?;
+
+    // A prefix or a position can name the patch an exact match would have found above:
+    // resolve it, then look again under the name it resolved to. Skipped after an exact
+    // hit, whose record `discard` has already ended while this manifest still holds it.
+    if exact.is_none()
+        && let Some(existing) = find(layout, &manifest, &entries[index].name)
+    {
+        match resume_or_discard(layout, existing, patch, discard)? {
+            Some(answer) => return Ok(answer),
+            None => discarded = true,
+        }
+    }
     let entry = entries[index].clone();
 
     let base = match base {
@@ -156,24 +158,56 @@ fn find<'s>(
     })
 }
 
-/// Where `patch` sits in the enabled series, if it is there at all.
-fn position(entries: &[crate::series::Entry], patch: &str) -> Option<usize> {
-    entries
-        .iter()
-        .position(|e| e.name == patch || e.path.file_name().is_some_and(|f| f == patch))
+/// An existing work area: return to it when it matches its patch, refuse when it holds
+/// changes the user did not ask to lose, or, with `discard`, end it so a fresh one can
+/// open. `Some` is the answer to hand back; `None` means the caller carries on opening.
+fn resume_or_discard(
+    layout: &Layout,
+    existing: &Session,
+    patch: &str,
+    discard: bool,
+) -> Result<Option<(Session, bool, bool)>> {
+    if !session::unsaved(layout, existing)? {
+        // Matches the patch: not a complaint, just where the user was. Return to it.
+        return Ok(Some((existing.clone(), false, false)));
+    }
+    if !discard {
+        bail!(
+            "{} has unsaved changes.\n\
+             `{}` saves them; `{}` discards them and starts over.",
+            existing.patch,
+            skot_args("save", &existing.patch),
+            skot_args("edit", &format!("--discard {patch}"))
+        );
+    }
+    // The informed override. `end` takes the worktree and the record; the patch file
+    // is untouched either way, because unsaved changes live only in the worktree.
+    session::end(layout, existing)?;
+    Ok(None)
 }
 
-fn not_in_series(series: &Series, entries: &[crate::series::Entry], patch: &str) -> String {
-    let known: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-    format!(
-        "`{patch}` is not in the series at {}. Patches in it: {}",
-        series.path().display(),
-        if known.is_empty() {
-            "(none)".to_owned()
-        } else {
-            known.join(", ")
-        }
-    )
+/// Where `patch` sits in the enabled series: read the way every `[PATCH]` argument reads
+/// one, a name, a unique prefix, or a 1-based position, plus the bare file name `edit`
+/// has always accepted. A miss fails with the shared resolver's wording, so `edit` says
+/// what the other commands say.
+fn position(entries: &[crate::series::Entry], patch: &str) -> Result<usize> {
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    // The universe is every spelling the argument may use; the position space is the
+    // series as it stands.
+    let mut all = names.clone();
+    all.extend(
+        entries
+            .iter()
+            .filter_map(|e| e.path.file_name().and_then(|f| f.to_str()))
+            .filter(|f| !names.contains(f)),
+    );
+    let resolved = authoring::resolve_patch(&all, &names, patch)?.name(&names);
+    Ok(entries
+        .iter()
+        .position(|e| {
+            e.name == resolved || e.path.file_name().is_some_and(|f| f == resolved.as_str())
+        })
+        .expect("resolved name is in the series"))
 }
 
 #[cfg(test)]
@@ -375,6 +409,37 @@ mod tests {
         let err = open(&layout, "nope", None, false).unwrap_err().to_string();
         assert!(err.contains("a.patch"), "the message should list it: {err}");
         assert!(err.contains("b.patch"), "the message should list it: {err}");
+    }
+
+    #[test]
+    fn a_unique_prefix_and_a_position_name_a_patch() {
+        // The help on `[PATCH]` promises a name, a unique prefix or a 1-based position;
+        // every other `[PATCH]` command reads all three, and `edit` must agree.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = series_only(tmp.path());
+
+        let (session, opened, _) = open(&layout, "a", None, false).unwrap();
+        assert!(opened, "a prefix opens the patch it names");
+        assert_eq!(session.patch, "a.patch");
+
+        let (session, opened, _) = open(&layout, "2", None, false).unwrap();
+        assert!(opened, "a position opens the patch at it");
+        assert_eq!(session.patch, "b.patch");
+    }
+
+    #[test]
+    fn a_prefix_returns_to_the_work_area_that_patch_already_has() {
+        // Resolving a prefix must land on the same work area an exact name reaches: the
+        // work area is keyed by the patch, not by how the argument spelled it.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = series_only(tmp.path());
+        let (session, _, _) = open(&layout, "b.patch", None, false).unwrap();
+
+        let (again, opened, discarded) = open(&layout, "b", None, false).unwrap();
+
+        assert!(!opened, "the existing work area is returned to");
+        assert!(!discarded);
+        assert_eq!(again, session);
     }
 
     #[test]

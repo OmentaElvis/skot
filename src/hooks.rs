@@ -143,7 +143,14 @@ pub fn run_one(hook: &Resolved, env: &Env, config: &Config, json: bool) -> Resul
             Some(point) if point.runs_in_project_root() => &env.project_root,
             _ => &env.sandbox,
         };
-        base.join(&hook.cwd)
+        // A cwd of `.` is the base itself, and `./sub` is `sub`: joining them would put
+        // a stray `.` into the path every failure line prints.
+        let rel = hook.cwd.strip_prefix(".").unwrap_or(&hook.cwd);
+        if rel.as_os_str().is_empty() {
+            base.clone()
+        } else {
+            base.join(rel)
+        }
     };
 
     debug!(target: "hook", "{} cwd {}", hook.name, cwd.display());
@@ -407,6 +414,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("exit status 3"), "got {err}");
+        assert!(
+            err.contains(&format!("(in {})", sandbox.display())),
+            "the failure names the directory itself, not a `.` joined onto it: {err}"
+        );
     }
 
     #[test]

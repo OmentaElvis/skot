@@ -110,6 +110,13 @@ impl Asker {
         }
     }
 
+    /// Whether anyone is there to answer: `--json`, `--yes`, and a missing terminal
+    /// all mean no. A site that takes a default on a silent run reports it; on an
+    /// interactive one the question just showed the same default on screen.
+    pub fn is_interactive(&self) -> bool {
+        self.interactive
+    }
+
     /// A line of text. Enter answers empty, so a silent run answers empty too and
     /// the site maps that to its default the same way it maps an empty line. `esc`
     /// names what Esc answers here (the wizard's value prompt goes back), so the line
