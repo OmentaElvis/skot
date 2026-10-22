@@ -13,17 +13,51 @@ use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use crate::invocation::{skot, skot_args};
 use crate::phase::Phase;
 
+pub const ASCII_LOGO: &str = concat!(
+    r#"
+                              
+  ▄▄▄▄▄              ▄▄▄▄▄▄▄  
+ ██▀▀▀▀█▄           █▀▀██▀▀▀▀ 
+ ▀██▄  ▄▀ ▄▄           ██     
+   ▀██▄▄  ██ ▄█▀ ▄███▄ ██     
+ ▄   ▀██▄ ████   ██ ██ ██     
+ ▀██████▀▄██ ▀█▄▄▀███▀ ▀██▄   
+            v"#,
+    env!("CARGO_PKG_VERSION"),
+    "\n",
+    " Maintain your changes as a \n  patch series, not a fork."
+);
+
+const PROSE: &str = r#"
+skot lets you maintain your changes to someone else's project as
+a series of patches instead of a fork. Each patch stays small
+enough to review, and you can reorder, disable or rebase any of
+them when upstream moves.
+
+Upstream can be a remote repository, a local folder, or any
+other git source. You can import patches from a pull request, a
+commit range or another checkout. You can also keep several
+series side by side, one for each branch, tag or ref you
+maintain, and switch between them as needed.
+
+skot handles the mirror, the checkout and the series. Your
+language, build system and artifact location stay yours: hooks
+in skot.toml let you run your own commands at each stage of the
+build, so skot works with any kind of project.
+"#;
+
+/// The long help page renders `long_about` instead of `about`, so it carries the
+/// logo above the prose.
+fn long_about() -> String {
+    format!("{ASCII_LOGO}\n\n{PROSE}")
+}
+
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "skot",
     version,
-    about = "Keep your changes to an upstream repo as a patch series.",
-    long_about = "skot keeps your changes as an ordered series of patch files rather than as a \
-                  fork, so they stay reviewable, individually droppable, and individually \
-                  rebasable when upstream moves.\n\n\
-                  skot knows how to manage a sandbox and a patch series. It does not know \
-                  your language, your build system, or where your artifact goes: those are \
-                  hooks in skot.toml.",
+    about = ASCII_LOGO,
+    long_about = long_about(),
     propagate_version = true,
     disable_help_subcommand = false
 )]
@@ -1118,18 +1152,21 @@ mod tests {
 
     /// The command name at the start of a rendered help row, if the line is one.
     ///
-    /// Whole-row, whole-word: a styled substring count would see a longer name twice.
+    /// A row is shaped the way `push_row` writes it: the name, then at least two
+    /// spaces of name column, then the description. Prose reads `name words` with a
+    /// single space, so no sentence in an about or a hint can take a command's place.
     fn row_name(line: &str) -> Option<String> {
         let stripped = strip_ansi(line);
-        let mut words = stripped.split_whitespace().map(str::to_owned);
-        let name = words.next()?;
-        // A row's name is followed by its description; a bare word with nothing after it
-        // is a heading or an option, not a command row.
-        words.next()?;
-        name.chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_lowercase())
-            .then_some(name)
+        let rest = stripped.trim_start();
+        let name_end = rest.find(char::is_whitespace)?;
+        let name = &rest[..name_end];
+        let after_name = &rest[name_end..];
+        let gap = after_name.len() - after_name.trim_start().len();
+        let description = after_name.trim_start();
+        (gap >= 2
+            && !description.is_empty()
+            && name.chars().next().is_some_and(|c| c.is_ascii_lowercase()))
+        .then(|| name.to_owned())
     }
 
     /// Remove ANSI escapes so a row's words can be compared plainly.

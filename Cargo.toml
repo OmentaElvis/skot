@@ -2,11 +2,11 @@
 name = "skot"
 version = "0.1.0"
 edition = "2024"
-description = "Manage a patch series against an upstream git repository and build the result, without a fork."
+description = "Manage a patch series against an upstream git repository and build easily produce build outputs."
 license = "MIT"
-repository = "https://github.com/you/skot"
+repository = "https://github.com/OmentaElvis/skot"
 readme = "README.md"
-categories = ["command-line-utilities", "development-tools"]
+categories = ["command-line-utilities", "development-tools", "git"]
 
 [[bin]]
 name = "skot"
