@@ -237,12 +237,35 @@ pub fn open_named(
     dir: &Path,
     remedy: &str,
 ) -> Result<git2::Repository> {
-    let worktree = mirror.repo().find_worktree(name).context(format!(
-        "the mirror at {} has no `{name}` worktree registered.\n{remedy}",
-        mirror.path().display()
-    ))?;
-    git2::Repository::open_from_worktree(&worktree)
-        .context(format!("opening `{name}` at {}", dir.display()))
+    let worktree = mirror.repo().find_worktree(name).map_err(|err| {
+        // Registered but unusable is a different fact from never registered: git
+        // records worktree paths absolutely, and a registration whose recorded paths
+        // are gone is what a moved project directory looks like.
+        let diagnosis = match err.class() {
+            git2::ErrorClass::Worktree => format!(
+                "the `{name}` worktree is registered in the mirror at {}, but its \
+                 registration is unusable: the paths git recorded with it no longer exist, \
+                 which is what a moved project directory does.\n{remedy}",
+                mirror.path().display()
+            ),
+            _ => format!(
+                "the mirror at {} has no `{name}` worktree registered.\n{remedy}",
+                mirror.path().display()
+            ),
+        };
+        anyhow::Error::new(err).context(diagnosis)
+    })?;
+    git2::Repository::open_from_worktree(&worktree).map_err(|err| {
+        let diagnosis = match err.class() {
+            git2::ErrorClass::Worktree => format!(
+                "the `{name}` worktree cannot be opened: the paths git recorded with its \
+                 registration no longer exist, which is what a moved project directory does.\n\
+                 {remedy}"
+            ),
+            _ => format!("opening `{name}` at {}", dir.display()),
+        };
+        anyhow::Error::new(err).context(diagnosis)
+    })
 }
 
 /// The commit the sandbox is checked out at.
@@ -467,8 +490,8 @@ pub fn verify_objects(layout: &Layout, mirror: &Mirror, sha: &Sha) -> Result<()>
     let oid =
         git2::Oid::from_str(sha).map_err(|e| anyhow::anyhow!("{sha} is not a commit id: {e}"))?;
 
-    let broken = |what: String| -> anyhow::Error {
-        anyhow::anyhow!(
+    let broken = |what: String| -> String {
+        format!(
             "{what}\n\
              The sandbox at {} shares its objects with the mirror at {}, so it cannot work \
              without it.\n\
@@ -481,36 +504,42 @@ pub fn verify_objects(layout: &Layout, mirror: &Mirror, sha: &Sha) -> Result<()>
         )
     };
 
-    let repo = git2::Repository::open_bare(mirror.path()).map_err(|e| {
-        broken(format!(
-            "the mirror at {} is unusable: {e}",
+    let repo = git2::Repository::open_bare(mirror.path()).map_err(|err| {
+        anyhow::Error::new(err).context(broken(format!(
+            "the mirror at {} is unusable",
             mirror.path().display()
-        ))
+        )))
     })?;
 
     let name = sandbox_worktree_name(layout);
-    if repo.find_worktree(&name).is_err() {
-        return Err(broken(format!(
-            "the mirror at {} has no `{name}` worktree registered, so the sandbox \
-             at {} is not a worktree of it.",
+    let worktree = repo.find_worktree(&name).map_err(|err| match err.class() {
+        // Registered but unusable: git's recorded paths are gone, which is what a
+        // moved project directory does. Different fact from never registered.
+        git2::ErrorClass::Worktree => anyhow::Error::new(err).context(broken(format!(
+            "the mirror at {} has a `{name}` worktree registration, but it is unusable: \
+             the paths git recorded with it no longer exist, which is what a moved project \
+             directory does",
+            mirror.path().display()
+        ))),
+        _ => anyhow::Error::new(err).context(broken(format!(
+            "the mirror at {} has no `{name}` worktree registered, so the sandbox at {} \
+             is not a worktree of it",
             mirror.path().display(),
             layout.sandbox_dir().display()
-        )));
-    }
-
-    let worktree = repo.find_worktree(&name).expect("just checked");
-    let sandbox = git2::Repository::open_from_worktree(&worktree).map_err(|e| {
-        broken(format!(
-            "the sandbox at {} cannot be opened through the mirror: {e}",
+        ))),
+    })?;
+    let sandbox = git2::Repository::open_from_worktree(&worktree).map_err(|err| {
+        anyhow::Error::new(err).context(broken(format!(
+            "the sandbox at {} cannot be opened through the mirror",
             layout.sandbox_dir().display()
-        ))
+        )))
     })?;
 
-    sandbox.find_object(oid, None).map(|_| ()).map_err(|e| {
-        broken(format!(
-            "the sandbox at {} cannot read commit {sha}: {e}",
+    sandbox.find_object(oid, None).map(|_| ()).map_err(|err| {
+        anyhow::Error::new(err).context(broken(format!(
+            "the sandbox at {} cannot read commit {sha}",
             layout.sandbox_dir().display()
-        ))
+        )))
     })
 }
 

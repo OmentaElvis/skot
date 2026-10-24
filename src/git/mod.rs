@@ -23,6 +23,24 @@ pub type Sha = String;
 /// Deliberately *not* doing anything clever: a ref either resolves or it does not, and
 /// saying so is more useful than guessing.
 pub fn resolve_ref(repo: &git2::Repository, name: &str) -> Result<Sha> {
+    // A commit expression first: neither `refs/tags/` nor `refs/heads/` means anything
+    // to it, and a miss here is about the history behind the expression rather than
+    // about spelling, so it says that with libgit2's own detail underneath.
+    if mirror::is_commit_expression(name) {
+        return match repo.revparse_single(name) {
+            Ok(obj) => match obj.peel(git2::ObjectType::Commit) {
+                Ok(commit) => Ok(commit.id().to_string()),
+                Err(err) => Err(anyhow::Error::new(err)
+                    .context(format!("`{name}` resolves, but not to a commit"))),
+            },
+            Err(err) => Err(anyhow::Error::new(err).context(format!(
+                "`{name}` is a commit expression, and the mirror does not hold the \
+                 history behind it.\n\
+                 Fetch the ref it reads from (`{}`), or pass a ref.",
+                crate::invocation::skot_args("sync", mirror::commit_expression_base(name))
+            ))),
+        };
+    }
     for candidate in [format!("refs/tags/{name}"), format!("refs/heads/{name}")] {
         if let Some(id) = try_commit(repo, &candidate) {
             return Ok(id);

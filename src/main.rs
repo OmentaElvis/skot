@@ -60,10 +60,9 @@ fn main() -> ExitCode {
             if cli.json {
                 return json_failure(&format!("{err:?}"), 1);
             }
+            // `{:?}` prints the whole chain, message and every context beneath it, which
+            // is what makes a failure debuggable from the log alone.
             log::error!("Error: {:?}", err);
-            for cause in err.chain().skip(1) {
-                log::debug!("caused by: {cause}");
-            }
             ExitCode::FAILURE
         }
     }

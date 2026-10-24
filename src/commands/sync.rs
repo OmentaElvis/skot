@@ -148,6 +148,33 @@ fn sync(layout: &Layout, ref_name: Option<&str>, refresh: bool) -> Result<SyncOu
         }
     }
 
+    // A commit expression cannot be fetched: it is a statement about history, not a ref,
+    // and the fetch below could only offer it as a refspec and be refused. The mirror
+    // answers it directly when it holds the history behind it, `--refresh` or not, since
+    // there is nothing to refresh for an expression; when it does not, `resolve_ref`'s
+    // failure already carries the reason with libgit2's own detail chained beneath it.
+    if let Some(wanted) = &wanted
+        && mirror::is_commit_expression(wanted)
+    {
+        if existed {
+            let mirror = Mirror::open(layout)?;
+            return match mirror.resolve(wanted) {
+                Ok(sha) => {
+                    info!(target: "sync", "have {wanted} at {sha}");
+                    report(&mirror, url.as_deref(), false, false)
+                }
+                Err(err) => Err(err),
+            };
+        }
+        let base = mirror::commit_expression_base(wanted);
+        bail!(
+            "`{wanted}` is a commit expression: it names a commit relative to another, \
+             not a ref, so it cannot be fetched.\n\
+             Fetch the ref it reads from first (`{}`), or pass a ref.",
+            skot_args("sync", base)
+        );
+    }
+
     // The network path: the mirror is cold, the ref is missing, or an update was asked
     // for. The fetch takes exactly `wanted` (or the whole upstream when nothing names a
     // ref), so one checked-out tree does not drag every branch and tag behind it.

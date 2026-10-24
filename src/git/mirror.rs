@@ -491,6 +491,19 @@ pub(crate) fn is_commit_id(name: &str) -> bool {
     matches!(name.len(), 40 | 64) && name.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// A commit expression: `main~1`, `main^2`, `HEAD@{1}`. It names a commit relative to
+/// another rather than a ref, so no refspec can carry it to a remote, and the mirror
+/// resolves it only as far as the history it holds.
+pub(crate) fn is_commit_expression(name: &str) -> bool {
+    name.contains('~') || name.contains('^') || name.contains("@{")
+}
+
+/// The ref an expression reads from: `main~1` to `main`, `HEAD@{1}` to `HEAD`. The
+/// thing to fetch first when the mirror cannot answer the expression itself.
+pub(crate) fn commit_expression_base(name: &str) -> &str {
+    name.split(['~', '^', '@']).next().unwrap_or(name)
+}
+
 /// Point the mirror's HEAD at `name` as a branch, or detached at it as a tag. False
 /// when the mirror has neither, for the caller to fall back on.
 fn point_head_at(repo: &git2::Repository, name: &str) -> Result<bool> {
