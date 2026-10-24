@@ -171,7 +171,9 @@ fn run_all(ctx: &Ctx, args: &CheckArgs) -> Result<Exit> {
 /// The report behind both entries: resolve, select the entries, check them.
 ///
 /// The ref chain is the one everywhere else in skot: the argument, then the series'
-/// own base, then `upstream.default-ref`, then what the sandbox holds.
+/// own base, then `upstream.default-ref`, then what the sandbox holds, and at the very
+/// end the mirror's own HEAD, which is the base these patches were recorded against
+/// when nothing named one.
 fn check_one(args: &CheckArgs, layout: &Layout) -> Result<crate::check::Report> {
     let (config, series) = layout.project()?;
     let all = series.require_resolvable(layout)?;
@@ -187,7 +189,8 @@ fn check_one(args: &CheckArgs, layout: &Layout) -> Result<crate::check::Report> 
         .clone()
         .or_else(|| layout.base_ref())
         .or_else(|| config.upstream.default_ref.clone())
-        .or_else(|| git::sandbox::current_ref(layout));
+        .or_else(|| git::sandbox::current_ref(layout))
+        .or_else(|| super::mirror_head_ref(layout, "check"));
 
     match wanted {
         Some(name) => {
@@ -210,7 +213,8 @@ fn check_one(args: &CheckArgs, layout: &Layout) -> Result<crate::check::Report> 
                 anyhow::bail!(
                     "nothing to check against.\n\
                      No ref was given, the series has no base, `upstream.default-ref` is \
-                     unset, and there is no sandbox yet.\n\
+                     unset, there is no sandbox yet, and the mirror has no HEAD branch to \
+                     stand in either.\n\
                      Pass one (`{}`), record one with `{}`, set `upstream.default-ref` \
                      in {}, or run `{}` first.",
                     skot_args("check", "main"),
@@ -401,5 +405,17 @@ mod tests {
 
         assert!(err.contains("does not list"), "{err}");
         assert!(err.contains("unapply"), "{err}");
+    }
+
+    #[test]
+    fn a_check_with_no_ref_falls_back_to_the_mirrors_own_head() {
+        // Fresh project: no argument, no series base, no `upstream.default-ref`, no
+        // sandbox. `import` recorded these patches against the mirror's own HEAD, so
+        // `check` right after it answers from the same place instead of refusing.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::mirror_with_one_commit(tmp.path());
+        testsupport::write_series(&layout, &[("a.patch", testsupport::patch_one())]);
+
+        assert_eq!(run(&ctx_for(&layout), &args(false)).unwrap(), Exit::Success);
     }
 }

@@ -221,24 +221,30 @@ fn scaffold(layout: &Layout, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
-/// What the scaffold left open that blocks a command, said out loud.
-///
-/// A missing url or default-ref stops commands cold, so both belong in the report. An
-/// unset build hook does not: an apply-only project is finished as it stands, and the
-/// `next` hints already point at the `[hooks]` section for anyone who wants one.
-fn todo_notes(layout: &Layout, plan: &Plan) -> Vec<String> {
+/// What the scaffold left open, said with whether it blocks a command. A missing url
+/// stops everything that reaches the upstream, so it is a warning; a missing
+/// default-ref blocks nothing, the mirror's own HEAD standing in wherever a base is
+/// needed, so it is a note.
+fn todo_notes(layout: &Layout, plan: &Plan) -> Vec<(bool, String)> {
     let config = layout.config_file().display().to_string();
     let mut notes = Vec::new();
     if plan.url.is_none() {
-        notes.push(format!(
-            "upstream.url is not set: run `{}` again, or edit {config}",
-            skot_args("init", "--url <repository>")
+        notes.push((
+            true,
+            format!(
+                "upstream.url is not set: run `{}` again, or edit {config}",
+                skot_args("init", "--url <repository>")
+            ),
         ));
     }
     if plan.default_ref.is_none() {
-        notes.push(format!(
-            "upstream.default-ref is not set: pass a ref (as in `{}`), or edit {config}",
-            skot_args("apply", "main")
+        notes.push((
+            false,
+            format!(
+                "upstream.default-ref is not set: skot uses the mirror's own HEAD where a \
+                 base is needed; pin one with `{}` or by editing {config}",
+                skot_args("apply", "main")
+            ),
         ));
     }
     notes
@@ -524,12 +530,16 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
             "series": layout.series_file().display().to_string(),
             "patches": layout.patches_dir().display().to_string(),
             "sync": sync,
-            "todo": todo,
+            "todo": todo.iter().map(|(_, text)| text.clone()).collect::<Vec<_>>(),
         }))
         .context("writing the document to stdout")?;
     } else {
-        for note in &todo {
-            warn!(target: "init", "{note}");
+        for (blocking, note) in &todo {
+            if *blocking {
+                warn!(target: "init", "{note}");
+            } else {
+                info!(target: "init", "{note}");
+            }
         }
         let mut hints = Hints::new("next").line(
             "edit the [hooks] section to describe how you build and where the result\n  \

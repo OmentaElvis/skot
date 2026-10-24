@@ -132,10 +132,11 @@ pub fn run(ctx: &Ctx, args: &BuildArgs) -> Result<Exit> {
     Ok(Exit::Success)
 }
 
-/// The ref to build: the argument, then the configured default, with build's advice.
+/// The ref to build: the argument, then the configured default, then the mirror's own
+/// HEAD, with build's advice.
 ///
-/// `layout` only supplies the config file's path for the message; the parameters are all
-/// scalars, so this is testable without a command line.
+/// `layout` supplies the config file's path for the message and the mirror for that last
+/// resort; the rest is scalars, so this is testable without a command line.
 fn the_ref(layout: &Layout, config: &Config, ref_name: Option<&str>) -> Result<String> {
     if let Some(name) = ref_name {
         debug!(target: "build", "ref from the argument: {name}");
@@ -149,12 +150,17 @@ fn the_ref(layout: &Layout, config: &Config, ref_name: Option<&str>) -> Result<S
         target: "build",
         "no ref argument and no base; consulting `upstream.default-ref`"
     );
-    config.upstream.default_ref.clone().context(format!(
-        "no ref to build.\n\
-             Pass one (`{}`), record a base for this series, or set `upstream.default-ref` in {}.",
-        skot_args("build", "v1.2.0"),
-        layout.config_file().display()
-    ))
+    config
+        .upstream
+        .default_ref
+        .clone()
+        .or_else(|| super::mirror_head_ref(layout, "build"))
+        .context(format!(
+            "no ref to build.\n\
+                 Pass one (`{}`), record a base for this series, or set `upstream.default-ref` in {}.",
+            skot_args("build", "v1.2.0"),
+            layout.config_file().display()
+        ))
 }
 
 /// Run the selected phases in order, and return the names of the ones that ran.
@@ -444,6 +450,18 @@ mod tests {
         let (config, _) = layout.project().unwrap();
         let err = the_ref(&layout, &config, None).unwrap_err().to_string();
         assert!(err.contains("upstream.default-ref"), "got {err}");
+    }
+
+    #[test]
+    fn the_ref_falls_back_to_the_mirrors_own_head() {
+        // No argument, no series base, no `upstream.default-ref`: the branch the mirror
+        // itself points at is the base, the same one `import` takes for a range that
+        // left it to be worked out.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::mirror_with_one_commit(tmp.path());
+        let (config, _) = layout.project().unwrap();
+
+        assert_eq!(the_ref(&layout, &config, None).unwrap(), "main");
     }
 
     #[test]

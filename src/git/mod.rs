@@ -63,7 +63,7 @@ pub fn resolve_ref(repo: &git2::Repository, name: &str) -> Result<Sha> {
     )
 }
 
-fn try_commit(repo: &git2::Repository, rev: &str) -> Option<Sha> {
+pub(crate) fn try_commit(repo: &git2::Repository, rev: &str) -> Option<Sha> {
     repo.revparse_single(rev)
         .ok()?
         .peel(git2::ObjectType::Commit)

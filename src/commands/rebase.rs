@@ -226,7 +226,7 @@ pub fn run(ctx: &Ctx, arg: &RebaseArgs) -> Result<Exit> {
 /// scalars in, a description of the outcome out.
 fn rebase(layout: &Layout, ref_name: Option<&str>, into: Option<&str>) -> Result<Rebased> {
     let (config, series) = layout.project()?;
-    let new_base = authoring::wanted_ref(layout, ref_name, &config, &skot("rebase"))?;
+    let new_base = authoring::wanted_ref(layout, ref_name, &config, &skot("rebase"), "rebase")?;
 
     // An empty series has nothing to replay, so the rebase is the base move alone.
     if series.is_empty() {

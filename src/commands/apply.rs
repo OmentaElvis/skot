@@ -144,13 +144,14 @@ fn apply_inner(
         None => entries,
     };
 
-    // Argument, then the base the series sits on, then the configured default: the same
-    // chain every other command resolves a ref through, so `apply` after a `rebase` puts
-    // the sandbox where the rebase put the series.
+    // Argument, then the base the series sits on, then the configured default, then the
+    // mirror's own HEAD: the same chain every other command resolves a ref through, so
+    // `apply` after a `rebase` puts the sandbox where the rebase put the series.
     let wanted = ref_name
         .map(str::to_owned)
         .or_else(|| layout.base_ref())
-        .or_else(|| config.upstream.default_ref.clone());
+        .or_else(|| config.upstream.default_ref.clone())
+        .or_else(|| super::mirror_head_ref(layout, "apply"));
     let Some(wanted) = wanted else {
         bail!(
             "no ref to apply against.\n\
@@ -730,8 +731,9 @@ index 1111111..2222222 100644
 
     #[test]
     fn apply_without_a_ref_or_a_default_says_so() {
+        // The mirror's own HEAD stands in only when it exists: with no mirror at all,
+        // there is nothing left to fall back on and the advice still arrives.
         let f = Fixture::new();
-        f.with_upstream();
         std::fs::write(f.layout.config_file(), "[upstream]\nurl = \"u\"\n").unwrap();
         f.patch("a.patch", "");
         f.series(&["a.patch"]);
@@ -742,6 +744,21 @@ index 1111111..2222222 100644
             err.contains(&skot_args("apply", "main")),
             "no remedy offered: {err}"
         );
+    }
+
+    #[test]
+    fn apply_falls_back_to_the_mirrors_own_head() {
+        // No argument, no series base, no `upstream.default-ref`: the patch lands on the
+        // branch the mirror itself points at rather than demanding a ref first.
+        let f = Fixture::new();
+        f.with_upstream();
+        std::fs::write(f.layout.config_file(), "[upstream]\nurl = \"u\"\n").unwrap();
+        f.patch("a.patch", crate::commands::testsupport::patch_one());
+        f.series(&["a.patch"]);
+
+        apply_locked(&f.layout, None).unwrap();
+
+        assert_eq!(f.sandbox_file(), "first\n");
     }
 
     #[test]

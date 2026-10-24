@@ -27,6 +27,8 @@ pub const DEFAULT_SERIES: &str = "default";
 /// Starts with `@`, which a series name can never contain, so a shared sandbox and a
 /// per-series one can never claim the same path.
 pub const SHARED_SANDBOX: &str = "@shared";
+/// Where a `--repo` URL's objects live: one tracked store per source, under `.skot/`.
+pub const SOURCES_DIR: &str = "sources";
 
 /// All paths skot may read or write, derived from one project root.
 ///
@@ -294,6 +296,20 @@ impl Layout {
 
     pub fn mirror_dir(&self) -> PathBuf {
         self.state_dir().join("mirror.git")
+    }
+
+    /// The tracked stores skot keeps for `--repo` sources that are URLs, one bare
+    /// repository each, keyed by where they came from. The mirror's own directory is
+    /// never used for these: a source the user named is its own universe, with its own
+    /// history, and keeps it out of what `sync` and `check` read.
+    pub fn sources_dir(&self) -> PathBuf {
+        self.state_dir().join(SOURCES_DIR)
+    }
+
+    /// One source's store, `key` being a stable digest of the location as given
+    /// (see `source_key` in `commands::import`).
+    pub fn source_store(&self, key: &str) -> PathBuf {
+        self.sources_dir().join(key)
     }
 
     /// The active series' sandbox working tree.

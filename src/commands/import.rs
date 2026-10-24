@@ -1,16 +1,17 @@
 //! `patch import`: turn commits from somewhere else into a patch in the series.
 //!
 //! The range can be refs already in the mirror, a repository skot does not track (a fork,
-//! a local clone), or a pull request. All three end the same way: two trees in the mirror,
-//! one diff between them, one patch file, one line in the series.
+//! a local clone, an unrelated project), or a pull request. All three end the same way:
+//! two trees, one diff between them, one patch file, one line in the series.
 //!
-//! The network stays in the mirror layer, as everywhere else. Every fetch (the range's
-//! own refs from the origin, the source behind `--repo`, and the pull request behind
-//! `--pr`, a number read against the forge's own ref namespace or the full ref as
-//! written) goes into `.skot/mirror.git` through [`Mirror::fetch_refspecs`], so once the
-//! fetch finishes there is nothing external left to read from: the objects sit where
-//! every other command already looks for them, and `check` verifies the imported patch
-//! like any other.
+//! A source named with `--repo` is read where it lies. A local tree is opened and
+//! resolved in place, like a working directory: its refs, its commits, and its own
+//! history are all that matter, nothing shares history with anything, and nothing is
+//! copied. A URL cannot be opened, so the range's refs are fetched into a store of that
+//! one source under `.skot/sources/`, never into the mirror. With no `--repo`, the
+//! mirror is where everything is read from, as everywhere else: the range's own refs
+//! come from the origin through [`Mirror::fetch_refspecs`], and `check` verifies the
+//! imported patch like any other.
 //!
 //! What import does *not* do is apply anything. The patch joins the series at the end (or
 //! at `--at`), and the sandbox is untouched, so the next step is the same as after
@@ -23,8 +24,12 @@
 //! edited since is refused rather than overwritten, because the new version would
 //! silently discard your work. Where a patch came from lives in an `X-Skot-Import` mail
 //! header, which the header parser keeps along with everything else it does not model.
+//! That line is how a later run recognizes the same request, and it never names a local
+//! path: a source is recorded by the network origin it answers to when it has one, by a
+//! digest of where it lies when it does not, and `X-Skot-Source` carries that origin
+//! alongside when there is one worth carrying.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
@@ -33,17 +38,17 @@ use serde_json::json;
 use crate::cli::ImportArgs;
 use crate::commands::{Ctx, Exit, authoring, emit_json};
 use crate::git::diff;
-use crate::git::mirror::{Mirror, is_commit_id};
+use crate::git::mirror::{Mirror, is_commit_id, is_local_url};
 use crate::git::{self, Sha};
 use crate::hints::Hints;
 use crate::invocation::{skot, skot_args};
 use crate::layout::Layout;
 use crate::series;
 
-/// Where a `--repo` fetch lands: out of the way of `refs/heads` (which `skot sync` treats
-/// as upstream's own) and out of the way of `refs/tags`, so an imported branch can share a
-/// name with both without overwriting anything.
-const NS: &str = "refs/skot-import";
+/// What to say when a local `--repo` tree cannot answer for something the range reads
+/// and its own `origin` might: the flag that grants that lookup, never assumed.
+const TREE_UPSTREAM_HINT: &str =
+    "If this tree's upstream carries what is missing, `--refresh` checks it there on your behalf.";
 
 /// What `import` did, for whichever layer presents it.
 #[derive(Debug)]
@@ -107,16 +112,39 @@ enum Base {
     Named(String),
     /// The merge base of two refs, from `A...B`.
     MergeBaseOf(String, String),
-    /// The merge base with `upstream.default-ref`, when nothing specified a base.
+    /// The merge base with `upstream.default-ref`, when nothing specified a base. A
+    /// source named with `--repo` does not read the mirror's default for this: the
+    /// coordinate is taken against its own repository, as its parent commit.
     MergeWithDefault,
 }
 
-/// The two ends, resolved to commit ids in the mirror.
+/// The two ends, resolved to commit ids in the repository the range was read from: the
+/// mirror, a `--repo` tree, or a `--repo` URL's store.
 struct Ends {
     from: String,
     from_sha: Sha,
     to: String,
     to_sha: Sha,
+}
+
+/// Where the range is read from: a repository skot fills itself, or one the user named
+/// with `--repo`, which is read where it lies.
+enum Ground {
+    /// A bare repository skot maintains: the project's mirror, or a `--repo` URL's
+    /// store under `.skot/sources/`. Read the same way either way.
+    Mirror(Mirror),
+    /// A `--repo` local tree, opened at the path given and never written to.
+    Tree(git2::Repository),
+}
+
+impl Ground {
+    /// The repository the ends and the diff are read from.
+    fn repo(&self) -> &git2::Repository {
+        match self {
+            Ground::Mirror(mirror) => mirror.repo(),
+            Ground::Tree(repo) => repo,
+        }
+    }
 }
 
 /// `skot patch import`: resolve the range, fetch whatever it is missing, write the patch.
@@ -213,175 +241,261 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         .filter(|literal| literal.parse::<u64>().is_ok())
         .and_then(|_| pr_teach_note(&config, pr_url.as_deref(), layout));
 
-    // No mirror yet: start one, like every other command does, rather than sending the
-    // user away to run `skot sync` and come back. The fetch takes the range's first
-    // fetchable ref; the blocks below fill in whatever else the range reads.
-    let mirror = match existing {
-        Some(mirror) => mirror,
+    // Where the range is read from. `--repo` names a source of its own: a local tree,
+    // opened and read in place, or a URL, whose store is filled on the same cache terms
+    // the mirror gets. Without `--repo`, the mirror is the ground, created and filled
+    // as every other command finds it.
+    let source = args.repo.as_deref();
+    let (ground, ends) = match source {
+        Some(source) => {
+            let ground = open_source(
+                layout,
+                &request,
+                source,
+                config.upstream.default_ref.as_deref(),
+                teach.clone(),
+            )?;
+            let default = config.upstream.default_ref.clone();
+            let (origin, hint) = match &ground {
+                Ground::Tree(repo) => {
+                    let url = repo
+                        .find_remote("origin")
+                        .ok()
+                        .and_then(|remote| remote.url().map(str::to_owned).ok());
+                    let hint = (!layout.refresh() && url.is_some()).then_some(TREE_UPSTREAM_HINT);
+                    (url, hint)
+                }
+                Ground::Mirror(_) => (None, None),
+            };
+            match ends_in_tree(ground.repo(), &request, source, default.as_deref(), hint) {
+                Ok(ends) => (ground, ends),
+                Err(err) => {
+                    // `--refresh` against a local tree is the permission to look
+                    // further: the tree cannot answer, so the `origin` it records is
+                    // asked, into the store this source keys.
+                    if layout.refresh()
+                        && let Some(url) = origin
+                    {
+                        info!(
+                            target: "import",
+                            "the tree does not carry what the range reads; \
+                             checking its upstream at {url}"
+                        );
+                        let store =
+                            open_store(layout, &request, source, &url, default.as_deref(), teach)?;
+                        let ends = ends_in_tree(
+                            store.repo(),
+                            &request,
+                            source,
+                            default.as_deref(),
+                            Some("This tree's upstream does not carry it either."),
+                        )?;
+                        (Ground::Mirror(store), ends)
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
         None => {
-            let needed = needed_refs(&request, config.upstream.default_ref.as_deref());
-            let wanted = needed
+            // Before any network: a base that can be neither read from the config nor taken
+            // from the mirror's own HEAD is known now, not after three minutes of fetches. A
+            // mirror that does not exist yet is created below and answers the same question
+            // from its own HEAD.
+            if matches!(request.base, Base::MergeWithDefault)
+                && config.upstream.default_ref.is_none()
+                && let Some(mirror) = &existing
+                && mirror.head_branch().is_none()
+            {
+                bail!("{}", base_sentence(&request.to, layout));
+            }
+
+            // No mirror yet: start one, like every other command does, rather than sending the
+            // user away to run `skot sync` and come back. The fetch takes the range's first
+            // fetchable ref; the blocks below fill in whatever else the range reads.
+            let mirror = match existing {
+                Some(mirror) => mirror,
+                None => {
+                    let needed = needed_refs(&request, config.upstream.default_ref.as_deref());
+                    let wanted = needed
+                        .iter()
+                        .find(|n| !is_commit_id(n))
+                        .map(String::as_str)
+                        .or(config.upstream.default_ref.as_deref());
+                    super::sync::ensure(layout, wanted)?;
+                    Mirror::open(layout).context(format!(
+                        "opening the mirror at {}",
+                        layout.mirror_dir().display()
+                    ))?
+                }
+            };
+
+            // The base for a range that left it to be worked out: the setting when there is
+            // one, else the branch the mirror itself points at, which is what a clone of this
+            // project would call its main line and the answer a person gives when asked. Said
+            // out loud, because it is a fallback and not a setting written anywhere.
+            let default_ref: Option<String> = if matches!(request.base, Base::MergeWithDefault)
+                && config.upstream.default_ref.is_none()
+            {
+                mirror.head_branch().map(|name| {
+                    info!(
+                        target: "import",
+                        "upstream.default-ref is not set; using the mirror's `{name}` as the base"
+                    );
+                    name
+                })
+            } else {
+                config.upstream.default_ref.clone()
+            };
+
+            // Fill the mirror for what this range actually reads, and only that. The mirror is
+            // a cache: a range it can already walk is answered from it, with no connection
+            // made; a gap (a ref it lacks, history a shallow fetch never took, a commit it
+            // does not hold) is the only reason to go to the network, and `--refresh` is the
+            // way to ask for freshness even when there is no gap. A pull request is the
+            // exception: a moving pointer whose head means whatever the forge last published,
+            // so it is always asked. A mirror with no `origin` has nothing to ask; `resolve`
+            // gives the remedy for a ref that is still missing afterwards.
+            let needed = needed_refs(&request, default_ref.as_deref());
+            let fetchable: Vec<&str> = needed
                 .iter()
-                .find(|n| !is_commit_id(n))
                 .map(String::as_str)
-                .or(config.upstream.default_ref.as_deref());
-            super::sync::ensure(layout, wanted)?;
-            Mirror::open(layout).context(format!(
-                "opening the mirror at {}",
-                layout.mirror_dir().display()
-            ))?
+                .filter(|n| !is_commit_id(n))
+                .collect();
+            let by_id: Vec<&str> = needed
+                .iter()
+                .map(String::as_str)
+                .filter(|n| is_commit_id(n))
+                .collect();
+            // A raw commit id names no ref: only the history that contains it can be fetched,
+            // and which branch that is is not something an id says. A commit the mirror does
+            // not hold therefore takes the whole upstream at full depth; an id already here is
+            // no reason to ask for anything under it.
+            let wildcard =
+                !by_id.is_empty() && by_id.iter().any(|n| mirror.try_resolve(n).is_none());
+            // The origin is asked once for everything this run reads from it: the range's own
+            // refs, and the pull request head when there is one. One fetch, so an origin that
+            // cannot be reached is an answer said once for the run instead of once per ref.
+            let pull_ref = request
+                .pull
+                .is_some()
+                .then(|| format!("+{}:{}", request.to, request.to));
+            match mirror.remote_url() {
+                Ok(url) => {
+                    let mut refspecs: Vec<String> = if wildcard {
+                        vec![
+                            "+refs/heads/*:refs/heads/*".into(),
+                            "+refs/tags/*:refs/tags/*".into(),
+                        ]
+                    } else {
+                        fetchable
+                            .iter()
+                            .flat_map(|name| refspecs_for(name))
+                            .collect()
+                    };
+                    let mut held = needed.iter().all(|n| mirror.try_resolve(n).is_some());
+                    if let Some(spec) = &pull_ref {
+                        refspecs.push(spec.clone());
+                        held = held && mirror.try_resolve(&request.to).is_some();
+                    }
+                    // Held refs are not the question: history behind them a shallow fetch
+                    // never took fails the walk just the same, so the walk itself decides.
+                    // When it completes from what is here, the mirror answers and no
+                    // connection is made; a pull request or `--refresh` asks anyway.
+                    let walks = held && range_walks(&mirror, &request, default_ref.as_deref());
+                    if !refspecs.is_empty()
+                        && (layout.refresh() || request.pull.is_some() || !walks)
+                    {
+                        let extra = teach
+                            .as_ref()
+                            .map(|note| (request.to.as_str(), note.clone()));
+                        fetch_or_fall_back(
+                            &mirror,
+                            &url,
+                            "origin",
+                            &refspecs,
+                            "fetching what the range needs",
+                            held,
+                            "mirror",
+                            format!("fetching the range's refs from {url}"),
+                            extra,
+                        )?;
+                    } else if !refspecs.is_empty() {
+                        debug!(
+                            target: "import",
+                            "the mirror already walks this range; not asking {url}"
+                        );
+                    }
+                }
+                // No `origin` and a pull request means nowhere to fetch it from. A range
+                // alone keeps reading the mirror as it stands, which is what it has always
+                // done.
+                Err(err) if pull_ref.is_some() => {
+                    return Err(err).context(format!(
+                    "the mirror records no `origin`, so there is nowhere to fetch the pull request \
+                 from.\nRun `{}` first.",
+                    skot("sync")
+                ));
+                }
+                Err(_) => {}
+            }
+
+            // After every fetch has had its chance: a ref the upstream does not have is said so
+            // here, with the fetch already part of the story, rather than surfacing later as
+            // advice to go run the sync that just happened.
+            let mut check: Vec<&str> = needed.iter().map(String::as_str).collect();
+            if request.pull.is_some() {
+                check.push(&request.to);
+            }
+            if let Some(missing) = check
+                .into_iter()
+                .find(|n| !is_commit_id(n) && mirror.try_resolve(n).is_none())
+            {
+                let mut message = format!(
+                    "`{missing}` is not in the mirror, and the upstream does not have it either.\n\
+             Check the spelling; a ref published only just may need a moment."
+                );
+                if let Some(note) = &teach
+                    && missing == request.to
+                {
+                    message.push('\n');
+                    message.push_str(note);
+                }
+                bail!("{message}");
+            }
+
+            let ends = resolve(&mirror, layout, &request, default_ref.as_deref())?;
+            (Ground::Mirror(mirror), ends)
         }
     };
+    let repo = ground.repo();
 
-    // Fill the mirror from the origin for what this range actually reads. The fetch runs
-    // whenever there is a URL to ask (an upstream that moved the branch since the last
-    // import is seen now, not after an explicit sync) and takes only the range's own
-    // refs at full depth: an import *walks* (a merge base, then the commits between the
-    // ends), and a mirror after an ordinary sync is a shallow, narrowed view. A mirror
-    // with no `origin` has nothing to ask; `resolve` gives the remedy for a ref that
-    // is still missing afterwards.
-    let needed = needed_refs(&request, config.upstream.default_ref.as_deref());
-    let fetchable: Vec<&str> = needed
-        .iter()
-        .map(String::as_str)
-        .filter(|n| !is_commit_id(n))
-        .collect();
-    let by_id: Vec<&str> = needed
-        .iter()
-        .map(String::as_str)
-        .filter(|n| is_commit_id(n))
-        .collect();
-    let shallow = mirror.is_shallow();
-    // A raw commit id names no ref: only the history that contains it can be fetched,
-    // and which branch that is is not something an id says. A gap around an id (or a
-    // shallow mirror under one) therefore takes the whole upstream at full depth;
-    // otherwise the range's own refs are enough.
-    let wildcard =
-        !by_id.is_empty() && (shallow || by_id.iter().any(|n| mirror.try_resolve(n).is_none()));
-    // The origin is asked once for everything this run reads from it: the range's own
-    // refs, and the pull request head when there is one and no `--repo` says otherwise.
-    // One fetch, so an origin that cannot be reached is an answer said once for the
-    // run instead of once per ref. With `--repo` the pull request belongs to the source
-    // repository: that is the cross-forge case, a GitHub project taking a GitLab change.
-    let pull_ref = (request.pull.is_some() && args.repo.is_none())
-        .then(|| format!("+{}:{}", request.to, request.to));
-    match mirror.remote_url() {
-        Ok(url) => {
-            let mut refspecs: Vec<String> = if wildcard {
-                vec![
-                    "+refs/heads/*:refs/heads/*".into(),
-                    "+refs/tags/*:refs/tags/*".into(),
-                ]
-            } else {
-                fetchable
-                    .iter()
-                    .flat_map(|name| refspecs_for(name, false))
-                    .collect()
-            };
-            let mut held = needed.iter().all(|n| mirror.try_resolve(n).is_some());
-            if let Some(spec) = &pull_ref {
-                refspecs.push(spec.clone());
-                held = held && mirror.try_resolve(&request.to).is_some();
-            }
-            if !refspecs.is_empty() {
-                let extra = args
-                    .repo
-                    .is_none()
-                    .then_some(teach.as_ref())
-                    .flatten()
-                    .map(|note| (request.to.as_str(), note.clone()));
-                fetch_or_fall_back(
-                    &mirror,
-                    &url,
-                    "origin",
-                    &refspecs,
-                    "fetching what the range needs",
-                    held,
-                    format!("fetching the range's refs from {url}"),
-                    extra,
-                )?;
-            }
-        }
-        // No `origin` and a pull request means nowhere to fetch it from. A range alone
-        // keeps reading the mirror as it stands, which is what it has always done.
-        Err(err) if pull_ref.is_some() => {
-            return Err(err).context(format!(
-                "the mirror records no `origin`, so there is nowhere to fetch the pull request \
-                 from.\nRun `{}` first.",
-                skot("sync")
-            ));
-        }
-        Err(_) => {}
-    }
-
-    if let Some(source) = args.repo.as_deref() {
-        // The source is fetched for this range and nothing else: the names the range
-        // reads, under the namespace, at full depth: the merge base walks them, and a
-        // pull request head under its own name when there is one. A branch the range
-        // does not name is not worth dragging across.
-        let source_needed = needed_refs(&request, None);
-        let mut refspecs: Vec<String> = source_needed
-            .iter()
-            .flat_map(|name| refspecs_for(name, true))
-            .collect();
-        if request.pull.is_some() {
-            refspecs.push(format!("+{}:{}", request.to, request.to));
-        }
-        let held = refspecs.iter().all(|spec| {
-            spec.split_once(':')
-                .is_some_and(|(_, dest)| mirror.try_resolve(dest).is_some())
-        });
-        fetch_or_fall_back(
-            &mirror,
-            source,
-            "import",
-            &refspecs,
-            "fetching the source repository",
-            held,
-            format!("fetching from {source}"),
-            teach
-                .as_ref()
-                .map(|note| (request.to.as_str(), note.clone())),
-        )?;
-    }
-
-    // After every fetch has had its chance: a ref the upstream does not have is said so
-    // here, with the fetch already part of the story, rather than surfacing later as
-    // advice to go run the sync that just happened. With `--repo` this check is
-    // skipped: `resolve` speaks for the source repository by name, and a ref that exists
-    // only over there is not a miss against the origin.
-    if args.repo.is_none() {
-        let mut check: Vec<&str> = needed.iter().map(String::as_str).collect();
-        if request.pull.is_some() {
-            check.push(&request.to);
-        }
-        if let Some(missing) = check
-            .into_iter()
-            .find(|n| !is_commit_id(n) && mirror.try_resolve(n).is_none())
-        {
-            let mut message = format!(
-                "`{missing}` is not in the mirror, and the upstream does not have it either.\n\
-                 Check the spelling; a ref published only just may need a moment."
-            );
-            if let Some(note) = &teach
-                && missing == request.to
-            {
-                message.push('\n');
-                message.push_str(note);
-            }
-            bail!("{message}");
-        }
-    }
-
-    let ends = resolve(&mirror, layout, &config, &request, args.repo.as_deref())?;
+    // How the source is named in the patch's identity, and what origin is worth saying
+    // out loud: a network origin the source answers to when it has one, a digest of
+    // where it lies when it does not, and never the path itself. Patches get committed,
+    // and a path there says where the files on this machine sat.
+    let origin = match &ground {
+        Ground::Tree(repo) => repo
+            .find_remote("origin")
+            .ok()
+            .and_then(|remote| remote.url().map(str::to_owned).ok()),
+        Ground::Mirror(mirror) => mirror.remote_url().ok(),
+    };
+    let source_url = origin
+        .as_deref()
+        .filter(|url| !is_local_url(url))
+        .map(str::to_owned);
+    let token = match source {
+        Some(raw) => Some(source_token(raw, origin.as_deref())?),
+        None => None,
+    };
+    let identity = identity_of(&request, token.as_deref(), args.reverse);
 
     // The lock authoring holds now covers import's local work too: deciding whether this
     // change already exists, choosing the next free prefix, and writing. The fetch stays
     // outside it (network is not what two imports racing over the series need
     // serialising), but nothing below runs without it.
     let lock = layout.lock()?;
-
-    let repo = mirror.repo();
     let from_tree = git::commit_tree(repo, &ends.from_sha)
         .context(format!("reading the tree of {}", ends.from))?;
     let to_tree =
@@ -474,10 +588,12 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     let bare =
         diff::tree_to_tree_patch(repo, &old, &new, &header).context("rendering the import")?;
     let change = change_id(&bare)?;
-    let identity = identity_of(&request, args.repo.as_deref(), args.reverse);
     header
         .extra
         .push(provenance_line(&identity, &line_from, &line_to, &change));
+    if let Some(url) = &source_url {
+        header.extra.push(format!("X-Skot-Source: {url}"));
+    }
     let text =
         diff::tree_to_tree_patch(repo, &old, &new, &header).context("rendering the import")?;
     let summary = diff::summarise(&text);
@@ -554,12 +670,15 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         // its filename — so an update takes none of that from the request: only the ends
         // and the provenance change. `--name` names creations, not updates.
         let mut header = authoring::header_for(Some(&existing), &subject, &signature);
-        header
-            .extra
-            .retain(|line| !line.starts_with("X-Skot-Import: "));
+        header.extra.retain(|line| {
+            !line.starts_with("X-Skot-Import: ") && !line.starts_with("X-Skot-Source: ")
+        });
         header
             .extra
             .push(provenance_line(&identity, &line_from, &line_to, &change));
+        if let Some(url) = &source_url {
+            header.extra.push(format!("X-Skot-Source: {url}"));
+        }
         if commits == 1 {
             header.body = tip_body;
         } else {
@@ -831,11 +950,11 @@ fn pr_teach_note(
 }
 
 /// What the range reads out of a repository: the `to` end, whatever the base names, and
-/// the default ref only when the base *is* the default, the one case `resolve` reads it
-/// in. `default` is that ref, or `None` for a `--repo` source, whose namespace `resolve`
-/// never consults for it.
+/// the default ref only when the base *is* the default, the one case a caller that
+/// resolves against a default reads it in. `default` is that ref, or `None` when the
+/// base needs no default: a bare coordinate from a `--repo` source takes its parent.
 ///
-/// A pull request's own ref is excluded: its fetch below already brings it.
+/// A pull request's own ref is excluded: its fetch brings it.
 fn needed_refs(request: &Request, default: Option<&str>) -> Vec<String> {
     let mut names = Vec::new();
     if request.pull.is_none() {
@@ -855,41 +974,31 @@ fn needed_refs(request: &Request, default: Option<&str>) -> Vec<String> {
     names
 }
 
-/// How one name is fetched: plainly from upstream, or under [`NS`] from a `--repo`
-/// source. A commit id names no ref, and a full ref path has no short form to map into
-/// the namespace. Neither can be fetched by name, so neither produces a refspec.
-fn refspecs_for(name: &str, into_ns: bool) -> Vec<String> {
+/// How one name is fetched by name: a short name as both a branch and a tag (libgit2
+/// takes whichever the remote has), a full ref as written. A commit id names no ref and
+/// produces no refspec.
+fn refspecs_for(name: &str) -> Vec<String> {
     if is_commit_id(name) {
         return Vec::new();
     }
     if name.starts_with("refs/") {
-        return if into_ns {
-            Vec::new()
-        } else {
-            vec![format!("+{name}:{name}")]
-        };
+        return vec![format!("+{name}:{name}")];
     }
-    let dest = |space: &str| {
-        if into_ns {
-            format!("{NS}/{space}/{name}")
-        } else {
-            format!("refs/{space}/{name}")
-        }
-    };
     vec![
-        format!("+refs/heads/{name}:{}", dest("heads")),
-        format!("+refs/tags/{name}:{}", dest("tags")),
+        format!("+refs/heads/{name}:refs/heads/{name}"),
+        format!("+refs/tags/{name}:refs/tags/{name}"),
     ]
 }
 
-/// One of import's fetches, run the way every import run runs: the upstream is asked
-/// first, so a ref that moved upstream is seen now rather than after an explicit
-/// sync. When it cannot be reached, a mirror that already holds every destination
-/// (`held`) is enough to import from, said out loud, and when it does not, the
-/// failure is the answer.
+/// One of import's fetches, called when the walk probe found a gap, `--refresh` asked,
+/// or a pull request (a moving pointer, always asked). When the upstream cannot be
+/// reached but a mirror that already holds every destination (`held`) is enough to
+/// import from, that is said out loud, and when it does not, the failure is the answer.
 ///
 /// `extra` is a note to append when the failure lands on `extra.0`'s needle: the
 /// diagnosis of a ref the forge does not publish, or of a run not allowed to ask.
+/// `place` names what is being kept when that happens: the mirror, or a `--repo` URL's
+/// store.
 #[allow(clippy::too_many_arguments)]
 fn fetch_or_fall_back(
     mirror: &Mirror,
@@ -898,6 +1007,7 @@ fn fetch_or_fall_back(
     refspecs: &[String],
     message: &str,
     held: bool,
+    place: &str,
     context: String,
     extra: Option<(&str, String)>,
 ) -> Result<()> {
@@ -912,10 +1022,7 @@ fn fetch_or_fall_back(
                 "the upstream at {url} could not be reached: {}",
                 fetch_err.root_cause()
             );
-            warn!(
-                target: "import",
-                "using the local mirror as it stands"
-            );
+            warn!(target: "import", "using the local {place} as it stands");
             Ok(())
         }
         Err(fetch_err) => {
@@ -931,38 +1038,70 @@ fn fetch_or_fall_back(
     }
 }
 
+/// What a range with no base says when there is nothing to take one from: the flag,
+/// or the setting, before any network is spent proving it.
+fn base_sentence(to: &str, layout: &Layout) -> String {
+    format!(
+        "cannot work out what `{to}` is based on.\n\
+         Pass a base (`{}`), or set `upstream.default-ref` in {}.",
+        skot_args("import", &format!("--from <ref> {to}")),
+        layout.config_file().display()
+    )
+}
+
+/// Whether the history behind the range is already here: every end resolves, and the
+/// walk the range reads (a merge base, or the commits between the ends) completes from
+/// what is on disk. Purely local, so a miss costs a revwalk; the fetch this decides
+/// whether to skip fills exactly the gap the walk found.
+fn range_walks(mirror: &Mirror, request: &Request, default: Option<&str>) -> bool {
+    let resolve = |name: &str| mirror.try_resolve(name);
+    match &request.base {
+        Base::Named(from) => match (resolve(&request.to), resolve(from)) {
+            (Some(to), Some(from)) => count_between(mirror.repo(), &to, &from).is_ok(),
+            _ => false,
+        },
+        Base::MergeBaseOf(a, b) => match (resolve(a), resolve(b)) {
+            (Some(a), Some(b)) => merge_base(mirror.repo(), &a, &b).is_ok(),
+            _ => false,
+        },
+        Base::MergeWithDefault => {
+            let Some(default) = default else {
+                return false;
+            };
+            match (resolve(default), resolve(&request.to)) {
+                (Some(default), Some(to)) => merge_base(mirror.repo(), &default, &to).is_ok(),
+                _ => false,
+            }
+        }
+    }
+}
+
 /// The two ends as commit ids, after any fetch has put them in the mirror.
 fn resolve(
     mirror: &Mirror,
     layout: &Layout,
-    config: &crate::config::Config,
     request: &Request,
-    source: Option<&str>,
+    default_ref: Option<&str>,
 ) -> Result<Ends> {
-    let to_sha = resolve_named(mirror, source, &request.to)?;
+    let to_sha = mirror.resolve(&request.to)?;
 
     let (from, from_sha) = match &request.base {
-        Base::Named(name) => (name.clone(), resolve_named(mirror, source, name)?),
+        Base::Named(name) => (name.clone(), mirror.resolve(name)?),
         Base::MergeBaseOf(a, b) => {
-            let sha_a = resolve_named(mirror, source, a)?;
-            let sha_b = resolve_named(mirror, source, b)?;
-            let sha = merge_base(mirror, &sha_a, &sha_b)
+            let sha_a = mirror.resolve(a)?;
+            let sha_b = mirror.resolve(b)?;
+            let sha = merge_base(mirror.repo(), &sha_a, &sha_b)
                 .context(format!("`{a}` and `{b}` share no history"))?;
             (format!("merge-base({a}, {b})"), sha)
         }
         Base::MergeWithDefault => {
-            let default = config.upstream.default_ref.clone().context(format!(
-                "cannot work out what `{}` is based on.\n\
-                 Pass a base (`{}`), or set `upstream.default-ref` \
-                 in {}.",
-                request.to,
-                skot_args("import", &format!("--from <ref> {}", request.to)),
-                layout.config_file().display()
-            ))?;
+            let default = default_ref
+                .context(base_sentence(&request.to, layout))?
+                .to_owned();
             let default_sha = mirror.resolve(&default).with_context(|| {
                 format!("cannot resolve `upstream.default-ref` (`{default}`) in the mirror")
             })?;
-            let sha = merge_base(mirror, &default_sha, &to_sha).context(format!(
+            let sha = merge_base(mirror.repo(), &default_sha, &to_sha).context(format!(
                 "`{default}` and `{}` share no history, so there is no base to import against",
                 request.to
             ))?;
@@ -978,39 +1117,264 @@ fn resolve(
     })
 }
 
-/// Resolve one end of the range.
-///
-/// In `--repo` mode the fetched namespace is tried first, because the name was written
-/// against that repository: `skot patch import --repo ../fork main..feat` means *that* repo's
-/// `main` and `feat`. The mirror is the fallback, which is how the upstream end of a range
-/// resolves when the fork does not carry it.
-fn resolve_named(mirror: &Mirror, source: Option<&str>, name: &str) -> Result<Sha> {
-    if let Some(source) = source {
-        for namespace in [format!("{NS}/heads/"), format!("{NS}/tags/")] {
-            if let Some(sha) = mirror.try_resolve(&format!("{namespace}{name}")) {
-                return Ok(sha);
-            }
-        }
-        if let Some(sha) = mirror.try_resolve(name) {
-            return Ok(sha);
-        }
-        bail!(
-            "`{name}` is neither a branch or tag in {source}, nor in the mirror.\n\
-             With `--repo`, give a branch or tag name from that repository."
-        );
-    }
-    mirror.resolve(name)
-}
-
-/// The common ancestor of two commits already in the mirror.
-fn merge_base(mirror: &Mirror, a: &Sha, b: &Sha) -> Result<Sha> {
+/// The common ancestor of two commits in one repository.
+fn merge_base(repo: &git2::Repository, a: &Sha, b: &Sha) -> Result<Sha> {
     let a = git2::Oid::from_str(a).context(format!("{a} is not a commit id"))?;
     let b = git2::Oid::from_str(b).context(format!("{b} is not a commit id"))?;
-    mirror
-        .repo()
-        .merge_base(a, b)
+    repo.merge_base(a, b)
         .map(|oid| oid.to_string())
         .context("the two refs share no history")
+}
+
+/// The ground for a `--repo` source: a local tree read in place, or a URL's store.
+///
+/// What decides is what can be *opened*: a path that exists is a tree, wherever its
+/// repository root sits, and skot reads it directly the way `format-patch` reads a
+/// working tree. A URL cannot be opened, so the range's refs are fetched into the store
+/// keyed by that location and read from there. Anything else is neither, and says so
+/// before anything is fetched.
+fn open_source(
+    layout: &Layout,
+    request: &Request,
+    source: &str,
+    default_ref: Option<&str>,
+    teach: Option<String>,
+) -> Result<Ground> {
+    if Path::new(source).exists() {
+        let repo = git2::Repository::discover(source)
+            .context(format!("`{source}` is not inside a git repository"))?;
+        return Ok(Ground::Tree(repo));
+    }
+    if looks_like_url(source) {
+        let store = open_store(layout, request, source, source, default_ref, teach)?;
+        return Ok(Ground::Mirror(store));
+    }
+    bail!("`{source}` is not a git repository or a URL.")
+}
+
+/// Whether a location that does not exist on disk names a remote: a scheme, a user, or
+/// a host with a dot in it. Anything else typed in that is not a path is refused as one
+/// rather than fetched from.
+fn looks_like_url(source: &str) -> bool {
+    source.contains("://")
+        || source.contains('@')
+        || url_domain(source).is_some_and(|host| host.contains('.'))
+}
+
+/// A `--repo` URL's store: the range's refs fetched from `url` into
+/// `.skot/sources/<key>`, on the same cache terms the mirror gets. The store is keyed
+/// by the location the user gave, so the same source reuses one store and two different
+/// sources can never read each other's history.
+///
+/// The store is filled with what a ref can carry: a commit id names no ref, so an id the
+/// store lacks takes every ref at full depth, which is what brings the history a ref
+/// points at. A commit no ref points at cannot cross a fetch at all; a local tree holds
+/// it by lying on disk, which is what `--repo <path>` reads.
+fn open_store(
+    layout: &Layout,
+    request: &Request,
+    source: &str,
+    url: &str,
+    default_ref: Option<&str>,
+    teach: Option<String>,
+) -> Result<Mirror> {
+    let path = layout.source_store(&source_key(source)?);
+    let existing = Mirror::at(path.clone(), layout.offline()).ok();
+    // A pull request's head is its own ref, fetched alongside; its base may read the
+    // default ref from the store too. Anything else needs only what the range names, so
+    // a bare commit asks for one thing.
+    let fetch_default = request.pull.is_some().then_some(default_ref).flatten();
+    let needed = needed_refs(request, fetch_default);
+    let walks = existing.as_ref().is_some_and(|mirror| {
+        ends_in_tree(mirror.repo(), request, source, default_ref, None).is_ok()
+    });
+    if layout.refresh() || request.pull.is_some() || !walks {
+        let mut refspecs = store_refspecs(existing.as_ref().map(Mirror::repo), &needed);
+        if request.pull.is_some() {
+            refspecs.push(format!("+{}:{}", request.to, request.to));
+        }
+        if !refspecs.is_empty() {
+            let message = "fetching the source repository";
+            let context = format!("fetching what the range needs from {url}");
+            let extra = teach.map(|note| (request.to.as_str(), note));
+            match &existing {
+                Some(mirror) => fetch_or_fall_back(
+                    mirror, url, "origin", &refspecs, message, walks, "store", context, extra,
+                )?,
+                None => {
+                    if let Err(err) =
+                        Mirror::fetch_at(url, &path, &refspecs, message, layout.offline())
+                    {
+                        let mut err = err.context(context);
+                        if let Some((needle, note)) = extra {
+                            let names_the_ref = err.root_cause().to_string().contains(needle);
+                            if names_the_ref || layout.offline() {
+                                err = err.context(note);
+                            }
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    } else {
+        debug!(
+            target: "import",
+            "the store already walks this range; not asking {url}"
+        );
+    }
+    Mirror::at(path, layout.offline())
+}
+
+/// What a store asks of its source: the range's own refs by name, or, when a bare
+/// commit id the store does not hold needs history behind it, every ref at full depth
+/// (the only way an id can arrive, since only a ref can carry it across a fetch).
+fn store_refspecs(repo: Option<&git2::Repository>, needed: &[String]) -> Vec<String> {
+    let missing_id = needed
+        .iter()
+        .filter(|name| is_commit_id(name))
+        .any(|id| repo.is_none_or(|repo| git::try_commit(repo, id).is_none()));
+    if missing_id {
+        return vec![
+            "+refs/heads/*:refs/heads/*".into(),
+            "+refs/tags/*:refs/tags/*".into(),
+        ];
+    }
+    needed
+        .iter()
+        .filter(|name| !is_commit_id(name))
+        .flat_map(|name| refspecs_for(name))
+        .collect()
+}
+
+/// The store key for a source location: a digest of where it is, canonicalised when it
+/// is a path, so the same location reuses one store however it was spelled.
+fn source_key(source: &str) -> Result<String> {
+    let canonical = std::fs::canonicalize(source)
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| source.to_owned());
+    let digest = git2::Oid::hash_object(git2::ObjectType::Blob, canonical.as_bytes())
+        .context("keying the source location")?
+        .to_string();
+    Ok(digest.chars().take(16).collect())
+}
+
+/// How a `--repo` source is named in a patch's identity: the network origin it answers
+/// to when it has one, a digest of where it lies when it does not. Never the path
+/// itself: patches get committed, and a path there says where the files on this machine
+/// sat. A local origin is worth no more than the path beside it, so it digests too.
+fn source_token(source: &str, origin: Option<&str>) -> Result<String> {
+    match origin {
+        Some(url) if !is_local_url(url) => Ok(url.to_owned()),
+        _ => source_key(source),
+    }
+}
+
+/// The two ends of the request, read in the repository the source provides.
+///
+/// Every name resolves against that repository alone: its refs, its commits, even a
+/// commit expression, and a commit id that exists there as an object (on a branch, on
+/// no branch at all, it does not matter; the object is what is read). The base is that
+/// repository's business and never the mirror's: an explicit range as written, and for
+/// a bare coordinate the parent of the commit, which is the change the commit itself
+/// introduced, the way `git format-patch -1` reads it. A pull request is the one
+/// coordinate that means everything it brings: its head against the source's own
+/// default line when that exists there, the head's parent when it does not.
+fn ends_in_tree(
+    repo: &git2::Repository,
+    request: &Request,
+    source: &str,
+    default_ref: Option<&str>,
+    miss_hint: Option<&str>,
+) -> Result<Ends> {
+    let to = resolve_in(repo, &request.to, source, miss_hint)?;
+    let (from, from_sha) = match &request.base {
+        Base::Named(name) => (name.clone(), resolve_in(repo, name, source, miss_hint)?),
+        Base::MergeBaseOf(a, b) => {
+            let sha_a = resolve_in(repo, a, source, miss_hint)?;
+            let sha_b = resolve_in(repo, b, source, miss_hint)?;
+            let sha = merge_base(repo, &sha_a, &sha_b)
+                .context(format!("`{a}` and `{b}` share no history"))?;
+            (format!("merge-base({a}, {b})"), sha)
+        }
+        Base::MergeWithDefault => {
+            let shared = request
+                .pull
+                .is_some()
+                .then(|| default_ref.and_then(|name| git::try_commit(repo, name)))
+                .flatten()
+                .and_then(|default_sha| merge_base(repo, &default_sha, &to).ok());
+            match (shared, default_ref) {
+                (Some(sha), Some(name)) => (format!("merge-base({name}, {})", request.to), sha),
+                _ => parent_of(repo, &request.to, &to)?,
+            }
+        }
+    };
+
+    Ok(Ends {
+        from,
+        from_sha,
+        to: request.to.clone(),
+        to_sha: to,
+    })
+}
+
+/// One coordinate against the source: a commit id looked up as an object, anything
+/// else read the way git reads a revision in that repository.
+///
+/// The mirror is not consulted. A name the source does not have is a fact about the
+/// source, and `--repo` said that is the tree that matters.
+fn resolve_in(
+    repo: &git2::Repository,
+    name: &str,
+    source: &str,
+    miss_hint: Option<&str>,
+) -> Result<Sha> {
+    if is_commit_id(name) {
+        let oid = git2::Oid::from_str(name).context(format!("`{name}` is not a commit id"))?;
+        if repo.find_object(oid, None).is_err() {
+            let mut message = format!(
+                "the commit `{name}` is not in {source}.\n\
+                 `--repo` names that tree, and it holds no such object: check the \
+                 sha, or point `--repo` at the tree that holds it."
+            );
+            if let Some(hint) = miss_hint {
+                message.push('\n');
+                message.push_str(hint);
+            }
+            bail!("{message}");
+        }
+        return git::try_commit(repo, name)
+            .context(format!("`{name}` is in {source}, but is not a commit"));
+    }
+    git::try_commit(repo, name).with_context(|| {
+        let mut message = format!("`{name}` is neither a branch, tag, nor commit in {source}.");
+        if let Some(hint) = miss_hint {
+            message.push('\n');
+            message.push_str(hint);
+        }
+        message
+    })
+}
+
+/// The base a bare coordinate takes in its own repository: the commit's parent, the
+/// change the commit itself introduced. A root commit has no parent and no history it
+/// came from, so there is nothing to diff it against.
+fn parent_of(repo: &git2::Repository, coord: &str, sha: &Sha) -> Result<(String, Sha)> {
+    let oid = git2::Oid::from_str(sha).context(format!("{sha} is not a commit id"))?;
+    let commit = repo
+        .find_commit(oid)
+        .context(format!("reading `{coord}`"))?;
+    match commit.parent_id(0) {
+        Ok(parent) => Ok((format!("{coord}^"), parent.to_string())),
+        Err(_) => bail!(
+            "`{coord}` is the root commit of the repository, so it has no parent to \
+             diff it against.\nGive a base explicitly (`{}`), or import a commit that \
+             has one.",
+            skot_args("import", &format!("--from <ref> {coord}"))
+        ),
+    }
 }
 
 /// How many commits `FROM..TO` contains: the same count `git rev-list FROM..TO` prints.
@@ -1045,13 +1409,13 @@ fn request_expression(request: &Request) -> String {
 /// a base that moved still matches — only a different way of asking (another source
 /// repository, another base flag, the other direction) is a different import: the
 /// forward and the reversed patch of one commit are two different things in the series.
-fn identity_of(request: &Request, repo: Option<&str>, reverse: bool) -> String {
+fn identity_of(request: &Request, source: Option<&str>, reverse: bool) -> String {
     let kind = if reverse { "reversed:" } else { "" };
     if let Some(literal) = &request.pull {
         return format!("{kind}pr:{literal}");
     }
     let expression = request_expression(request);
-    match repo {
+    match source {
         Some(url) => format!("{kind}repo:{url}#{expression}"),
         None => format!("{kind}range:{expression}"),
     }
@@ -1648,15 +2012,14 @@ mod tests {
         assert!(!text.contains("+second"), "net diff only:\n{text}");
     }
 
-    #[test]
-    fn an_import_rechecks_the_upstream_so_a_moved_branch_is_seen() {
-        // The mirror is warm when the branch moves upstream: the import must notice,
-        // not read the copy it already had.
+    /// A project synced from a local upstream: `main` and `feat` behind an `origin`
+    /// that is free to move once the first import has run.
+    fn moved_upstream_fixture() -> (tempfile::TempDir, Layout, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let upstream = tmp.path().join("up.git");
         let repo = git2::Repository::init_bare(&upstream).unwrap();
         let main = commit_file(&repo, "refs/heads/main", "base", b"base\n", &[]);
-        let feat = {
+        {
             let parent = repo.find_commit(main).unwrap();
             commit_file(
                 &repo,
@@ -1664,8 +2027,8 @@ mod tests {
                 "add the second line",
                 b"second\n",
                 &[&parent],
-            )
-        };
+            );
+        }
         drop(repo);
 
         let layout = Layout::new(tmp.path().join("proj"));
@@ -1680,31 +2043,61 @@ mod tests {
         .unwrap();
         crate::commands::sync::fetch(&layout, Some("main")).unwrap();
 
-        let first = import(&layout, &args(Some("main..feat"))).unwrap();
-        assert_eq!(first.to_sha, feat.to_string());
+        (tmp, layout, upstream)
+    }
 
-        // Upstream moves `feat` after that run.
-        let repo = git2::Repository::open_bare(&upstream).unwrap();
-        let moved = {
-            let parent = repo.find_commit(feat).unwrap();
-            commit_file(
-                &repo,
-                "refs/heads/feat",
-                "add a third line",
-                b"third\n",
-                &[&parent],
-            )
-        };
-        drop(repo);
+    /// Move upstream's `feat` one commit past `tip`, returning the new tip.
+    fn move_feat_upstream(upstream: &std::path::Path, tip: &str) -> String {
+        let repo = git2::Repository::open_bare(upstream).unwrap();
+        let parent = repo.find_commit(git2::Oid::from_str(tip).unwrap()).unwrap();
+        let moved = commit_file(
+            &repo,
+            "refs/heads/feat",
+            "add a third line",
+            b"third\n",
+            &[&parent],
+        );
+        moved.to_string()
+    }
+
+    #[test]
+    fn without_refresh_a_moved_upstream_is_not_chased() {
+        // The mirror is a cache: what it holds answers the range, and only an explicit
+        // `--refresh` asks upstream for more. The run that asks is the one that sees
+        // the move.
+        let (_tmp, layout, upstream) = moved_upstream_fixture();
+        let first = import(&layout, &args(Some("main..feat"))).unwrap();
+        let old_tip = first.to_sha.clone();
+        let moved = move_feat_upstream(&upstream, &old_tip);
 
         let second = import(&layout, &args(Some("main..feat"))).unwrap();
 
         assert_eq!(
             second.outcome,
-            Outcome::Updated,
-            "the move upstream must be seen"
+            Outcome::Unchanged,
+            "the mirror's copy answers; --refresh is how a move is asked for"
         );
-        assert_eq!(second.to_sha, moved.to_string());
+        assert_eq!(
+            second.to_sha, old_tip,
+            "the tip as the mirror holds it, not the one upstream moved to ({moved})"
+        );
+    }
+
+    #[test]
+    fn refresh_sees_a_moved_upstream() {
+        let (_tmp, layout, upstream) = moved_upstream_fixture();
+        let first = import(&layout, &args(Some("main..feat"))).unwrap();
+        let old_tip = first.to_sha.clone();
+        let moved = move_feat_upstream(&upstream, &old_tip);
+
+        let second = import(&layout.with_refresh(true), &args(Some("main..feat"))).unwrap();
+
+        assert_eq!(
+            second.outcome,
+            Outcome::Updated,
+            "an explicit refresh asks upstream"
+        );
+        assert_eq!(second.to_sha, moved, "the move is seen");
     }
 
     #[test]
@@ -1807,6 +2200,182 @@ mod tests {
             "the merge base of main and feat is main"
         );
         assert_eq!(done.commits, 1);
+    }
+
+    #[test]
+    fn an_unset_default_ref_falls_back_to_the_mirrors_head() {
+        // The config never named a base; the branch the mirror points at is the answer
+        // a person would give, and the import proceeds without a failure over it.
+        let (_tmp, layout, main) = fixture();
+        std::fs::write(layout.config_file(), "[upstream]\nurl = \"unused\"\n").unwrap();
+
+        let done = import(&layout, &args(Some("feat"))).unwrap();
+
+        assert_eq!(done.from, "merge-base(main, feat)");
+        assert_eq!(done.from_sha, main);
+    }
+
+    #[test]
+    fn a_base_that_cannot_be_worked_out_fails_before_any_fetch() {
+        // No `default-ref` in the config and no HEAD to stand in for one: known from
+        // the config and the mirror alone, so refused before any network, proven here
+        // by the run being offline (a fetch attempt would change the error).
+        let (_tmp, layout, _main) = fixture();
+        std::fs::write(layout.config_file(), "[upstream]\nurl = \"unused\"\n").unwrap();
+        git2::Repository::open_bare(layout.mirror_dir())
+            .unwrap()
+            .set_head("refs/heads/ghost")
+            .unwrap();
+
+        let err = import(&layout.with_offline(true), &args(Some("feat")))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("cannot work out"), "got {err}");
+        assert!(err.contains("--from"), "the remedy: {err}");
+        assert_eq!(
+            std::fs::read_dir(layout.patches_dir()).unwrap().count(),
+            0,
+            "nothing may be written before the refusal"
+        );
+    }
+
+    #[test]
+    fn a_store_asks_for_refs_by_name_and_widens_only_for_a_missing_commit_id() {
+        assert_eq!(
+            store_refspecs(None, &["main".to_owned()]),
+            vec![
+                "+refs/heads/main:refs/heads/main".to_owned(),
+                "+refs/tags/main:refs/tags/main".to_owned(),
+            ],
+            "a named end is fetched by name"
+        );
+        assert_eq!(
+            store_refspecs(
+                None,
+                &["deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_owned()]
+            ),
+            vec![
+                "+refs/heads/*:refs/heads/*".to_owned(),
+                "+refs/tags/*:refs/tags/*".to_owned(),
+            ],
+            "an id names no ref: only refs can carry what is behind it"
+        );
+        assert!(
+            store_refspecs(None, &[]).is_empty(),
+            "nothing needed, nothing asked"
+        );
+    }
+
+    #[test]
+    fn a_source_without_the_commit_fails_before_anything_is_copied() {
+        // The local tree is read directly: a commit it does not hold is a fact known
+        // from opening it, refused before any transfer runs.
+        let (tmp, layout, _main) = fixture();
+        let source = fork(tmp.path());
+        let absent = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+        let err = import(
+            &layout,
+            &ImportArgs {
+                at: None,
+                repo: Some(source.to_str().unwrap().to_owned()),
+                ..args(Some(absent))
+            },
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+
+        assert!(msg.contains("is not in"), "got {msg}");
+        assert!(msg.contains(absent), "names the commit: {msg}");
+        assert!(
+            !msg.contains("target OID"),
+            "the transport error this replaces must not surface: {msg}"
+        );
+        assert!(
+            !layout.sources_dir().exists(),
+            "a tree that cannot answer creates no store"
+        );
+        let mirror = Mirror::open(&layout).unwrap();
+        assert!(
+            mirror.repo().find_remote("import").is_err(),
+            "nothing may have been fetched"
+        );
+    }
+
+    #[test]
+    fn a_local_tree_is_read_by_commit_id_without_touching_origin() {
+        // The format-patch shape: a local clone holding the commit, a bare id on the
+        // command line, an origin that must never be contacted. The commit comes from
+        // the named source alone.
+        let (tmp, layout, _main) = fixture();
+        let repo = git2::Repository::open_bare(layout.mirror_dir()).unwrap();
+        repo.remote("origin", tmp.path().join("gone.git").to_str().unwrap())
+            .unwrap();
+        drop(repo);
+        let source = fork(tmp.path());
+        let sha = {
+            let source_repo = git2::Repository::open(&source).unwrap();
+            source_repo
+                .find_reference("refs/heads/feat")
+                .unwrap()
+                .target()
+                .unwrap()
+                .to_string()
+        };
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                at: None,
+                repo: Some(source.to_str().unwrap().to_owned()),
+                ..args(Some(&sha))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.to_sha, sha);
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(
+            text.contains("+forked"),
+            "the local commit's change: {text}"
+        );
+        let mirror = Mirror::open(&layout).unwrap();
+        assert!(
+            mirror.try_resolve(&sha).is_none(),
+            "the tree is read in place: nothing is copied into the mirror"
+        );
+        assert!(
+            mirror.repo().find_remote("import").is_err(),
+            "no remote is registered for a source read where it lies"
+        );
+        assert!(
+            !layout.sources_dir().exists(),
+            "a local tree needs no store"
+        );
+    }
+
+    #[test]
+    fn the_walk_probe_answers_from_what_the_mirror_holds() {
+        let (_tmp, layout, _main) = fixture();
+        let mirror = Mirror::open(&layout).unwrap();
+        let config = layout.project().unwrap().0;
+        let range = request(&args(Some("main..feat")), &config, None).unwrap();
+        let bare = request(&args(Some("feat")), &config, None).unwrap();
+
+        assert!(
+            range_walks(&mirror, &range, None),
+            "both ends held by name, history complete: the walk answers"
+        );
+        assert!(!range_walks(&mirror, &bare, None), "no base, no walk");
+        assert!(
+            !range_walks(&mirror, &bare, Some("ghost")),
+            "a base the mirror lacks cannot walk"
+        );
+        assert!(
+            range_walks(&mirror, &bare, Some("main")),
+            "the default ref held: the merge base is walkable"
+        );
     }
 
     #[test]
@@ -1951,9 +2520,12 @@ mod tests {
     }
 
     #[test]
-    fn a_repo_fetch_lands_in_the_namespace_and_the_range_comes_from_there() {
+    fn a_source_tree_is_read_in_place_and_the_mirror_is_not_touched() {
         let (tmp, layout, _main) = fixture();
         let fork = fork(tmp.path());
+        let mirror = Mirror::open(&layout).unwrap();
+        let fixture_feat = mirror.try_resolve("refs/heads/feat").unwrap();
+        drop(mirror);
 
         let done = import(
             &layout,
@@ -1965,21 +2537,519 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!(done.commits, 1, "one commit between the named ends");
         let text = std::fs::read_to_string(&done.path).unwrap();
         assert!(text.contains("+forked"), "the fork's own change:\n{text}");
 
         let mirror = Mirror::open(&layout).unwrap();
-        assert!(
-            mirror.try_resolve(&format!("{NS}/heads/feat")).is_some(),
-            "the fetched branch must be reachable in the mirror"
+        assert_eq!(
+            mirror.try_resolve("refs/heads/feat"),
+            Some(fixture_feat),
+            "the mirror's own branch is left exactly as it was"
         );
         assert!(
-            mirror.repo().find_remote("import").is_ok(),
-            "the source repository is the `import` remote"
+            mirror.repo().find_remote("import").is_err(),
+            "a source read in place never registers a remote"
         );
         assert!(
             mirror.repo().find_remote("origin").is_err(),
             "origin is `sync`'s remote and import must not invent one"
+        );
+        assert!(
+            !layout.sources_dir().exists(),
+            "a local tree needs no store"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_tree_imports_a_bare_commit_by_its_parent() {
+        // The commit's parent is the base, read from the commit itself: no history the
+        // mirror and this tree could or could not share enters the question.
+        let (_tmp, layout, _main) = fixture();
+        let foreign = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(foreign.path()).unwrap();
+        let root = commit_file(
+            &repo,
+            "refs/heads/main",
+            "unrelated base",
+            b"unrelated\n",
+            &[],
+        );
+        let sha = {
+            let parent = repo.find_commit(root).unwrap();
+            commit_file(
+                &repo,
+                "refs/heads/feat",
+                "foreign line",
+                b"foreign\n",
+                &[&parent],
+            )
+            .to_string()
+        };
+        drop(repo);
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                at: None,
+                repo: Some(foreign.path().to_str().unwrap().to_owned()),
+                ..args(Some(&sha))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.from, format!("{sha}^"), "the commit's own parent");
+        assert_eq!(done.from_sha, root.to_string(), "and nothing older");
+        assert_eq!(done.commits, 1, "the one change the commit introduced");
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(text.contains("+foreign"), "the foreign change:\n{text}");
+    }
+
+    #[test]
+    fn a_commit_on_no_ref_imports_from_the_object_that_is_here() {
+        // What a reset or a rebase leaves behind: the object exists in the tree and no
+        // ref names it. `--repo` reads objects, not just branches, so it comes across.
+        let (tmp, layout, _main) = fixture();
+        let source = fork(tmp.path());
+        let sha = {
+            let repo = git2::Repository::open(&source).unwrap();
+            let sha = repo
+                .find_reference("refs/heads/feat")
+                .unwrap()
+                .target()
+                .unwrap()
+                .to_string();
+            repo.find_branch("feat", git2::BranchType::Local)
+                .unwrap()
+                .delete()
+                .unwrap();
+            sha
+        };
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                at: None,
+                repo: Some(source.to_str().unwrap().to_owned()),
+                ..args(Some(&sha))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.to_sha, sha, "the object as it lies in the tree");
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(text.contains("+forked"), "the unreachable commit:\n{text}");
+        assert!(
+            !layout.sources_dir().exists(),
+            "no ref to fetch: nothing needed fetching"
+        );
+    }
+
+    #[test]
+    fn a_bare_ref_name_reads_the_source_trees_own_line() {
+        let (tmp, layout, _main) = fixture();
+        let source = fork(tmp.path());
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                at: None,
+                repo: Some(source.to_str().unwrap().to_owned()),
+                ..args(Some("feat"))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.from, "feat^", "the change that line's tip introduced");
+        assert_eq!(done.commits, 1);
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(text.contains("+forked"), "the tree's own commit:\n{text}");
+    }
+
+    #[test]
+    fn a_url_source_fetches_into_a_store_of_its_own() {
+        let (tmp, layout, _main) = fixture();
+        let source = fork(tmp.path());
+        let url = format!("file://{}", source.display());
+
+        let first = import(
+            &layout,
+            &ImportArgs {
+                at: None,
+                repo: Some(url.clone()),
+                ..args(Some("main..feat"))
+            },
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&first.path).unwrap();
+        assert!(text.contains("+forked"), "the source's change:\n{text}");
+        assert!(
+            !text.contains(source.to_str().unwrap()),
+            "a file:// source is a local origin; the path stays out of the patch"
+        );
+        assert_eq!(
+            count_header_lines(&text, "X-Skot-Source: "),
+            0,
+            "a file:// URL stands for this machine too"
+        );
+        let entries: Vec<_> = std::fs::read_dir(layout.sources_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![std::ffi::OsString::from(source_key(&url).unwrap())],
+            "one store, keyed by the location as given"
+        );
+        let store = Mirror::at(
+            layout.source_store(&source_key(&url).unwrap()),
+            layout.offline(),
+        )
+        .unwrap();
+        assert!(
+            store.try_resolve("refs/heads/feat").is_some(),
+            "the store holds what was fetched"
+        );
+        let mirror = Mirror::open(&layout).unwrap();
+        assert!(
+            mirror.repo().find_remote("import").is_err(),
+            "the mirror is not where a URL is read"
+        );
+        assert!(
+            mirror.repo().find_remote("origin").is_err(),
+            "the mirror still belongs to `sync` alone"
+        );
+
+        let second = import(
+            &layout,
+            &ImportArgs {
+                at: None,
+                repo: Some(url),
+                ..args(Some("main..feat"))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            second.outcome,
+            Outcome::Unchanged,
+            "the same source and range is the same import"
+        );
+    }
+
+    #[test]
+    fn refresh_checks_a_local_trees_own_upstream_for_what_the_tree_lacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = tmp.path().join("upstream.git");
+        let repo = git2::Repository::init_bare(&upstream).unwrap();
+        let main = commit_file(&repo, "refs/heads/main", "base", b"base\n", &[]);
+        let feat = {
+            let parent = repo.find_commit(main).unwrap();
+            commit_file(
+                &repo,
+                "refs/heads/feat",
+                "add the second line",
+                b"second\n",
+                &[&parent],
+            )
+            .to_string()
+        };
+        repo.set_head("refs/heads/main").unwrap();
+        drop(repo);
+        let source_path = tmp.path().join("source");
+        let source = git2::Repository::clone(upstream.to_str().unwrap(), &source_path).unwrap();
+        for name in ["refs/heads/feat", "refs/remotes/origin/feat"] {
+            if let Ok(mut reference) = source.find_reference(name) {
+                reference.delete().unwrap();
+            }
+        }
+        drop(source);
+
+        let layout = Layout::new(tmp.path().join("proj"));
+        std::fs::create_dir_all(layout.patches_dir()).unwrap();
+        std::fs::write(
+            layout.config_file(),
+            "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
+        )
+        .unwrap();
+        let args = ImportArgs {
+            at: None,
+            repo: Some(source_path.to_str().unwrap().to_owned()),
+            ..args(Some("main..feat"))
+        };
+
+        let err = import(&layout, &args).unwrap_err().to_string();
+        assert!(
+            err.contains("neither a branch, tag, nor commit"),
+            "the tree cannot answer: {err}"
+        );
+        assert!(err.contains("--refresh"), "the remedy: {err}");
+        assert!(
+            !layout.sources_dir().exists(),
+            "without --refresh nothing is fetched from the tree's upstream"
+        );
+
+        let done = import(&layout.with_refresh(true), &args).unwrap();
+        assert_eq!(
+            done.to_sha, feat,
+            "the tree's own upstream carries the missing line"
+        );
+        assert!(
+            layout.sources_dir().exists(),
+            "--refresh is the permission to ask, and the answer lands in the store"
+        );
+        assert!(
+            Mirror::open(&layout).is_err(),
+            "the main mirror is never involved in either run"
+        );
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(text.contains("+second"), "the fetched change:\n{text}");
+    }
+
+    #[test]
+    fn a_root_commit_cannot_be_its_own_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        let root = commit_file(&repo, "refs/heads/main", "the start", b"start\n", &[]);
+        drop(repo);
+        let (_tmp2, layout, _main) = fixture();
+
+        let err = import(
+            &layout,
+            &ImportArgs {
+                at: None,
+                repo: Some(tmp.path().to_str().unwrap().to_owned()),
+                ..args(Some(&root.to_string()))
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("root commit"), "the fact: {err}");
+        assert!(err.contains("--from"), "the remedy: {err}");
+    }
+
+    #[test]
+    fn a_source_tree_imports_without_a_mirror_at_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = fork(tmp.path());
+        let layout = Layout::new(tmp.path().join("proj"));
+        std::fs::create_dir_all(layout.patches_dir()).unwrap();
+        std::fs::write(
+            layout.config_file(),
+            "[upstream]\nurl = \"unused\"\ndefault-ref = \"main\"\n",
+        )
+        .unwrap();
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                at: None,
+                repo: Some(source.to_str().unwrap().to_owned()),
+                ..args(Some("main..feat"))
+            },
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(text.contains("+forked"), "the source's change:\n{text}");
+        assert!(
+            !layout.mirror_dir().exists(),
+            "nothing may have tried to create a mirror for this run"
+        );
+    }
+
+    /// The provenance a patch records, panicking for one that records none.
+    fn provenance_of(text: &str) -> Provenance {
+        text.lines()
+            .find_map(parse_provenance)
+            .expect("the patch records its import")
+    }
+
+    /// How many header lines of a kind a patch carries.
+    fn count_header_lines(text: &str, prefix: &str) -> usize {
+        text.lines().filter(|line| line.starts_with(prefix)).count()
+    }
+
+    #[test]
+    fn a_source_is_recorded_by_where_it_lies_and_never_the_path() {
+        let (tmp, layout, _main) = fixture();
+        let source = fork(tmp.path());
+        let source_str = source.to_str().unwrap().to_owned();
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                at: None,
+                repo: Some(source_str.clone()),
+                ..args(Some("main..feat"))
+            },
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(
+            !text.contains(&source_str),
+            "a committed patch must not say where the files sat:\n{text}"
+        );
+        let provenance = provenance_of(&text);
+        assert!(
+            provenance.identity.ends_with("#main..feat"),
+            "the request still speaks for itself: {}",
+            provenance.identity
+        );
+        let token = provenance
+            .identity
+            .strip_prefix("repo:")
+            .and_then(|rest| rest.split('#').next())
+            .unwrap();
+        assert_eq!(token.len(), 16, "a digest, not a location: {token}");
+        assert!(
+            token.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "a digest reads as hex: {token}"
+        );
+        assert_eq!(
+            count_header_lines(&text, "X-Skot-Source: "),
+            0,
+            "no origin worth recording"
+        );
+    }
+
+    #[test]
+    fn a_source_with_a_network_origin_is_recorded_by_that_origin() {
+        let (tmp, layout, _main) = fixture();
+        let source = fork(tmp.path());
+        let source_str = source.to_str().unwrap().to_owned();
+        let origin = "https://example.com/me/fork.git";
+        let repo = git2::Repository::open(&source).unwrap();
+        repo.remote("origin", origin).unwrap();
+        drop(repo);
+
+        let first = import(
+            &layout,
+            &ImportArgs {
+                at: None,
+                repo: Some(source_str.clone()),
+                ..args(Some("main..feat"))
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&first.path).unwrap();
+        assert!(!text.contains(&source_str), "never the path:\n{text}");
+        assert_eq!(
+            provenance_of(&text).identity,
+            format!("repo:{origin}#main..feat"),
+            "the origin a person could clone from names the source"
+        );
+        assert!(
+            text.contains(&format!("X-Skot-Source: {origin}")),
+            "the origin is also said in its own line:\n{text}"
+        );
+
+        // Another commit on the line: the next run updates the same patch, and neither
+        // header line may stack while it does.
+        let repo = git2::Repository::open(&source).unwrap();
+        {
+            let tip = repo
+                .find_reference("refs/heads/feat")
+                .unwrap()
+                .target()
+                .unwrap();
+            let parent = repo.find_commit(tip).unwrap();
+            commit_file(
+                &repo,
+                "refs/heads/feat",
+                "forked again",
+                b"forked again\n",
+                &[&parent],
+            );
+        }
+        drop(repo);
+
+        let second = import(
+            &layout,
+            &ImportArgs {
+                at: None,
+                repo: Some(source_str),
+                ..args(Some("main..feat"))
+            },
+        )
+        .unwrap();
+        assert_eq!(second.outcome, Outcome::Updated, "the line moved on");
+        let text = std::fs::read_to_string(&second.path).unwrap();
+        assert_eq!(
+            count_header_lines(&text, "X-Skot-Import: "),
+            1,
+            "one provenance line:\n{text}"
+        );
+        assert_eq!(
+            count_header_lines(&text, "X-Skot-Source: "),
+            1,
+            "one source line:\n{text}"
+        );
+        assert!(text.contains(&format!("X-Skot-Source: {origin}")));
+    }
+
+    #[test]
+    fn a_local_origin_is_not_written_into_a_patch() {
+        let (tmp, layout, _main) = fixture();
+        let source = fork(tmp.path());
+        let source_str = source.to_str().unwrap().to_owned();
+        let local = tmp.path().join("upstream.git");
+        let repo = git2::Repository::open(&source).unwrap();
+        repo.remote("origin", local.to_str().unwrap()).unwrap();
+        drop(repo);
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                at: None,
+                repo: Some(source_str.clone()),
+                ..args(Some("main..feat"))
+            },
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(
+            !text.contains(&source_str) && !text.contains(local.to_str().unwrap()),
+            "two local names for the same machine, neither written:\n{text}"
+        );
+        let token = provenance_of(&text)
+            .identity
+            .strip_prefix("repo:")
+            .and_then(|rest| rest.split('#').next())
+            .unwrap()
+            .to_owned();
+        assert_eq!(token.len(), 16, "a local origin is worth no more: {token}");
+        assert_eq!(
+            count_header_lines(&text, "X-Skot-Source: "),
+            0,
+            "a local origin would re-leak the path it stands for"
+        );
+    }
+
+    #[test]
+    fn a_source_token_is_its_network_origin_or_a_digest_of_where_it_lies() {
+        let path = "/tmp/example/fork";
+        let url = "https://example.com/me/fork.git";
+        let digest = source_key(path).unwrap();
+        assert_eq!(source_token(path, Some(url)).unwrap(), url);
+        assert_eq!(
+            source_token(path, Some("git@example.com:me/fork.git")).unwrap(),
+            "git@example.com:me/fork.git"
+        );
+        assert_eq!(source_token(path, Some(path)).unwrap(), digest);
+        assert_eq!(
+            source_token(path, Some("file:///tmp/example/fork")).unwrap(),
+            digest
+        );
+        assert_eq!(source_token(path, None).unwrap(), digest);
+        let file_url_digest = source_token("file:///tmp/example/fork", None).unwrap();
+        assert_eq!(file_url_digest.len(), 16);
+        assert!(
+            !file_url_digest.contains("example"),
+            "the location never shows through: {file_url_digest}"
         );
     }
 

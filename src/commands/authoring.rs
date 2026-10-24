@@ -18,21 +18,24 @@ use crate::series::Entry;
 use crate::state::State;
 
 /// Resolve the ref a command should work against: the argument, then the series' base,
-/// then the configured default.
+/// then the configured default, then the mirror's own HEAD.
 ///
 /// `command_line` is what the advice tells the user to run, already resolved through
-/// [`crate::invocation`] so a command that moves updates this message too. Kept as a
-/// plain scalar so this stays callable from tests without a clap `Ctx` behind it.
+/// [`crate::invocation`] so a command that moves updates this message too, and `target`
+/// is which command the fallback note is attributed to. Kept as plain scalars so this
+/// stays callable from tests without a clap `Ctx` behind it.
 pub fn wanted_ref(
     layout: &Layout,
     ref_name: Option<&str>,
     config: &Config,
     command_line: &str,
+    target: &'static str,
 ) -> Result<String> {
     ref_name
         .map(str::to_owned)
         .or_else(|| layout.base_ref())
         .or_else(|| config.upstream.default_ref.clone())
+        .or_else(|| super::mirror_head_ref(layout, target))
         .context(format!(
             "no ref to work against.\n\
              Pass one (as in `{command_line} <ref>`), record a base for this series, \

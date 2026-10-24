@@ -107,6 +107,7 @@ fn create(layout: &Layout, name: &str, base: Option<&str>, at: Option<&str>) -> 
             .map(str::to_owned)
             .or_else(|| layout.base_ref())
             .or_else(|| config.upstream.default_ref.clone())
+            .or_else(|| super::mirror_head_ref(layout, "new"))
             .ok_or_else(|| {
                 // `apply`'s version of this error says "run `skot patch apply <ref>`", which is the
                 // wrong advice here: the user has not decided to apply anything, they have decided
@@ -381,9 +382,10 @@ mod tests {
     #[test]
     fn new_without_a_default_ref_says_how_to_choose_one() {
         // `apply`'s advice for this situation ("run `skot patch apply <ref>`") is the wrong
-        // advice here, because the user has not decided to apply anything.
-        let tmp = tempfile::tempdir().unwrap();
-        let (layout, _sha) = testsupport::project_with_sandbox(tmp.path());
+        // advice here, because the user has not decided to apply anything. The mirror's own
+        // HEAD stands in only when there is a mirror; without one there is nothing left to
+        // ask and the advice still arrives.
+        let (_tmp, layout) = testsupport::project();
 
         let err = create(&layout, "next", None, None).unwrap_err().to_string();
         assert!(err.contains("--base"), "should point at the flag: {err}");
@@ -391,6 +393,18 @@ mod tests {
             err.contains("default-ref"),
             "should point at the config: {err}"
         );
+    }
+
+    #[test]
+    fn new_falls_back_to_the_mirrors_own_head() {
+        // No argument, no series base, no `upstream.default-ref`: the patch starts from
+        // the branch the mirror itself points at instead of demanding a ref first.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::project_with_sandbox(tmp.path());
+
+        create(&layout, "next", None, None).unwrap();
+
+        assert!(layout.patches_dir().join("next.patch").is_file());
     }
 
     #[test]

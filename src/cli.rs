@@ -701,7 +701,8 @@ pub struct ImportArgs {
     #[arg(value_name = "RANGE", required_unless_present = "pr")]
     pub range: Option<String>,
 
-    /// Base of the patch. Defaults to the merge base with `upstream.default-ref`.
+    /// Base of the patch. Defaults to the merge base with `upstream.default-ref`, or to
+    /// `TO^` when `--repo` reads a tree and the range names no base.
     #[arg(long, value_name = "REF")]
     pub from: Option<String>,
 
@@ -711,9 +712,10 @@ pub struct ImportArgs {
     #[arg(long, value_name = "N|REF", conflicts_with = "range")]
     pub pr: Option<String>,
 
-    /// Fetch the range from this repository (a URL or a local clone). Refs are looked up
-    /// there first, so a range named against that repository resolves as written.
-    #[arg(long, value_name = "URL")]
+    /// Read the range from this repository. A local tree is read where it lies and the
+    /// mirror is not touched; a URL is fetched into a store of its own under
+    /// `.skot/sources/`. A bare `TO` then takes `TO^` as its base.
+    #[arg(long, value_name = "URL|PATH")]
     pub repo: Option<String>,
 
     /// Name for the new patch. Defaults to the subject of what is being imported: the

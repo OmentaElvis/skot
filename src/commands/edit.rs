@@ -122,6 +122,7 @@ fn open(
             .map(str::to_owned)
             .or_else(|| layout.base_ref())
             .or_else(|| config.upstream.default_ref.clone())
+            .or_else(|| super::mirror_head_ref(layout, "edit"))
             .ok_or_else(|| {
                 // `new`'s version of this error suggests `new --base`, which would start a
                 // *different* patch; this one is about opening an existing one.
@@ -367,8 +368,9 @@ mod tests {
 
     #[test]
     fn edit_without_a_base_says_how_to_choose_one() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (layout, _sha) = testsupport::mirror_with_one_commit(tmp.path());
+        // The mirror's own HEAD stands in only when there is a mirror; without one there
+        // is nothing left to fall back on and the advice still arrives.
+        let (_tmp, layout) = testsupport::project();
         testsupport::write_series(&layout, &[("a.patch", "")]);
 
         let err = open(&layout, "a.patch", None, false)
@@ -379,6 +381,19 @@ mod tests {
             err.contains("default-ref"),
             "should point at the config: {err}"
         );
+    }
+
+    #[test]
+    fn edit_falls_back_to_the_mirrors_own_head() {
+        // No argument, no series base, no `upstream.default-ref`: the work area opens on
+        // the branch the mirror itself points at.
+        let tmp = tempfile::tempdir().unwrap();
+        let (layout, _sha) = testsupport::mirror_with_one_commit(tmp.path());
+        testsupport::write_series(&layout, &[("a.patch", "")]);
+
+        let (session, _, _) = open(&layout, "a.patch", None, false).unwrap();
+
+        assert_eq!(session.ref_name, "main");
     }
 
     #[test]

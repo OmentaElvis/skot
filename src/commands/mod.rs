@@ -33,6 +33,7 @@ pub(crate) mod sync;
 pub(crate) mod testsupport;
 
 use anyhow::{Result, bail};
+use log::info;
 
 use crate::cli::{Cli, Command, PatchCommand, SeriesCommand};
 use crate::layout::{DEFAULT_SERIES, Layout};
@@ -265,6 +266,23 @@ pub fn run(ctx: Ctx) -> Result<Exit> {
 pub fn emit_json<T: serde::Serialize>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+
+/// The last thing a ref chain can stand on before it gives up: the branch the mirror's
+/// own HEAD points at, which is the base `import` takes for a range that left it to be
+/// worked out. Said out loud, because it is a fallback and not a setting written
+/// anywhere.
+///
+/// Nothing is fetched to answer this: a mirror that exists has the HEAD it was cloned
+/// with, and one that does not leaves the chain's error standing as it was.
+pub(crate) fn mirror_head_ref(layout: &Layout, target: &'static str) -> Option<String> {
+    let mirror = crate::git::mirror::Mirror::open(layout).ok()?;
+    let name = mirror.head_branch()?;
+    info!(
+        target: target,
+        "upstream.default-ref is not set; using the mirror's `{name}` as the base"
+    );
+    Some(name)
 }
 
 #[cfg(test)]

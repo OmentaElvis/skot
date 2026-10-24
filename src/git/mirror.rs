@@ -41,6 +41,47 @@ impl Mirror {
         })
     }
 
+    /// Open an existing bare repository at an arbitrary path: a `--repo` URL's store
+    /// under `.skot/sources/`, which reads like the mirror but belongs to that one
+    /// source rather than to the project.
+    pub fn at(path: PathBuf, offline: bool) -> Result<Self> {
+        let repo = git2::Repository::open_bare(&path)
+            .context(format!("opening the source store at {}", path.display()))?;
+
+        Ok(Self {
+            repo,
+            path,
+            offline,
+        })
+    }
+
+    /// Fetch `refspecs` from `url` into the bare repository at `path`, creating it when
+    /// it is not there yet.
+    ///
+    /// How a `--repo` URL's store is filled: the same [`Self::transfer`] every other
+    /// fetch goes through, so `--offline` is refused at the door and the spinner shows
+    /// the work, with the path handed in rather than taken from a layout, because the
+    /// store is keyed by where the user pointed, not by the project's own mirror.
+    pub fn fetch_at(
+        url: &str,
+        path: &Path,
+        refspecs: &[String],
+        message: &str,
+        offline: bool,
+    ) -> Result<()> {
+        Self::transfer(
+            url,
+            path,
+            "origin",
+            refspecs,
+            message,
+            None,
+            i32::MAX,
+            offline,
+        )
+        .map(|_| ())
+    }
+
     /// Open the mirror, creating it from `url` if it is not there yet.
     pub fn open_or_clone(layout: &Layout, url: &str, ref_name: Option<&str>) -> Result<Self> {
         if layout.mirror_dir().join("HEAD").is_file() {
@@ -126,6 +167,17 @@ impl Mirror {
     /// several candidate names and want a miss rather than an error naming a remedy.
     pub fn try_resolve(&self, name: &str) -> Option<Sha> {
         super::try_commit(&self.repo, name)
+    }
+
+    /// The branch this mirror's own HEAD points at: what a clone of this project would
+    /// call its main line, and the answer a person gives when asked for the default. A
+    /// detached or unborn HEAD is nobody's default, so it counts as none.
+    pub fn head_branch(&self) -> Option<String> {
+        let head = self.repo.head().ok()?;
+        if !head.is_branch() {
+            return None;
+        }
+        head.shorthand().ok().map(str::to_owned)
     }
 
     /// `sync`'s refspecs: exactly the ref asked for, or the whole upstream when nothing
@@ -474,7 +526,7 @@ const FETCH_DEPTH: i32 = 1;
 /// Whether `url` names a local repository: a path, `file://`, or anything without a host
 /// in it. Only fetch depth cares: libgit2 refuses shallow fetches over its local
 /// transport, so those fetches take full history.
-fn is_local_url(url: &str) -> bool {
+pub(crate) fn is_local_url(url: &str) -> bool {
     match url.split_once("://") {
         Some((scheme, _)) => scheme == "file",
         // The scp form, `host:path` or `user@host:path`, is a network transport; a path
