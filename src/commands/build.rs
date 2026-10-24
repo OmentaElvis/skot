@@ -32,6 +32,7 @@ use crate::commands::apply;
 use crate::commands::authoring;
 use crate::commands::{Ctx, Exit, emit_json};
 use crate::config::{Config, SandboxPolicy};
+use crate::git::mirror::Mirror;
 use crate::git::sandbox;
 use crate::hooks::{self, Env};
 use crate::invocation::{skot, skot_args};
@@ -132,8 +133,15 @@ pub fn run(ctx: &Ctx, args: &BuildArgs) -> Result<Exit> {
     Ok(Exit::Success)
 }
 
-/// The ref to build: the argument, then the configured default, then the mirror's own
-/// HEAD, with build's advice.
+/// The ref to build: the argument, then where the sandbox already stands, then the
+/// series base, then the configured default, then the mirror's own HEAD, with build's
+/// advice.
+///
+/// The record comes second and not later because a build is the continuation of what is
+/// on the table: after an `apply` put a ref's series into the sandbox, a bare `build`
+/// keeps building there rather than re-priming the sandbox against whatever
+/// `default-ref` or the mirror's HEAD says. An argument is the one way to say
+/// "somewhere else".
 ///
 /// `layout` supplies the config file's path for the message and the mirror for that last
 /// resort; the rest is scalars, so this is testable without a command line.
@@ -141,6 +149,13 @@ fn the_ref(layout: &Layout, config: &Config, ref_name: Option<&str>) -> Result<S
     if let Some(name) = ref_name {
         debug!(target: "build", "ref from the argument: {name}");
         return Ok(name.to_owned());
+    }
+    if let Some(applied) = State::load(layout)
+        .ok()
+        .and_then(|state| state.ref_name(layout).map(str::to_owned))
+    {
+        debug!(target: "build", "ref from where the sandbox stands: {applied}");
+        return Ok(applied);
     }
     if let Some(base) = layout.base_ref() {
         debug!(target: "build", "ref from the series base: {base}");
@@ -221,7 +236,7 @@ fn sync_phase(layout: &Layout, config: &Config, ref_name: &str, json: bool) -> R
     // warm build runs even when the network would not.
     crate::commands::sync::ensure(layout, Some(ref_name))?;
 
-    let env = hook_env(layout, ref_name, &current_sha(layout))?;
+    let env = hook_env(layout, ref_name, &base_sha(layout, ref_name))?;
     hooks::run_point(HookPoint::PostSync, &env, config, json)?;
     Ok(())
 }
@@ -238,9 +253,11 @@ fn apply_phase(
     json: bool,
     synced: bool,
 ) -> Result<()> {
-    let sha = current_sha(layout);
-    // The sha comes from state, which a cold run has not filled in yet: on a first run
-    // there is nothing to say but the ref itself.
+    let sha = base_sha(layout, ref_name);
+    // What the ref resolves to, not what the sandbox happens to record: a run against
+    // one ref while the record holds another must not label itself, its hooks or its
+    // failures with the other one's commit. Empty when neither the mirror nor the
+    // record knows the ref yet, in which case the line carries the ref alone.
     let against = if sha.is_empty() {
         ref_name.to_owned()
     } else {
@@ -325,8 +342,7 @@ fn apply_phase(
                 // problem, and it is the last place that information exists before the
                 // run stops.
                 bail!(
-                    "the series does not apply to {ref_name} ({sha}); the run stopped.\n\
-                     {failure}",
+                    "the series does not apply to {against}; the run stopped.\n{failure}",
                     failure = applied.failure
                 );
             }
@@ -340,8 +356,10 @@ fn apply_phase(
                 crate::commands::sync::resolve_in_mirror(layout, ref_name)?
             };
             if let Err(e) = authoring::land(layout, ref_name, &base, &stack) {
+                // `base`, not the label above: the failure names the commit the replay
+                // actually stood on, resolved just above.
                 bail!(
-                    "the recorded set does not apply to {ref_name} ({sha}); \
+                    "the recorded set does not apply to {ref_name} ({base}); \
                      the run stopped.\n{e}"
                 );
             }
@@ -361,7 +379,7 @@ fn hook_phase(
     phase: Phase,
     json: bool,
 ) -> Result<()> {
-    let sha = current_sha(layout);
+    let sha = base_sha(layout, ref_name);
     let env = hook_env(layout, ref_name, &sha)?;
     hooks::ensure_sandbox(&env.sandbox)?;
 
@@ -399,15 +417,28 @@ pub(crate) fn unique_points(phase: Phase) -> Vec<HookPoint> {
     out
 }
 
-/// The commit the last successful sync or apply recorded, for the hook environment.
+/// The commit `ref_name` stands on, for the hook environment and for the lines that name
+/// what a phase is working against.
 ///
-/// Read back from state rather than resolved again, so every hook in a run is told the same
-/// commit. Resolving per phase would let a hook see a different tree from the one the run
-/// actually applied.
-fn current_sha(layout: &Layout) -> String {
+/// The mirror answers for anything it holds, since that is what `apply` resolves against
+/// anyway, and between the sync and the phases after it the mirror does not move, so
+/// every hook in a run is told the same commit. The sandbox's record is read only when
+/// the mirror cannot answer, and only when the record is about this very ref: a run
+/// against one ref while the sandbox holds another must not print, hook or report the
+/// other one's commit as if it were this ref's. A cold run has not fetched the ref yet,
+/// and there it is honestly empty.
+fn base_sha(layout: &Layout, ref_name: &str) -> String {
+    let mirror = Mirror::open(layout).ok();
+    if let Some(sha) = mirror
+        .as_ref()
+        .and_then(|mirror| mirror.try_resolve(ref_name))
+    {
+        return sha;
+    }
     State::load(layout)
         .ok()
-        .and_then(|s| s.sha(layout).map(str::to_owned))
+        .filter(|state| state.ref_name(layout) == Some(ref_name))
+        .and_then(|state| state.sha(layout).map(str::to_owned))
         .unwrap_or_default()
 }
 
@@ -462,6 +493,43 @@ mod tests {
         let (config, _) = layout.project().unwrap();
 
         assert_eq!(the_ref(&layout, &config, None).unwrap(), "main");
+    }
+
+    #[test]
+    fn build_continues_from_where_the_sandbox_stands() {
+        // The sandbox record beats the configured default: after `patch apply` primed
+        // `main`, a bare build keeps building there instead of silently re-priming the
+        // sandbox against whatever `default-ref` or the mirror's HEAD says.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = testsupport::applied_two_patch_stack(tmp.path());
+        std::fs::write(
+            layout.config_file(),
+            "[upstream]\nurl = \"unused\"\ndefault-ref = \"nonexistent\"\n",
+        )
+        .unwrap();
+        let (config, _) = layout.project().unwrap();
+
+        assert_eq!(the_ref(&layout, &config, None).unwrap(), "main");
+    }
+
+    #[test]
+    fn a_sha_is_the_commit_this_ref_points_at() {
+        // Never another ref's commit: the mirror answers for anything it holds, the
+        // record answers only for the ref it recorded, and a ref neither knows is
+        // nothing yet rather than somebody else's sha.
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = testsupport::applied_two_patch_stack(tmp.path());
+        let main = crate::git::mirror::Mirror::open(&layout)
+            .unwrap()
+            .resolve("main")
+            .unwrap();
+
+        assert_eq!(base_sha(&layout, "main"), main);
+        assert_eq!(
+            base_sha(&layout, "nonexistent"),
+            "",
+            "no such ref, and the record's main must not leak into it"
+        );
     }
 
     #[test]
