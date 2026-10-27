@@ -603,6 +603,13 @@ fn init_takes_the_default_of_every_question_it_cannot_ask() {
             "{name}: a question with no default stays unset: {config}"
         );
 
+        let gitignore = std::fs::read_to_string(project.join(".gitignore"))
+            .unwrap_or_else(|e| panic!("{name}: init wrote a .gitignore: {e}"));
+        assert!(
+            gitignore.lines().any(|line| line == ".skot"),
+            "{name}: the state directory is ignored: {gitignore}"
+        );
+
         let layout = Layout::new(&project);
         let series = std::fs::read_to_string(layout.series_file())
             .unwrap_or_else(|e| panic!("{name}: the default series exists: {e}"));

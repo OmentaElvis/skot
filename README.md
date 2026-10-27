@@ -132,6 +132,7 @@ After running `skot init` and authoring or importing a patch, your project direc
 ```text
 my-project/
 ├── skot.toml               # Main configuration (upstream URL, default ref, build hooks)
+├── .gitignore              # Written by init; keeps .skot/ out of version control
 ├── patches/                # Version-controlled patch store (commit this to Git)
 │   └── default/            # One directory per series (the default series is 'default')
 │       ├── series          # Ordered list of patch files ('#!' marks disabled patches)
@@ -139,7 +140,7 @@ my-project/
 │       ├── 001-my-fix.patch
 │       └── 002-feature.patch
 ├── blobs/                  # Binary content referenced by patches (commit this to Git)
-└── .skot/                  # Disposable local workspace (add to .gitignore, safe to delete)
+└── .skot/                  # Disposable local workspace (ignored by .gitignore, safe to delete)
     ├── mirror.git/         # Bare git mirror of upstream (only thing that touches network)
     ├── sandbox/            # Linked worktree workspace where patches are applied and built
     │   └── default/
@@ -149,6 +150,7 @@ my-project/
 ```
 
 - **`skot.toml`**: The main configuration file that records your upstream repository URL, default base ref, and lifecycle build hooks.
+- **`.gitignore`**: `init` creates it when absent and adds `.skot` when missing, without touching rules the project already has.
 - **`patches/`**: The permanent source of truth. Each series gets its own directory with an explicit `series` ordering file and plain unified `.patch` files. Commit this entire directory to Git.
 - **`blobs/`**: The permanent store for binary content that patches reference by hash. It is shared by every series and must be committed with `patches/`.
 - **`.skot/`**: Disposable local cache and workspaces. It contains the upstream mirror, your linked build sandbox, and authoring worktrees. If you ever delete `.skot/`, running `skot build` or `skot sync` will simply recreate it on the fly.

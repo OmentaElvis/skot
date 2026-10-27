@@ -117,6 +117,38 @@ fn one_line(cmd: &str) -> String {
     }
 }
 
+/// The line `init` adds to `.gitignore`: the state directory is local, never shared.
+const GITIGNORE_LINE: &str = ".skot";
+
+/// Whether a `.gitignore` line already ignores the state directory.
+fn ignores_state(line: &str) -> bool {
+    matches!(line.trim_end(), ".skot" | ".skot/" | "/.skot" | "/.skot/")
+}
+
+/// Make sure `.gitignore` keeps the state directory out of version control.
+///
+/// Created when absent and appended to when present without the line. A file that
+/// already says so is left byte for byte: a generated file must never overwrite rules
+/// the user wrote.
+fn ensure_gitignore(root: &std::path::Path) -> Result<()> {
+    let path = root.join(".gitignore");
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err).context(format!("reading {}", path.display())),
+    };
+    if existing.lines().any(ignores_state) {
+        return Ok(());
+    }
+    let mut out = existing;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(GITIGNORE_LINE);
+    out.push('\n');
+    std::fs::write(&path, out).context(format!("writing {}", path.display()))
+}
+
 /// Which of [`KEEP_CANDIDATES`] are actually sitting in `root`.
 fn keep_candidates(root: &std::path::Path) -> Vec<String> {
     KEEP_CANDIDATES
@@ -217,6 +249,9 @@ fn scaffold(layout: &Layout, plan: &Plan) -> Result<()> {
         )
         .context(format!("writing {}", series_path.display()))?;
     }
+    // The state directory is local. Init writes the rule that keeps it out of the
+    // repository, without touching any rule the project already has.
+    ensure_gitignore(layout.root())?;
     layout.ensure_state_dirs()?;
     Ok(())
 }
@@ -613,6 +648,40 @@ mod tests {
         let written = read(&layout);
         assert!(written.contains(&toml_line("series", "exp")), "{written}");
         assert!(!written.contains(PLACEHOLDER_SERIES), "{written}");
+    }
+
+    #[test]
+    fn init_writes_a_gitignore_that_keeps_the_state_directory_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(tmp.path());
+        scaffold(&layout, &plan("https://example.invalid/proj")).unwrap();
+
+        let written = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(written, ".skot\n");
+    }
+
+    #[test]
+    fn an_existing_gitignore_keeps_its_rules_and_gains_the_state_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".gitignore");
+        std::fs::write(&path, "target").unwrap();
+        let layout = Layout::new(tmp.path());
+        scaffold(&layout, &plan("https://example.invalid/proj")).unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, "target\n.skot\n");
+    }
+
+    #[test]
+    fn a_gitignore_that_already_ignores_the_state_directory_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".gitignore");
+        let existing = "target\n.skot/\n# local state\n";
+        std::fs::write(&path, existing).unwrap();
+        let layout = Layout::new(tmp.path());
+        scaffold(&layout, &plan("https://example.invalid/proj")).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
     }
 
     #[test]
