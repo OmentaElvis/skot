@@ -138,6 +138,7 @@ my-project/
 │       ├── base            # The upstream ref and commit this series sits on
 │       ├── 001-my-fix.patch
 │       └── 002-feature.patch
+├── blobs/                  # Binary content referenced by patches (commit this to Git)
 └── .skot/                  # Disposable local workspace (add to .gitignore, safe to delete)
     ├── mirror.git/         # Bare git mirror of upstream (only thing that touches network)
     ├── sandbox/            # Linked worktree workspace where patches are applied and built
@@ -149,6 +150,7 @@ my-project/
 
 - **`skot.toml`**: The main configuration file that records your upstream repository URL, default base ref, and lifecycle build hooks.
 - **`patches/`**: The permanent source of truth. Each series gets its own directory with an explicit `series` ordering file and plain unified `.patch` files. Commit this entire directory to Git.
+- **`blobs/`**: The permanent store for binary content that patches reference by hash. It is shared by every series and must be committed with `patches/`.
 - **`.skot/`**: Disposable local cache and workspaces. It contains the upstream mirror, your linked build sandbox, and authoring worktrees. If you ever delete `.skot/`, running `skot build` or `skot sync` will simply recreate it on the fly.
 
 ---
@@ -532,6 +534,16 @@ The order this file lists is the order `apply` follows, and it is the only place
 What the sandbox holds is an ordered *subset* of the series: any patch can be on or off, and the set always replays in series order. `skot patch list` and `skot status` show it as `[x]` against each applied entry and `[ ]` against each that is off, so a disabled patch in the middle is visible rather than implied by a count. The choice of which patches apply lives in the series file itself: `skot patch disable` marks a line `#!` and `skot patch enable` takes the mark off, so it is trackable in git. Every `[PATCH]` argument reads the same way: an exact name, a unique name prefix such as `fix`, or a 1-based position among the enabled patches (`skot patch drop fix`, `skot patch push 3`).
 
 `skot patch new --at` and `skot patch import --at` insert at an existing patch name or a 1-based position; only the new line is added and every other patch keeps its name and its place. A file that already occupies a name outside the series is refused rather than overwritten. `skot patch drop <patch>` goes the other way: it takes the line and the file, leaving the rest where they are. `skot patch move` reorders without taking anything out: the patch's line steps to its new place and the entries it passes fold one place at a time.
+
+---
+
+## Binary Files
+
+Binary changes stay out of the patch text. A patch names the bytes in an `X-Skot-Blob: <path> <sha256> <size>` header line, and the content lives once at `blobs/<sha256>` in the project root. The diff body keeps the usual `Binary files ... differ` stub, so a patch remains readable as a patch: the binary part is a line of metadata plus a content-addressed file, not a base85 block inside the diff.
+
+`blobs/` is part of the source of truth and must be committed with `patches/`. The same bytes are stored once no matter how many patches or series reference them. `skot check` and `skot patch apply` expand the references against the base before applying, so the sandbox gets the exact bytes without skot needing the `git` executable. After a save, drop, import, series drop or rebase, skot removes any blob no patch still names, including the ones kept by `series undo` and open work areas.
+
+Paths with spaces and other unusual characters are quoted on the `diff --git` line in git's own format, so the exported patch reads back correctly and applies to the right file.
 
 ---
 

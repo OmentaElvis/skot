@@ -11,6 +11,7 @@
 //!   checking and applying cannot disagree.
 //! - [`layout`] is the only module that names a path, and the only one that deletes one.
 
+pub mod blobs;
 pub mod check;
 pub mod cli;
 pub mod commands;

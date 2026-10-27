@@ -314,10 +314,10 @@ pub fn plan(
 
     let mut whole: Vec<Entry> = entries_below.to_vec();
     whole.extend(self_entry.cloned());
-    let applied = check::replay_series(mirror.repo(), &base_sha, &whole).context(format!(
-        "replaying {} patch(es) onto {ref_name}",
-        whole.len()
-    ))?;
+    let applied =
+        check::replay_series(mirror.repo(), &base_sha, &whole, &layout.blobs_dir()).context(
+            format!("replaying {} patch(es) onto {ref_name}", whole.len()),
+        )?;
     if !applied.report.ok {
         bail!(
             "the series does not apply to {ref_name}.\n\
@@ -485,7 +485,7 @@ pub fn unsaved(layout: &Layout, session: &Session) -> Result<bool> {
         &authoring::subject_from_name(&session.patch),
         &authoring::signature(&repo),
     );
-    let patch = diff::tree_to_patch(&repo, &base, &header)
+    let patch = diff::tree_to_patch(&repo, &base, &header, &layout.blobs_dir())
         .context(format!("exporting {} for comparison", session.patch))?;
     Ok(diff::change_of(&patch) != diff::change_of(&existing))
 }

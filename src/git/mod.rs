@@ -7,6 +7,7 @@
 //! creation, checkout and diff generation. skot calls those rather than
 //! reimplementing them, which is the whole point of embedding a git engine.
 
+pub mod binary;
 pub mod diff;
 pub mod mirror;
 pub mod sandbox;

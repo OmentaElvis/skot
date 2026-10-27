@@ -199,14 +199,16 @@ fn check_one(args: &CheckArgs, layout: &Layout) -> Result<crate::check::Report> 
             // sandbox (the entries are applied to the commit's tree in the mirror), so a
             // ref the mirror lacks is fetched, not deferred to a `skot sync` round trip.
             let (mirror, sha) = super::sync::resolve_in_mirror(layout, &name)?;
-            crate::check::check_series(mirror.repo(), &sha, &entries).context(format!(
-                "checking {} against {name} ({sha})",
-                if args.applied {
-                    "the applied set"
-                } else {
-                    "the series"
-                }
-            ))
+            crate::check::check_series(mirror.repo(), &sha, &entries, &layout.blobs_dir()).context(
+                format!(
+                    "checking {} against {name} ({sha})",
+                    if args.applied {
+                        "the applied set"
+                    } else {
+                        "the series"
+                    }
+                ),
+            )
         }
         None => {
             if !git::sandbox::is_repository(layout) {
@@ -228,7 +230,7 @@ fn check_one(args: &CheckArgs, layout: &Layout) -> Result<crate::check::Report> 
                 "reading the sandbox HEAD at {}",
                 layout.sandbox_dir().display()
             ))?;
-            crate::check::check_series(&repo, &sha, &entries)
+            crate::check::check_series(&repo, &sha, &entries, &layout.blobs_dir())
         }
     }
 }

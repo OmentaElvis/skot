@@ -7,6 +7,8 @@
 //! should be diffed against. Getting that in one place is what keeps `push` from silently
 //! diffing against a base that `apply` would never have produced.
 
+use std::path::Path;
+
 use anyhow::{Context, Result, bail};
 
 use crate::check;
@@ -49,8 +51,13 @@ pub fn wanted_ref(
 /// `push`, `pop` and `rebase` all need "what tree does this set of patches produce" and none
 /// of them want a checkout, so they share this rather than each calling `replay_series` and
 /// remembering to handle the failing case.
-pub fn replay(repo: &git2::Repository, base: &Sha, entries: &[Entry]) -> Result<check::Applied> {
-    check::replay_series(repo, base, entries).context(format!(
+pub fn replay(
+    repo: &git2::Repository,
+    base: &Sha,
+    entries: &[Entry],
+    blobs: &Path,
+) -> Result<check::Applied> {
+    check::replay_series(repo, base, entries, blobs).context(format!(
         "replaying {} patch(es) against {base}",
         entries.len()
     ))
@@ -429,7 +436,7 @@ pub fn resolve_stack(
 /// see the same stack the sandbox actually holds.
 pub fn land(layout: &Layout, ref_name: &str, base: &Sha, stack: &Stack) -> Result<git2::Oid> {
     let repo = require_sandbox(layout)?;
-    let applied = replay(&repo, base, &stack.entries)?;
+    let applied = replay(&repo, base, &stack.entries, &layout.blobs_dir())?;
 
     if !applied.report.ok {
         bail!(

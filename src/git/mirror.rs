@@ -58,7 +58,7 @@ impl Mirror {
     /// Fetch `refspecs` from `url` into the bare repository at `path`, creating it when
     /// it is not there yet.
     ///
-    /// How a `--repo` URL's store is filled: the same [`Self::transfer`] every other
+    /// How a `--repo` URL's store is filled: the same `Self::transfer` every other
     /// fetch goes through, so `--offline` is refused at the door and the spinner shows
     /// the work, with the path handed in rather than taken from a layout, because the
     /// store is keyed by where the user pointed, not by the project's own mirror.

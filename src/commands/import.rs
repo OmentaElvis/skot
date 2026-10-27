@@ -585,8 +585,8 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     if commits == 1 {
         header.body = tip_body.clone();
     }
-    let bare =
-        diff::tree_to_tree_patch(repo, &old, &new, &header).context("rendering the import")?;
+    let bare = diff::tree_to_tree_patch(repo, &old, &new, &header, &layout.blobs_dir())
+        .context("rendering the import")?;
     let change = change_id(&bare)?;
     header
         .extra
@@ -594,8 +594,8 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     if let Some(url) = &source_url {
         header.extra.push(format!("X-Skot-Source: {url}"));
     }
-    let text =
-        diff::tree_to_tree_patch(repo, &old, &new, &header).context("rendering the import")?;
+    let text = diff::tree_to_tree_patch(repo, &old, &new, &header, &layout.blobs_dir())
+        .context("rendering the import")?;
     let summary = diff::summarise(&text);
 
     // Does any existing patch already answer to this import? One pass over the directory:
@@ -684,12 +684,15 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         } else {
             header.body.clear();
         }
-        let text = diff::tree_to_tree_patch(repo, &old, &new, &header)
+        let text = diff::tree_to_tree_patch(repo, &old, &new, &header, &layout.blobs_dir())
             .context(format!("re-rendering {}", name))?;
         let summary = diff::summarise(&text);
         std::fs::write(&path, &text).context(format!("writing {}", path.display()))?;
         let (series_line, registered_now) =
             register_existing(layout, &mut series, &name, args.no_register)?;
+        // The update replaced whatever binary content the old version named, so the
+        // bytes it held may now have nothing pointing at them.
+        crate::blobs::sweep(layout).context("sweeping binary content no patch references")?;
         // How many commits the range held before: the provenance records the ends in
         // the patch's own direction, which for a reversed patch is the range reversed.
         let previous_commits = if args.reverse {
@@ -741,6 +744,7 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         std::fs::write(&path, &text).context(format!("writing {}", path.display()))?;
         Some(line)
     };
+    crate::blobs::sweep(layout).context("sweeping binary content no patch references")?;
     drop(lock);
 
     Ok(Imported {

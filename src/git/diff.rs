@@ -18,7 +18,9 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+
+use crate::blobs::{self, REF_HEADER};
 
 /// The mail header of a `format-patch` file: everything before the diff.
 ///
@@ -251,10 +253,17 @@ fn strip_patch_prefix(subject: &str) -> String {
 /// it already accounts for staged, unstaged and untracked changes at once and prints the
 /// contents of new files. The split was only ever needed because the *two-argument* form drops
 /// untracked contents, and there is no reason to pay for that.
+///
+/// Binary files are referenced rather than inlined: their bytes go to the project's blob
+/// store and the header gains a line naming them, which is what keeps a patch holding an
+/// image a few lines of text. `blobs` is where the bytes are stored; an export made only
+/// to compare writes them too, since content addressing makes storing bytes that are
+/// already there a no-op.
 pub fn tree_to_patch(
     repo: &git2::Repository,
     tree: &git2::Tree<'_>,
     header: &Header,
+    blobs: &Path,
 ) -> Result<String> {
     let mut options = git2::DiffOptions::new();
     options
@@ -275,9 +284,31 @@ pub fn tree_to_patch(
         return Ok(String::new());
     }
 
+    let mut header = header.clone();
     let mut body = String::new();
     render_body(&diff, &mut body)?;
     let stats = render_stats(&diff)?.map(|lines| lines.join("\n"));
+
+    // The scan below runs last on purpose. It walks the diff with `git_diff_foreach`,
+    // and letting that pass happen before `render_stats` lets libgit2's
+    // `git_diff_get_stats` dereference a NULL patch and crash the process:
+    // `git_patch_from_diff` reports a skippable delta as success with a NULL patch,
+    // and stats handles only the error case. Upstream bug; this order is the
+    // workaround.
+    let deltas = binary_deltas(&diff)?;
+    reference_binaries(
+        &deltas,
+        blobs,
+        |delta: &BinaryDelta| {
+            let workdir = repo
+                .workdir()
+                .context("the sandbox repository has no working directory")?;
+            let path = workdir.join(&delta.path);
+            std::fs::read(&path).context(format!("reading {}", path.display()))
+        },
+        &mut body,
+        &mut header,
+    )?;
 
     Ok(format!("{}{body}", header.render(stats.as_deref())))
 }
@@ -286,11 +317,15 @@ pub fn tree_to_patch(
 ///
 /// This is what `rebase` uses: both sides are already in the object database, so the result
 /// is a patch that applies to the new base by construction rather than by a later `check`.
+///
+/// Binary files are referenced rather than inlined, as in [`tree_to_patch`]; here the bytes
+/// come from the new tree, so a re-exported patch stores what the patch now produces.
 pub fn tree_to_tree_patch(
     repo: &git2::Repository,
     old: &git2::Tree<'_>,
     new: &git2::Tree<'_>,
     header: &Header,
+    blobs: &Path,
 ) -> Result<String> {
     let diff = repo
         .diff_tree_to_tree(Some(old), Some(new), None)
@@ -304,11 +339,127 @@ pub fn tree_to_tree_patch(
         return Ok(String::new());
     }
 
+    let mut header = header.clone();
     let mut body = String::new();
     render_body(&diff, &mut body)?;
     let stats = render_stats(&diff)?.map(|lines| lines.join("\n"));
 
+    // Last for the same reason as in `tree_to_patch`: a `git_diff_foreach` pass
+    // before `render_stats` can make libgit2's `git_diff_get_stats` dereference a
+    // NULL patch and crash. Upstream bug; this order is the workaround.
+    let deltas = binary_deltas(&diff)?;
+    reference_binaries(
+        &deltas,
+        blobs,
+        |delta: &BinaryDelta| {
+            let entry = new
+                .get_path(Path::new(&delta.path))
+                .context(format!("reading {} from the tree", delta.path))?;
+            let blob = repo
+                .find_blob(entry.id())
+                .context(format!("reading the blob for {}", delta.path))?;
+            Ok(blob.content().to_vec())
+        },
+        &mut body,
+        &mut header,
+    )?;
+
     Ok(format!("{}{body}", header.render(stats.as_deref())))
+}
+
+/// Every binary delta in a diff, in the order the diff reports them.
+///
+/// Asked of libgit2 rather than guessed from the rendered text: the binary flag is
+/// libgit2's own verdict about a delta, taken before anything is printed.
+fn binary_deltas(diff: &git2::Diff<'_>) -> Result<Vec<BinaryDelta>> {
+    let mut found: Vec<BinaryDelta> = Vec::new();
+    diff.foreach(
+        &mut |_delta, _progress| true,
+        Some(&mut |delta, _binary| {
+            let path = delta.new_file().path().or_else(|| delta.old_file().path());
+            if let Some(path) = path {
+                found.push(BinaryDelta {
+                    path: path.display().to_string(),
+                    deleted: delta.status() == git2::Delta::Deleted,
+                    link: delta.new_file().mode() == git2::FileMode::Link,
+                });
+            }
+            true
+        }),
+        None,
+        None,
+    )
+    .context("scanning the diff for binary files")?;
+    Ok(found)
+}
+
+/// One binary file a diff reports: which path, and what becomes of it.
+struct BinaryDelta {
+    /// The path as the diff spells it; identical on both sides without rename detection.
+    path: String,
+    /// True when the file goes away, which needs no stored bytes.
+    deleted: bool,
+    /// True when the path becomes a symbolic link, which no stored bytes can represent.
+    link: bool,
+}
+
+/// Store each surviving binary file's bytes and add the header lines that name them.
+///
+/// The stub libgit2 renders stays in the body: it is what tells any reader the file is
+/// binary. Its path is put in the quoted form when the name needs it, because libgit2's
+/// renderer leaves it bare and then cannot read its own output back. What is added here is
+/// one reference line per file the patch must carry content for, in the header, where a
+/// patch keeps what a diff cannot say. A deletion stores nothing, because the bytes it
+/// removes are in the tree the patch applies to.
+fn reference_binaries(
+    deltas: &[BinaryDelta],
+    store: &Path,
+    bytes_of: impl Fn(&BinaryDelta) -> Result<Vec<u8>>,
+    body: &mut String,
+    header: &mut Header,
+) -> Result<()> {
+    // The header came from the patch being replaced, so it may already name binaries the
+    // new diff no longer changes, or the same file with bytes that are now different. The
+    // diff is the authority: every reference is dropped and the ones it reports are added,
+    // so a re-export never carries a stale line beside a fresh one.
+    header.extra.retain(|line| {
+        !line
+            .strip_prefix(REF_HEADER)
+            .is_some_and(|rest| rest.starts_with(": "))
+    });
+    for delta in deltas {
+        // A path with a space or other unusual byte must be quoted on the diff line, or
+        // libgit2 cannot tell where one side ends and the next begins. This applies to a
+        // deletion as much as an addition: the line names the file either way.
+        crate::git::binary::quote_section(body, &delta.path);
+        if delta.deleted {
+            continue;
+        }
+        // A file that becomes a link cannot be carried as stored bytes: applying them
+        // would produce a regular file holding the target's path, not a link.
+        if delta.link {
+            bail!(
+                "{} is a binary file that becomes a link; a patch cannot carry that",
+                delta.path
+            );
+        }
+        // The path comes out of diff-shaped data, so it is checked before any method
+        // builds a path out of it, tree lookup included.
+        if !blobs::safe_repo_path(&delta.path) {
+            bail!(
+                "the diff names `{}`, which is not a safe path in the tree",
+                delta.path
+            );
+        }
+        let bytes = bytes_of(delta)?;
+        let hash = blobs::write(store, &bytes)?;
+        header.extra.push(format!(
+            "{REF_HEADER}: {} {hash} {}",
+            delta.path,
+            bytes.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Append a diff's patch-formatted body to `out`.
@@ -376,16 +527,17 @@ fn render_stats(diff: &git2::Diff<'_>) -> Result<Option<Vec<String>>> {
 /// because that is the one place a patch names its files in a form that does not depend on
 /// the language, the diff settings, or whether the diff is even parseable.
 pub fn summarise(text: &str) -> String {
-    let files: Vec<&str> = text
+    let files: Vec<String> = text
         .lines()
-        .filter_map(|l| l.strip_prefix("diff --git "))
-        // "a/path b/path": the post-image side is the name after the change.
-        .filter_map(|l| l.split_whitespace().nth(1))
-        .map(|p| p.rsplit('/').next().unwrap_or(p))
+        .filter(|l| l.starts_with("diff --git "))
+        // The b-side path, read through the parser that understands the quoted form a
+        // path with a space is written in. Splitting on whitespace would name half of it.
+        .filter_map(|l| crate::git::binary::diff_b_path(l).ok())
+        .map(|p| p.rsplit('/').next().unwrap_or(&p).to_owned())
         .collect();
     match files.as_slice() {
         [] => "no changes".to_owned(),
-        [only] => (*only).to_owned(),
+        [only] => only.clone(),
         [first, rest @ ..] => format!("{first} and {} more file(s)", rest.len()),
     }
 }
@@ -397,20 +549,31 @@ pub fn summarise(text: &str) -> String {
 /// they change when a patch is saved even though the patch still makes exactly the same
 /// edit. Comparing these is what makes `save` idempotent and tells a work area whether
 /// it has been edited; comparing whole files does neither.
+///
+/// The header's binary references are the exception to skipping the header: the bytes a
+/// patch carries live in the store rather than the body, so the lines naming them are the
+/// only place a replaced binary shows up at all.
 pub fn change_of(patch: &str) -> Vec<&str> {
-    let body = match patch.find("diff --git ") {
-        Some(at) => &patch[at..],
-        None => "",
-    };
-    body.lines()
+    let at = patch.find("diff --git ").unwrap_or(patch.len());
+    let head = &patch[..at];
+    let mut out: Vec<&str> = head
+        .lines()
+        // The header ends at the first blank line, so a commit body mentioning the
+        // reference syntax is not mistaken for one.
+        .take_while(|line| !line.trim_end().is_empty())
         .filter(|line| {
-            !line.starts_with("diff --git")
-                && !line.starts_with("index ")
-                && !line.starts_with("@@")
-                && !line.starts_with("+++")
-                && !line.starts_with("---")
+            line.strip_prefix(REF_HEADER)
+                .is_some_and(|r| r.starts_with(": "))
         })
-        .collect()
+        .collect();
+    out.extend(patch[at..].lines().filter(|line| {
+        !line.starts_with("diff --git")
+            && !line.starts_with("index ")
+            && !line.starts_with("@@")
+            && !line.starts_with("+++")
+            && !line.starts_with("---")
+    }));
+    out
 }
 
 /// Match a `keep` glob against a path.
@@ -818,6 +981,12 @@ diff --git a/a.txt b/a.txt
         assert_eq!(summarise(text), "a.txt and 1 more file(s)");
         assert_eq!(summarise("diff --git a/only b/only\n"), "only");
         assert_eq!(summarise("nothing"), "no changes");
+        // A path with a space is quoted on the diff line; the summary still names all of
+        // it rather than the fragment after the space.
+        assert_eq!(
+            summarise("diff --git \"a/my logo.bin\" \"b/my logo.bin\"\n"),
+            "my logo.bin"
+        );
     }
 
     #[test]
@@ -839,6 +1008,9 @@ diff --git a/a.txt b/a.txt
         _tmp: tempfile::TempDir,
         repo: git2::Repository,
         base: git2::Oid,
+        /// Where this sandbox's exports store binary content, standing in for the
+        /// project's blob store.
+        blobs: std::path::PathBuf,
     }
 
     impl Sandbox {
@@ -871,6 +1043,9 @@ diff --git a/a.txt b/a.txt
                 _tmp: tmp,
                 repo,
                 base: tree_id,
+                // Beside the worktree, not inside it: the project's store lives outside
+                // every sandbox, and a store the export could see would export itself.
+                blobs: dir.parent().unwrap().join("blob-store"),
             }
         }
 
@@ -884,7 +1059,32 @@ diff --git a/a.txt b/a.txt
 
         fn export(&self) -> String {
             let header = Header::signed("t", &git2::Signature::now("a", "a@b").unwrap());
-            tree_to_patch(&self.repo, &self.base_tree(), &header).unwrap()
+            tree_to_patch(&self.repo, &self.base_tree(), &header, &self.blobs).unwrap()
+        }
+
+        /// A tree derived from the base: `Some(bytes)` inserts or replaces the path,
+        /// `None` drops it. The tree-to-tree exports need a second tree to diff against.
+        fn derived(&self, edits: &[(&str, Option<&[u8]>)]) -> git2::Tree<'_> {
+            let mut builder = self.repo.treebuilder(Some(&self.base_tree())).unwrap();
+            for (path, body) in edits {
+                match body {
+                    Some(bytes) => {
+                        let oid = self.repo.blob(bytes).unwrap();
+                        builder.insert(path, oid, 0o100644).unwrap();
+                    }
+                    None => {
+                        builder.remove(path).unwrap();
+                    }
+                }
+            }
+            let tree = builder.write().unwrap();
+            self.repo.find_tree(tree).unwrap()
+        }
+
+        /// Export `old` to `new` as rebase and import do.
+        fn export_between(&self, old: &git2::Tree<'_>, new: &git2::Tree<'_>) -> String {
+            let header = Header::signed("t", &git2::Signature::now("a", "a@b").unwrap());
+            tree_to_tree_patch(&self.repo, old, new, &header, &self.blobs).unwrap()
         }
 
         /// Apply an exported patch onto the base tree and return the resulting index.
@@ -1058,5 +1258,186 @@ diff --git a/a.txt b/a.txt
         assert_eq!(s.text_in(&applied, "f.txt"), "edited again\n");
         assert_eq!(s.text_in(&applied, "a.txt"), "a\n");
         assert_eq!(s.text_in(&applied, "d/b.txt"), "b\n");
+    }
+
+    /// Bytes no text diff can carry: NULs and high bytes, which is what makes git and
+    /// libgit2 call a file binary in the first place.
+    fn sample_binary() -> Vec<u8> {
+        vec![
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x00, 0x01, 0xff, 0xfe, 0x00, 0x42,
+        ]
+    }
+
+    /// The reference line the export should have written for `path`, and its hash.
+    fn reference(patch: &str, path: &str) -> (String, u64) {
+        let prefix = format!("X-Skot-Blob: {path} ");
+        let line = patch
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .unwrap_or_else(|| panic!("no {prefix} in:\n{patch}"));
+        let rest = line.strip_prefix("X-Skot-Blob: ").unwrap();
+        let size: u64 = rest.rsplit(' ').next().unwrap().parse().unwrap();
+        let hash = rest.rsplit(' ').nth(1).unwrap().to_owned();
+        (hash, size)
+    }
+
+    #[test]
+    fn a_binary_file_in_the_worktree_is_exported_as_a_reference_with_its_bytes_stored() {
+        // The gap this guards: an export that only carries libgit2's one-line stub claims
+        // a binary file changed and holds none of it, so it can never apply anywhere. The
+        // patch keeps the stub (libgit2 and git both read it), gains a reference line, and
+        // the bytes land once in the store under their hash.
+        let s = Sandbox::new();
+        let bytes = sample_binary();
+        std::fs::write(s.dir().join("logo.png"), &bytes).unwrap();
+
+        let patch = s.export();
+
+        assert!(
+            patch.contains("Binary files"),
+            "the stub is what names the file as binary:\n{patch}"
+        );
+        assert!(
+            !patch.contains("GIT binary patch"),
+            "the payload must not be inlined into the patch:\n{patch}"
+        );
+        let (hash, size) = reference(&patch, "logo.png");
+        assert_eq!(size as usize, bytes.len());
+        let stored = std::fs::read(s.blobs.join(&hash)).expect("the bytes must be in the store");
+        assert_eq!(stored, bytes);
+        // The stub still parses as a patch, header and all.
+        git2::Diff::from_buffer(patch.as_bytes()).expect("the export is a readable patch");
+    }
+
+    #[test]
+    fn a_binary_path_with_a_space_is_quoted_so_the_export_reads_back() {
+        // libgit2's renderer leaves the path bare, and its parser then cannot tell where
+        // one side of the diff line ends. The export has to quote it, or the patch is
+        // unreadable before any materialise step gets a chance to help.
+        let s = Sandbox::new();
+        let bytes = sample_binary();
+        std::fs::write(s.dir().join("my logo.bin"), &bytes).unwrap();
+
+        let patch = s.export();
+
+        assert!(
+            patch.contains("diff --git \"a/my logo.bin\" \"b/my logo.bin\""),
+            "the diff line must be quoted:\n{patch}"
+        );
+        git2::Diff::from_buffer(patch.as_bytes()).expect("the export is a readable patch");
+        let (hash, _) = reference(&patch, "my logo.bin");
+        assert_eq!(std::fs::read(s.blobs.join(hash)).unwrap(), bytes);
+
+        // Rebase takes the tree-to-tree path, which has to quote the same way.
+        let old = s.base_tree();
+        let new = s.derived(&[("my logo.bin", Some(&bytes))]);
+        let rebased = s.export_between(&old, &new);
+        assert!(
+            rebased.contains("diff --git \"a/my logo.bin\" \"b/my logo.bin\""),
+            "the rebased diff line must be quoted:\n{rebased}"
+        );
+        git2::Diff::from_buffer(rebased.as_bytes()).expect("the rebased export is readable");
+    }
+
+    #[test]
+    fn a_rebased_binary_carries_the_new_bytes_and_a_reference() {
+        // Rebase and import re-export from trees: the content comes from the new tree,
+        // and the stored blob must be the new bytes, not the old ones.
+        let s = Sandbox::new();
+        let old_bytes = sample_binary();
+        let mut new_bytes = sample_binary();
+        new_bytes.extend_from_slice(b" changed");
+        let old = s.derived(&[("logo.png", Some(&old_bytes))]);
+        let new = s.derived(&[("logo.png", Some(&new_bytes))]);
+
+        let patch = s.export_between(&old, &new);
+
+        let (hash, size) = reference(&patch, "logo.png");
+        assert_eq!(size as usize, new_bytes.len());
+        let stored = std::fs::read(s.blobs.join(&hash)).unwrap();
+        assert_eq!(stored, new_bytes, "the store holds the new bytes");
+        assert!(
+            !patch.contains("GIT binary patch"),
+            "still a reference, not an inlined payload:\n{patch}"
+        );
+    }
+
+    #[test]
+    fn a_re_export_replaces_an_existing_reference_instead_of_duplicating_it() {
+        // Rebase and save carry the header of the patch they replace. A reference already
+        // in it names the bytes as they were before this diff, so keeping it beside the
+        // fresh one leaves two lines for one file and the stale one can win.
+        let s = Sandbox::new();
+        let old_bytes = sample_binary();
+        let mut new_bytes = sample_binary();
+        new_bytes.extend_from_slice(b" changed");
+        let old = s.derived(&[("logo.png", Some(&old_bytes))]);
+        let new = s.derived(&[("logo.png", Some(&new_bytes))]);
+        let mut header = Header::new("t");
+        header.extra.push("X-Skot-Blob: logo.png aaaa 1".to_owned());
+
+        let patch = tree_to_tree_patch(&s.repo, &old, &new, &header, &s.blobs).unwrap();
+
+        assert_eq!(
+            patch.matches("X-Skot-Blob: ").count(),
+            1,
+            "one reference per file:\n{patch}"
+        );
+        let (hash, size) = reference(&patch, "logo.png");
+        assert_eq!(size as usize, new_bytes.len());
+        assert_eq!(std::fs::read(s.blobs.join(hash)).unwrap(), new_bytes);
+    }
+
+    #[test]
+    fn a_deleted_binary_stores_nothing_and_still_names_the_file() {
+        // A deletion needs no bytes: the content is in the base tree the patch applies to.
+        // The stub names the file; no reference is written for it.
+        let s = Sandbox::new();
+        let bytes = sample_binary();
+        let old = s.derived(&[("logo.png", Some(&bytes))]);
+        // The base itself: it never held the file, so this is the tree the deletion
+        // leaves behind.
+        let new = s.derived(&[]);
+
+        let patch = s.export_between(&old, &new);
+
+        assert!(patch.contains("Binary files"), "the stub stays:\n{patch}");
+        assert!(
+            !patch.contains("X-Skot-Blob"),
+            "a deletion stores nothing:\n{patch}"
+        );
+        let stored = std::fs::read_dir(&s.blobs).map(|e| e.count()).unwrap_or(0);
+        assert_eq!(stored, 0, "nothing written for the delete");
+    }
+
+    #[test]
+    fn a_body_exported_twice_compares_equal() {
+        // Save idempotency with a binary in the export: same content, same store, same
+        // reference line, so the second save has nothing to write.
+        let s = Sandbox::new();
+        std::fs::write(s.dir().join("logo.png"), sample_binary()).unwrap();
+        let first = s.export();
+        let second = s.export();
+        assert_eq!(change_of(&first), change_of(&second));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_change_of_sees_a_changed_binary_reference() {
+        // The reference is header text, and `change_of` used to start at `diff --git`,
+        // so replacing a binary with different bytes of the same length compared equal
+        // and `save` would report no unsaved work.
+        let before = "Subject: [PATCH] t\nX-Skot-Blob: logo.png aaaa 12\n\n---\n\n\
+                      diff --git a/logo.png b/logo.png\n\
+                      Binary files a/x and b/logo.png differ\n";
+        let after = "Subject: [PATCH] t\nX-Skot-Blob: logo.png bbbb 12\n\n---\n\n\
+                     diff --git a/logo.png b/logo.png\n\
+                     Binary files a/x and b/logo.png differ\n";
+        let same = "From: other\nSubject: [PATCH] t\n\
+                    X-Skot-Blob: logo.png aaaa 12\n\n---\n\n\
+                    diff --git a/logo.png b/logo.png\n\
+                    Binary files a/x and b/logo.png differ\n";
+        assert_ne!(change_of(before), change_of(after));
+        assert_eq!(change_of(before), change_of(same));
     }
 }

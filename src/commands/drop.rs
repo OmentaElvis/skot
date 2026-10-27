@@ -13,7 +13,7 @@
 //! nothing here ever guesses. The file the guard will not delete is reported rather than
 //! silently kept.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use log::{debug, info, warn};
 use serde_json::json;
 
@@ -157,6 +157,7 @@ fn remove(layout: &Layout, want: &str) -> Result<Removed> {
 
     let removal = series.remove_entry(layout, &name)?;
     series.save(layout)?;
+    crate::blobs::sweep(layout).context("sweeping binary content no patch references")?;
     drop(lock);
 
     Ok(Removed {
@@ -175,6 +176,7 @@ fn remove_disabled(layout: &Layout, name: &str) -> Result<Removed> {
         bail!("`{name}` is no longer a disabled line in the series.");
     };
     series.save(layout)?;
+    crate::blobs::sweep(layout).context("sweeping binary content no patch references")?;
     let left = series.len();
     drop(lock);
 

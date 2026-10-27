@@ -26,6 +26,8 @@
 //! `save` refuses rather than exporting against a context the series cannot rebuild,
 //! and `--force` is the way past it when the change below was deliberate.
 
+use std::path::Path;
+
 use anyhow::{Context, Result, bail};
 use log::{debug, info};
 use serde_json::json;
@@ -147,11 +149,16 @@ fn save(
     let recorded = git2::Oid::from_str(&session.base_tree)
         .context("reading the work area's recorded base tree")?;
     if !force {
-        let applied = crate::check::replay_series(&repo, &session.base_sha, &entries[..index])
-            .context(format!(
-                "replaying the patches below {} on its recorded base",
-                session.patch
-            ))?;
+        let applied = crate::check::replay_series(
+            &repo,
+            &session.base_sha,
+            &entries[..index],
+            &layout.blobs_dir(),
+        )
+        .context(format!(
+            "replaying the patches below {} on its recorded base",
+            session.patch
+        ))?;
         if applied.tree != recorded {
             bail!(
                 "the patches below `{}` changed after its work area opened, so the recorded \
@@ -174,7 +181,7 @@ fn save(
         &authoring::subject_from_name(&entry.name),
         &authoring::signature(&repo),
     );
-    let patch = diff::tree_to_patch(&repo, &base, &header)
+    let patch = diff::tree_to_patch(&repo, &base, &header, &layout.blobs_dir())
         .context(format!("exporting your edits as {}", entry.name))?;
 
     // Saving a patch you have not touched is normal, not a mistake: it is what running
@@ -218,7 +225,7 @@ fn save(
     // Prove the export applies before overwriting anything. A patch file that libgit2 cannot
     // apply back is worse than a stale one, because the series is now broken and the original
     // is gone.
-    verify_round_trip(&repo, &base, &patch, &entry.name)?;
+    verify_round_trip(&repo, &base, &patch, &entry.name, &layout.blobs_dir())?;
 
     std::fs::write(&entry.path, &patch).context(format!("writing {}", entry.path.display()))?;
 
@@ -239,6 +246,10 @@ fn save(
     // it and it stops being a work area: saving is the end of the loop, and there is no
     // separate close for the user to remember.
     end(layout, &session)?;
+    // The patch just written may have replaced a binary reference, leaving the bytes it
+    // used to name with nothing pointing at them. The new state is on disk, so sweeping
+    // now cannot take away anything a patch still needs.
+    crate::blobs::sweep(layout).context("sweeping binary content no patch references")?;
     drop(lock);
     Ok(Saved {
         name: entry.name,
@@ -355,8 +366,15 @@ fn verify_round_trip(
     base: &git2::Tree<'_>,
     patch: &str,
     name: &str,
+    blobs: &Path,
 ) -> Result<()> {
-    let diff = git2::Diff::from_buffer(patch.as_bytes()).context(format!(
+    // The export names binary content by reference, which libgit2 cannot read on its own:
+    // it is expanded against the base exactly as the replay will expand it, so the check
+    // proves the patch the series will hold applies rather than refusing every binary save.
+    let patch = crate::git::binary::materialise(repo, base, blobs, patch.as_bytes()).context(
+        format!("the exported {name} cannot be prepared for applying"),
+    )?;
+    let diff = git2::Diff::from_buffer(&patch).context(format!(
         "the exported {name} is not a patch skot can read back"
     ))?;
     repo.apply_to_tree(base, &diff, None)
@@ -510,7 +528,7 @@ mod tests {
             .unwrap();
 
         let broken = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,1 @@\n-nothing matches this\n+oops\n";
-        let err = verify_round_trip(&repo, &tree, broken, "a.patch")
+        let err = verify_round_trip(&repo, &tree, broken, "a.patch", &layout.blobs_dir())
             .unwrap_err()
             .to_string();
         assert!(err.contains("a.patch"), "got {err}");
@@ -532,7 +550,7 @@ mod tests {
             .unwrap();
 
         let good = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,1 @@\n-base\n+changed\n";
-        assert!(verify_round_trip(&repo, &tree, good, "a.patch").is_ok());
+        assert!(verify_round_trip(&repo, &tree, good, "a.patch", &layout.blobs_dir()).is_ok());
     }
 
     #[test]
@@ -574,7 +592,8 @@ mod tests {
         // And the series it produces actually applies, which is the property that matters.
         let repo = mirror_repo(&layout);
         let entries = layout.project().unwrap().1.entries(&layout).unwrap();
-        let report = crate::check::check_series(&repo, "main", &entries).unwrap();
+        let report =
+            crate::check::check_series(&repo, "main", &entries, &layout.blobs_dir()).unwrap();
         assert!(report.ok, "{}", report.summary());
     }
 
@@ -621,7 +640,8 @@ mod tests {
         // leaving a broken series unmarked.
         let repo = mirror_repo(&layout);
         let entries = layout.project().unwrap().1.entries(&layout).unwrap();
-        let report = crate::check::check_series(&repo, "main", &entries).unwrap();
+        let report =
+            crate::check::check_series(&repo, "main", &entries, &layout.blobs_dir()).unwrap();
         assert!(
             !report.ok,
             "b.patch's base moved, so the series is now inconsistent"
@@ -655,7 +675,7 @@ mod tests {
         let repo = mirror_repo(&layout);
         let entries = layout.project().unwrap().1.entries(&layout).unwrap();
         assert!(
-            crate::check::check_series(&repo, "main", &entries)
+            crate::check::check_series(&repo, "main", &entries, &layout.blobs_dir())
                 .unwrap()
                 .ok
         );
@@ -1001,7 +1021,8 @@ index 1111111..9999999 100644
         // And the series it produces applies, which is the property that matters.
         let repo = mirror_repo(&layout);
         let entries = layout.project().unwrap().1.entries(&layout).unwrap();
-        let report = crate::check::check_series(&repo, "main", &entries).unwrap();
+        let report =
+            crate::check::check_series(&repo, "main", &entries, &layout.blobs_dir()).unwrap();
         assert!(report.ok, "{}", report.summary());
     }
 }

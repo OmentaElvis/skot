@@ -513,6 +513,7 @@ fn drop_series(ctx: &Ctx, args: &SeriesDropArgs) -> Result<Exit> {
             target.patches_dir().display()
         );
     }
+    crate::blobs::sweep(&ctx.layout).context("sweeping binary content no patch references")?;
     drop(lock);
 
     follow_committed_default(ctx, &args.name, None);

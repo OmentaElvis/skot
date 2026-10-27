@@ -178,14 +178,15 @@ fn apply_inner(
     sandbox::reset_to(layout, &sha, &config.sandbox.keep)?;
 
     let repo = sandbox::open(layout)?;
-    let applied = check::replay_series(&repo, &sha, &entries).context(format!(
-        "applying {what} to {wanted} ({sha})",
-        what = if only.is_some() {
-            "the selected patches"
-        } else {
-            "the series"
-        }
-    ))?;
+    let applied =
+        check::replay_series(&repo, &sha, &entries, &layout.blobs_dir()).context(format!(
+            "applying {what} to {wanted} ({sha})",
+            what = if only.is_some() {
+                "the selected patches"
+            } else {
+                "the series"
+            }
+        ))?;
 
     if !applied.report.ok {
         // Reset first. Leaving a half-applied series in the sandbox is how a later

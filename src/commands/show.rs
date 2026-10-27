@@ -238,9 +238,12 @@ fn file_stats(text: &str) -> Vec<FileStat> {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             // `diff --git a/x b/x`: the b-side name is the file even when the delta
-            // deletes it and `+++` says `/dev/null`.
-            let last = rest.rsplit(' ').next().unwrap_or(rest);
-            let path = last.strip_prefix("b/").unwrap_or(last).to_owned();
+            // deletes it and `+++` says `/dev/null`. Read through the parser that knows
+            // the quoted form, because a path with a space is written that way.
+            let path = crate::git::binary::diff_b_path(line).unwrap_or_else(|_| {
+                let last = rest.rsplit(' ').next().unwrap_or(rest);
+                last.strip_prefix("b/").unwrap_or(last).to_owned()
+            });
             files.push(FileStat {
                 path,
                 added: 0,
@@ -665,6 +668,19 @@ mod tests {
                     removed: 0
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn stats_read_a_quoted_path_whole() {
+        let quoted = "diff --git \"a/my logo.bin\" \"b/my logo.bin\"\nGIT binary patch\n";
+        assert_eq!(
+            file_stats(quoted),
+            vec![FileStat {
+                path: "my logo.bin".to_owned(),
+                added: 0,
+                removed: 0
+            }]
         );
     }
 

@@ -33,6 +33,8 @@
 //! name and leaves the original alone; without it the original becomes the undo entry that
 //! `series undo` trades back.
 
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use log::{debug, error, info};
 use serde_json::json;
@@ -241,7 +243,7 @@ fn rebase(layout: &Layout, ref_name: Option<&str>, into: Option<&str>) -> Result
     let (_mirror, sha) = super::sync::resolve_in_mirror(layout, &new_base)?;
 
     let repo = authoring::require_sandbox(layout)?;
-    let result = plan(&repo, &sha, &entries)?;
+    let result = plan(&repo, &sha, &entries, &layout.blobs_dir())?;
 
     if !result.report.ok {
         drop(lock);
@@ -257,7 +259,7 @@ fn rebase(layout: &Layout, ref_name: Option<&str>, into: Option<&str>) -> Result
         });
     }
 
-    let rewritten = rewrite(&repo, &entries, &result)?;
+    let rewritten = rewrite(&repo, &entries, &result, &layout.blobs_dir())?;
 
     // The series file the rewrite produces: the rewritten names, in order. Comments
     // from the old file are not carried across, which is what rebase has always done.
@@ -313,6 +315,9 @@ fn rebase(layout: &Layout, ref_name: Option<&str>, into: Option<&str>) -> Result
             (Some(built.replace(layout)?), Some(tree))
         }
     };
+    // The old undo entry was replaced, and a re-export may name different bytes than the
+    // patch it rewrote; either can leave content with no patch behind it.
+    crate::blobs::sweep(layout).context("sweeping binary content no patch references")?;
     drop(lock);
 
     Ok(Rebased {
@@ -391,6 +396,7 @@ fn rebase_empty(layout: &Layout, new_base: &str, into: Option<&str>) -> Result<R
     } else {
         None
     };
+    crate::blobs::sweep(layout).context("sweeping binary content no patch references")?;
     drop(lock);
 
     let report = report.unwrap_or_else(|| check::Report {
@@ -442,8 +448,13 @@ struct Rewritten {
 }
 
 /// Replay the series onto `sha` and work out what each patch should become.
-fn plan(repo: &git2::Repository, sha: &Sha, entries: &[series::Entry]) -> Result<check::Applied> {
-    check::replay_series(repo, sha.as_str(), entries)
+fn plan(
+    repo: &git2::Repository,
+    sha: &Sha,
+    entries: &[series::Entry],
+    blobs: &Path,
+) -> Result<check::Applied> {
+    check::replay_series(repo, sha.as_str(), entries, blobs)
         .context(format!("replaying the series onto {sha}"))
 }
 
@@ -452,6 +463,7 @@ fn rewrite(
     repo: &git2::Repository,
     entries: &[series::Entry],
     result: &check::Applied,
+    blobs: &Path,
 ) -> Result<Vec<Rewritten>> {
     let base_tree = crate::git::commit_tree(repo, result.report.base.as_str())?;
     let mut out = Vec::with_capacity(entries.len());
@@ -482,7 +494,7 @@ fn rewrite(
             &authoring::subject_from_name(&entry.name),
             &authoring::signature(repo),
         );
-        let text = diff::tree_to_tree_patch(repo, &old, &new, &header)
+        let text = diff::tree_to_tree_patch(repo, &old, &new, &header, blobs)
             .context(format!("re-exporting {} against the new base", entry.name))?;
 
         out.push(Rewritten {
@@ -545,7 +557,8 @@ mod tests {
         // The whole series still reads back: nothing in it is a file skot cannot parse.
         let repo = git2::Repository::open(layout.mirror_dir()).unwrap();
         let entries = layout.project().unwrap().1.entries(&layout).unwrap();
-        let result = check::replay_series(&repo, &sha_of(&layout), &entries).unwrap();
+        let result =
+            check::replay_series(&repo, &sha_of(&layout), &entries, &layout.blobs_dir()).unwrap();
         assert!(result.report.ok, "{}", result.report.summary());
     }
 
@@ -599,9 +612,10 @@ mod tests {
         .unwrap();
         let entries = vec![entry(&layout, "a.patch"), entry(&layout, "b.patch")];
 
-        let result = check::replay_series(&repo, &sha_of(&layout), &entries).unwrap();
+        let result =
+            check::replay_series(&repo, &sha_of(&layout), &entries, &layout.blobs_dir()).unwrap();
         assert!(result.report.ok, "{}", result.report.summary());
-        let out = rewrite(&repo, &entries, &result).unwrap();
+        let out = rewrite(&repo, &entries, &result, &layout.blobs_dir()).unwrap();
 
         assert_eq!(out.len(), 2);
         assert!(
@@ -624,8 +638,8 @@ mod tests {
         std::fs::write(layout.patches_dir().join("a.patch"), body("base", "first")).unwrap();
         let entries = vec![entry(&layout, "a.patch")];
 
-        let result = check::replay_series(&repo, &sha, &entries).unwrap();
-        let out = rewrite(&repo, &entries, &result).unwrap();
+        let result = check::replay_series(&repo, &sha, &entries, &layout.blobs_dir()).unwrap();
+        let out = rewrite(&repo, &entries, &result, &layout.blobs_dir()).unwrap();
 
         let diff = git2::Diff::from_buffer(out[0].text.as_bytes()).expect("a readable patch");
         let base = repo
@@ -660,8 +674,8 @@ mod tests {
         std::fs::write(layout.patches_dir().join("a.patch"), &original).unwrap();
         let entries = vec![entry(&layout, "a.patch")];
 
-        let result = check::replay_series(&repo, &sha, &entries).unwrap();
-        let out = rewrite(&repo, &entries, &result).unwrap();
+        let result = check::replay_series(&repo, &sha, &entries, &layout.blobs_dir()).unwrap();
+        let out = rewrite(&repo, &entries, &result, &layout.blobs_dir()).unwrap();
 
         assert!(
             out[0].text.contains("Real Person <real@example.com>"),
@@ -688,8 +702,8 @@ mod tests {
         std::fs::write(layout.patches_dir().join("a.patch"), &original).unwrap();
         let entries = vec![entry(&layout, "a.patch")];
 
-        let result = check::replay_series(&repo, &sha, &entries).unwrap();
-        let out = rewrite(&repo, &entries, &result).unwrap();
+        let result = check::replay_series(&repo, &sha, &entries, &layout.blobs_dir()).unwrap();
+        let out = rewrite(&repo, &entries, &result, &layout.blobs_dir()).unwrap();
 
         assert_eq!(changed_lines(&out[0].text), changed_lines(&original));
     }
@@ -719,10 +733,10 @@ mod tests {
         .unwrap();
         let entries = vec![entry(&layout, "a.patch"), entry(&layout, "b.patch")];
 
-        let result = check::replay_series(&repo, &sha, &entries).unwrap();
+        let result = check::replay_series(&repo, &sha, &entries, &layout.blobs_dir()).unwrap();
         assert!(!result.report.ok);
         // `rewrite` refuses rather than producing a partial series.
-        assert!(rewrite(&repo, &entries, &result).is_err());
+        assert!(rewrite(&repo, &entries, &result, &layout.blobs_dir()).is_err());
         assert_eq!(
             std::fs::read_to_string(layout.patches_dir().join("a.patch")).unwrap(),
             body("base", "first"),
@@ -783,7 +797,7 @@ mod tests {
         .unwrap();
         let entries = vec![entry(&layout, "a.patch"), entry(&layout, "b.patch")];
 
-        let result = check::replay_series(&repo, &sha, &entries).unwrap();
+        let result = check::replay_series(&repo, &sha, &entries, &layout.blobs_dir()).unwrap();
         assert_eq!(result.per_patch.len(), 2);
         assert!(result.per_patch.iter().all(Option::is_some));
         assert_ne!(result.per_patch[0], result.per_patch[1]);
@@ -799,7 +813,7 @@ mod tests {
         std::fs::write(layout.patches_dir().join("a.patch"), body("nope", "x")).unwrap();
         let entries = vec![entry(&layout, "a.patch")];
 
-        let result = check::replay_series(&repo, &sha, &entries).unwrap();
+        let result = check::replay_series(&repo, &sha, &entries, &layout.blobs_dir()).unwrap();
         assert_eq!(result.per_patch, vec![None]);
     }
 

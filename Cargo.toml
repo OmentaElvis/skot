@@ -60,6 +60,11 @@ fs4 = { version = "1", features = ["sync"] }
 # reimplementing wrongly once -- gix-url is the gitoxide parser for exactly this, and
 # a location it rejects simply reads as having no host rather than failing a command.
 gix-url = "0.40.0"
+# Content addressing for the blob store: a patch names a binary file by the sha256 of
+# its bytes, so the name doubles as the integrity check on read and two patches holding
+# the same bytes share one file. Hashing bytes is all of it, so this stays a one-purpose
+# crate rather than a general crypto stack.
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

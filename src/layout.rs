@@ -20,6 +20,12 @@ pub const SERIES_FILE: &str = "series";
 pub const BASE_FILE: &str = "base";
 /// Patch directory, relative to the project root: holds one subdirectory per series.
 pub const PATCHES_DIR: &str = "patches";
+/// The blob store, relative to the project root: binary file content, named by the
+/// sha256 of the bytes, that patch headers reference. It sits beside `patches/` rather
+/// than inside it (every subdirectory there means a series) and outside `.skot/` (the
+/// content is the user's own commits and cannot be re-fetched, so it must not share the
+/// fate of the state directory a checkout might ignore wholesale).
+pub const BLOBS_DIR: &str = "blobs";
 /// The series a project starts with, and the one used when no pointer is recorded.
 pub const DEFAULT_SERIES: &str = "default";
 /// The one slot a shared sandbox lives in, under `sandbox/`.
@@ -198,6 +204,13 @@ impl Layout {
     /// The directory holding one subdirectory per series.
     pub fn series_root(&self) -> PathBuf {
         self.root.join(PATCHES_DIR)
+    }
+
+    /// Where stored binary content lives: one file per distinct content, named by hash.
+    ///
+    /// Shared by every series, so a blob two patches reference is written and kept once.
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.root.join(BLOBS_DIR)
     }
 
     /// The series that exist on disk, sorted.

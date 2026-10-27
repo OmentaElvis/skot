@@ -111,8 +111,13 @@ impl Report {
 }
 
 /// Replay `entries` against the tree of `base`, in order.
-pub fn check_series(repo: &git2::Repository, base: &str, entries: &[Entry]) -> Result<Report> {
-    Ok(replay_series(repo, base, entries)?.report)
+pub fn check_series(
+    repo: &git2::Repository,
+    base: &str,
+    entries: &[Entry],
+    blobs: &Path,
+) -> Result<Report> {
+    Ok(replay_series(repo, base, entries, blobs)?.report)
 }
 
 /// The result of a replay: what it found, and the tree it built.
@@ -136,7 +141,12 @@ pub struct Applied {
 ///
 /// The tree is written even when a patch fails: it is the state after the patches that *did*
 /// apply, which is what a caller needs in order to say "this much went on before it broke".
-pub fn replay_series(repo: &git2::Repository, base: &str, entries: &[Entry]) -> Result<Applied> {
+pub fn replay_series(
+    repo: &git2::Repository,
+    base: &str,
+    entries: &[Entry],
+    blobs: &Path,
+) -> Result<Applied> {
     let label = base.to_string();
     let tree =
         crate::git::commit_tree(repo, base).context(format!("reading the tree of {base}"))?;
@@ -145,6 +155,7 @@ pub fn replay_series(repo: &git2::Repository, base: &str, entries: &[Entry]) -> 
         repo,
         tree,
         base: label,
+        blobs,
         patches: Vec::new(),
         trees: Vec::new(),
     };
@@ -172,6 +183,8 @@ struct Replay<'repo> {
     /// What the next patch sees: the base, with every patch so far already on it.
     tree: git2::Tree<'repo>,
     base: String,
+    /// The blob store beside the patches, where a binary reference gets its bytes.
+    blobs: &'repo Path,
     patches: Vec<PatchReport>,
     /// The tree after each patch, for callers that need per-patch results.
     trees: Vec<Option<git2::Oid>>,
@@ -191,6 +204,20 @@ impl Replay<'_> {
             Ok(t) => t,
             Err(e) => {
                 report.error = Some(format!("cannot read {}: {}", entry.path.display(), e));
+                self.patches.push(report);
+                self.trees.push(None);
+                return;
+            }
+        };
+
+        // A patch holds references to stored binary content; libgit2 knows only inline
+        // payloads, so every reference is expanded here, against the tree this patch is
+        // about to see. A reference with nothing behind it is an error about that patch,
+        // reported like any other, rather than a parse failure further down.
+        let text = match crate::git::binary::materialise(self.repo, &self.tree, self.blobs, &text) {
+            Ok(t) => t,
+            Err(e) => {
+                report.error = Some(format!("cannot prepare {}: {e:#}", entry.path.display()));
                 self.patches.push(report);
                 self.trees.push(None);
                 return;
@@ -338,7 +365,6 @@ fn slice_delta(patch: &[u8], delta: &git2::DiffDelta<'_>) -> Option<Vec<u8>> {
         .new_file()
         .path()
         .or_else(|| delta.old_file().path())?;
-    let header = format!("a/{p} b/{p}", p = path.display());
 
     let lines: Vec<&[u8]> = patch.split_inclusive(|b| *b == b'\n').collect();
     let starts: Vec<usize> = lines
@@ -348,19 +374,22 @@ fn slice_delta(patch: &[u8], delta: &git2::DiffDelta<'_>) -> Option<Vec<u8>> {
         .map(|(i, _)| i)
         .collect();
 
-    let position = starts
-        .iter()
-        .position(|&i| header_is_for(lines[i], &header))?;
+    let position = starts.iter().position(|&i| header_is_for(lines[i], path))?;
     let begin = starts[position];
     let end = starts.get(position + 1).copied().unwrap_or(lines.len());
     Some(lines[begin..end].concat())
 }
 
-fn header_is_for(line: &[u8], header: &str) -> bool {
-    String::from_utf8_lossy(line)
-        .trim_end_matches(['\r', '\n'])
-        .strip_prefix("diff --git ")
-        .is_some_and(|rest| rest == header)
+/// Whether a `diff --git` line names `path` on its `b/` side.
+///
+/// Read through the same parser the binary expander uses, because a path with a space or
+/// other unusual byte is written quoted by git and by the binary export. Comparing the raw
+/// text would miss those and report a file whose patch is right there as one that could
+/// not be isolated.
+fn header_is_for(line: &[u8], path: &Path) -> bool {
+    let line = String::from_utf8_lossy(line);
+    crate::git::binary::diff_b_path(line.trim_end_matches(['\r', '\n']))
+        .is_ok_and(|found| Path::new(&found) == path)
 }
 
 /// Turn a libgit2 apply error into something the user can act on.
@@ -427,6 +456,15 @@ fn first_word(text: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The store for a test that has none.
+    ///
+    /// Absolute, and under a path that cannot contain anything, so a reference reaching
+    /// it fails loudly instead of quietly reading a file relative to the working
+    /// directory.
+    fn no_store() -> &'static Path {
+        Path::new("/dev/null/skot-no-store")
+    }
 
     /// A real repository with a real commit, so these exercise libgit2 rather than a
     /// stand-in for it.
@@ -529,7 +567,7 @@ index 3333333..4444444 100644
         ];
         let (_dir, repo, sha) = repo_with(&[("f.txt", BASE)]);
 
-        let report = check_series(&repo, &sha, &entries).unwrap();
+        let report = check_series(&repo, &sha, &entries, no_store()).unwrap();
 
         assert!(!report.ok, "a conflicting series must not report ok");
         let failure = report.first_failure().expect("a patch should have failed");
@@ -554,7 +592,7 @@ index 3333333..4444444 100644
             entry(tmp.path(), "b.patch", CONFLICTING_B),
         ];
         let (_dir, repo, sha) = repo_with(&[("f.txt", BASE)]);
-        let report = check_series(&repo, &sha, &entries).unwrap();
+        let report = check_series(&repo, &sha, &entries, no_store()).unwrap();
         assert_eq!(report.patches.len(), 2);
         assert!(report.patches[0].ok, "the first patch applies on its own");
         assert!(
@@ -568,7 +606,7 @@ index 3333333..4444444 100644
         // Zero patches apply to anything, so a fresh project's check is a success, not
         // an error about having nothing to do.
         let (_dir, repo, sha) = repo_with(&[("f.txt", BASE)]);
-        let report = check_series(&repo, &sha, &[]).unwrap();
+        let report = check_series(&repo, &sha, &[], no_store()).unwrap();
         assert!(report.ok);
         assert_eq!(report.patch_count, 0);
     }
@@ -591,7 +629,7 @@ index 0000000..2222222
 ",
         );
         let (_dir, repo, sha) = repo_with(&[("f.txt", BASE)]);
-        let report = check_series(&repo, &sha, &[a, b]).unwrap();
+        let report = check_series(&repo, &sha, &[a, b], no_store()).unwrap();
         assert!(report.ok, "{}", report.summary());
         assert!(report.first_failure().is_none());
     }
@@ -630,7 +668,7 @@ index 2222222..3333333 100644
 ",
         );
         let (_dir, repo, sha) = repo_with(&[]);
-        let report = check_series(&repo, &sha, &[create, edit]).unwrap();
+        let report = check_series(&repo, &sha, &[create, edit], no_store()).unwrap();
         assert!(report.ok, "{}", report.summary());
     }
 
@@ -659,7 +697,7 @@ index 1111111..2222222 100644
         );
         let base: String = (1..=12).map(|i| format!("line{i}\n")).collect();
         let (_dir, repo, sha) = repo_with(&[("f.txt", &base)]);
-        let report = check_series(&repo, &sha, &[patch]).unwrap();
+        let report = check_series(&repo, &sha, &[patch], no_store()).unwrap();
         assert!(!report.ok);
         assert!(!report.patches[0].files[0].ok);
     }
@@ -694,7 +732,7 @@ index 0000000..4444444
 ",
         );
         let (_dir, repo, sha) = repo_with(&[("f.txt", "gone\n")]);
-        let report = check_series(&repo, &sha, &[del, create]).unwrap();
+        let report = check_series(&repo, &sha, &[del, create], no_store()).unwrap();
         assert!(report.ok, "{}", report.summary());
     }
 
@@ -727,7 +765,7 @@ index 3333333..4444444 100644
 ",
         );
         let (_dir, repo, sha) = repo_with(&[("f.txt", BASE), ("g.txt", "original\n")]);
-        let report = check_series(&repo, &sha, &[patch]).unwrap();
+        let report = check_series(&repo, &sha, &[patch], no_store()).unwrap();
         assert!(!report.ok);
         assert_eq!(report.patches[0].files.len(), 2);
         let by_path = |name: &str| {
@@ -750,7 +788,7 @@ index 3333333..4444444 100644
             line: 1,
         };
         let (_dir, repo, sha) = repo_with(&[]);
-        let report = check_series(&repo, &sha, &[missing]).unwrap();
+        let report = check_series(&repo, &sha, &[missing], no_store()).unwrap();
         assert!(!report.ok);
         assert!(
             report.patches[0]
@@ -765,7 +803,7 @@ index 3333333..4444444 100644
         let tmp = tempfile::tempdir().unwrap();
         let bad = entry(tmp.path(), "bad.patch", "this is not a diff\n");
         let (_dir, repo, sha) = repo_with(&[]);
-        let report = check_series(&repo, &sha, &[bad]).unwrap();
+        let report = check_series(&repo, &sha, &[bad], no_store()).unwrap();
         assert!(!report.ok);
         assert!(
             report.patches[0]
@@ -779,7 +817,7 @@ index 3333333..4444444 100644
     #[test]
     fn an_empty_series_is_ok_and_says_so() {
         let (_dir, repo, sha) = repo_with(&[]);
-        let report = check_series(&repo, &sha, &[]).unwrap();
+        let report = check_series(&repo, &sha, &[], no_store()).unwrap();
         assert!(report.ok);
         assert_eq!(report.patch_count, 0);
     }
@@ -792,7 +830,9 @@ index 3333333..4444444 100644
             entry(tmp.path(), "b.patch", CONFLICTING_B),
         ];
         let (_dir, repo, sha) = repo_with(&[("f.txt", BASE)]);
-        let summary = check_series(&repo, &sha, &entries).unwrap().summary();
+        let summary = check_series(&repo, &sha, &entries, no_store())
+            .unwrap()
+            .summary();
         assert!(summary.contains("a.patch"), "got {summary}");
         assert!(summary.contains("b.patch"), "got {summary}");
         assert!(summary.contains("f.txt"), "got {summary}");
@@ -803,7 +843,8 @@ index 3333333..4444444 100644
         let tmp = tempfile::tempdir().unwrap();
         let entries = vec![entry(tmp.path(), "a.patch", CONFLICTING_A)];
         let (_dir, repo, sha) = repo_with(&[("f.txt", BASE)]);
-        let json = serde_json::to_string(&check_series(&repo, &sha, &entries).unwrap()).unwrap();
+        let json = serde_json::to_string(&check_series(&repo, &sha, &entries, no_store()).unwrap())
+            .unwrap();
         assert!(json.contains("\"patch_count\":1"));
         assert!(json.contains("\"base\""));
     }
@@ -845,7 +886,7 @@ index 1111111..{post} 100644
 "
             ),
         );
-        let report = check_series(&repo, &sha, &[patch]).unwrap();
+        let report = check_series(&repo, &sha, &[patch], no_store()).unwrap();
         assert!(report.ok, "{}", report.summary());
         assert!(report.patches[0].files[0].already_applied);
     }
@@ -855,8 +896,85 @@ index 1111111..{post} 100644
         let tmp = tempfile::tempdir().unwrap();
         let entries = vec![entry(tmp.path(), "a.patch", CONFLICTING_A)];
         let (_dir, repo, _sha) = repo_with(&[]);
-        let err = check_series(&repo, "no-such-ref", &entries)
+        let err = check_series(&repo, "no-such-ref", &entries, no_store())
             .expect_err("an unknown base must not look like an empty tree");
         assert!(err.to_string().contains("no-such-ref"), "got {err}");
+    }
+
+    #[test]
+    fn a_reference_whose_bytes_are_not_in_the_store_is_a_patch_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hash = crate::blobs::hash_of(b"the bytes");
+        let body = format!(
+            "From: A U Thor <a@b>\n\
+             Subject: [PATCH] t\n\
+             X-Skot-Blob: logo.png {hash} 9\n\
+             \n\
+             diff --git a/logo.png b/logo.png\n\
+             index 1111111..2222222 100644\n\
+             Binary files a/logo.png and b/logo.png differ\n"
+        );
+        let entries = vec![entry(tmp.path(), "t.patch", &body)];
+        let (_dir, repo, sha) = repo_with(&[]);
+        let empty_store = tmp.path().join("blobs");
+
+        let report = check_series(&repo, &sha, &entries, &empty_store).unwrap();
+
+        assert!(!report.ok, "a patch that cannot be prepared must not pass");
+        let patch = &report.patches[0];
+        let error = patch.error.as_deref().expect("the patch reports an error");
+        assert!(error.contains("cannot prepare"), "{error}");
+        assert!(error.contains("logo.png"), "{error}");
+    }
+
+    #[test]
+    fn a_binary_patch_expands_from_the_store_and_applies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join("blobs");
+        let bytes = b"binary\x00bytes";
+        let hash = crate::blobs::write(&store, bytes).unwrap();
+        let body = format!(
+            "From: A U Thor <a@b>\n\
+             Subject: [PATCH] t\n\
+             X-Skot-Blob: logo.png {hash} {}\n\
+             \n\
+             diff --git a/logo.png b/logo.png\n\
+             new file mode 100644\n\
+             index 0000000..1111111\n\
+             Binary files /dev/null and b/logo.png differ\n",
+            bytes.len()
+        );
+        let entries = vec![entry(tmp.path(), "t.patch", &body)];
+        let (_dir, repo, sha) = repo_with(&[]);
+
+        let report = check_series(&repo, &sha, &entries, &store).unwrap();
+
+        assert!(report.ok, "{}", report.summary());
+        assert_eq!(report.patches[0].files[0].path, "logo.png");
+    }
+
+    #[test]
+    fn a_quoted_diff_line_still_finds_its_file() {
+        // libgit2 and the binary generator quote a path with a space, so the slice that
+        // isolates one file's patch has to read the quoted form. Comparing raw text
+        // reports the patch as unreadable even though it is right there.
+        let tmp = tempfile::tempdir().unwrap();
+        let body = "From: A U Thor <a@b>\n\
+                    Subject: [PATCH] t\n\
+                    \n\
+                    diff --git \"a/my file.txt\" \"b/my file.txt\"\n\
+                    new file mode 100644\n\
+                    index 0000000..1111111\n\
+                    --- /dev/null\n\
+                    +++ \"b/my file.txt\"\n\
+                    @@ -0,0 +1 @@\n\
+                    +hello\n";
+        let entries = vec![entry(tmp.path(), "t.patch", body)];
+        let (_dir, repo, sha) = repo_with(&[]);
+
+        let report = check_series(&repo, &sha, &entries, no_store()).unwrap();
+
+        assert!(report.ok, "{}", report.summary());
+        assert_eq!(report.patches[0].files[0].path, "my file.txt");
     }
 }
