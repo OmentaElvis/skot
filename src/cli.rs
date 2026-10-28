@@ -15,17 +15,14 @@ use crate::phase::Phase;
 
 pub const ASCII_LOGO: &str = concat!(
     r#"
-                              
   ▄▄▄▄▄              ▄▄▄▄▄▄▄  
  ██▀▀▀▀█▄           █▀▀██▀▀▀▀ 
  ▀██▄  ▄▀ ▄▄           ██     
    ▀██▄▄  ██ ▄█▀ ▄███▄ ██     
  ▄   ▀██▄ ████   ██ ██ ██     
  ▀██████▀▄██ ▀█▄▄▀███▀ ▀██▄   
-            v"#,
+           v"#,
     env!("CARGO_PKG_VERSION"),
-    "\n",
-    " Maintain your changes as a \n  patch series, not a fork."
 );
 
 const PROSE: &str = r#"

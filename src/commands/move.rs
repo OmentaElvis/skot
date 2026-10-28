@@ -230,12 +230,12 @@ fn ask_position(asker: &Asker, names: &[String], moving: &str) -> Result<usize> 
         bail!("the series holds one patch, so there is nowhere to move it.");
     }
     let question = format!("New position for {moving} (1 to {count})");
-    let answer = asker.text_validated(
-        &question,
-        Some("The number the patch should have after the move. Esc cancels."),
-        Fallback::Flag(skot_args("move", "<patch> <patch|N>")),
-        move |input: &str| parse_position(input, count).map(|_| ()),
-    )?;
+    let answer = asker
+        .text(&question)
+        .help("The number the patch should have after the move. Esc cancels.")
+        .fallback(Fallback::Flag(skot_args("move", "<patch> <patch|N>")))
+        .validate(move |input: &str| parse_position(input, count).map(|_| ()))
+        .ask()?;
     Ok(parse_position(&answer, count).expect("the validator admitted this") - 1)
 }
 

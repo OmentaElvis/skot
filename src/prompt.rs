@@ -5,8 +5,8 @@
 //! same way `indicatif` turns its progress bars off when there is no terminal to show
 //! them to. The signals are the invocation itself: `--json` and `--yes` both mean
 //! nobody is waiting at the prompt, and a terminal on stdin decides the rest. This
-//! module owns every `inquire` call in the crate; a command passes the question, the
-//! help line and the fallback, never the prompt machinery.
+//! module owns every `inquire` call in the crate; a command builds its question from
+//! named parts (help, default, fallback) and never touches the prompt machinery.
 //!
 //! One rule covers every question, and it is the rule of pressing Enter:
 //!
@@ -20,6 +20,8 @@
 //!
 //! Under the test harness there is never a terminal, so tests exercise the silent
 //! branch and cannot block on a person.
+
+use inquire::ui::{RenderConfig, StyleSheet, Styled};
 
 /// True when stdin is a terminal and a prompt would have somebody to answer it.
 ///
@@ -117,59 +119,41 @@ impl Asker {
         self.interactive
     }
 
-    /// A line of text. Enter answers empty, so a silent run answers empty too and
-    /// the site maps that to its default the same way it maps an empty line. `esc`
-    /// names what Esc answers here (the wizard's value prompt goes back), so the line
-    /// left on screen does not call a decision a cancellation.
-    pub fn text(
-        &self,
-        message: &str,
-        help: Option<&str>,
-        placeholder: Option<&str>,
-        fallback: Fallback<String>,
-        esc: Option<&'static str>,
-    ) -> Result<String, PromptError> {
-        self.ask(message, fallback, || {
-            let mut prompt = inquire::Text::new(message);
-            if let Some(placeholder) = placeholder {
-                prompt = prompt.with_placeholder(placeholder);
-            }
-            if let Some(esc) = esc {
-                prompt = prompt.with_render_config(
-                    inquire::ui::RenderConfig::default_colored()
-                        .with_canceled_prompt_indicator(inquire::ui::Styled::new(esc)),
-                );
-            }
-            if let Some(help) = help {
-                prompt = prompt.with_help_message(help);
-            }
-            prompt.prompt()
-        })
+    fn default_config() -> RenderConfig<'static> {
+        RenderConfig::default_colored()
+            .with_answered_prompt_prefix(Styled::new("✔").with_fg(inquire::ui::Color::LightGreen))
+            .with_text_input(StyleSheet::new().with_fg(inquire::ui::Color::DarkGreen))
+            .with_help_message(StyleSheet::new().with_fg(inquire::ui::Color::DarkGrey))
+            .with_default_value(StyleSheet::new().with_fg(inquire::ui::Color::LightCyan))
+            .with_answer(StyleSheet::new().with_fg(inquire::ui::Color::LightGreen))
     }
 
-    /// A line of text no other answer will do: `accepts` decides what is well-formed,
-    /// at the site that knows what a valid answer is (a position, a name, a number).
-    pub fn text_validated(
-        &self,
-        message: &str,
-        help: Option<&str>,
-        fallback: Fallback<String>,
-        accepts: impl Fn(&str) -> std::result::Result<(), String> + Clone + 'static,
-    ) -> Result<String, PromptError> {
-        self.ask(message, fallback, || {
-            let mut prompt = inquire::Text::new(message);
-            if let Some(help) = help {
-                prompt = prompt.with_help_message(help);
-            }
-            prompt
-                .with_validator(move |input: &str| {
-                    Ok(match accepts(input) {
-                        Ok(()) => inquire::validator::Validation::Valid,
-                        Err(message) => inquire::validator::Validation::Invalid(message.into()),
-                    })
-                })
-                .prompt()
-        })
+    /// Start a line of text. Enter answers empty, so a silent run answers empty too and
+    /// the site maps that to its default the same way it maps an empty line.
+    ///
+    /// The rest of the question is named on the builder rather than carried as a row of
+    /// anonymous arguments:
+    ///
+    /// ```
+    /// # use skot::prompt::{Asker, Fallback};
+    /// let answer = Asker::new(false, false, false)
+    ///     .text("Default ref?")
+    ///     .help("Branch or tag commands use when you pass none.")
+    ///     .fallback(Fallback::Default("main".to_owned()))
+    ///     .ask();
+    /// assert_eq!(answer.unwrap(), "main");
+    /// ```
+    pub fn text<'a>(&'a self, message: &'a str) -> TextPrompt<'a> {
+        TextPrompt {
+            asker: self,
+            message,
+            help: None,
+            default: None,
+            placeholder: None,
+            fallback: Fallback::Default(String::new()),
+            accepts: None,
+            esc: None,
+        }
     }
 
     /// One line of a list. The cursor starts on what Enter takes, so a question whose
@@ -193,19 +177,18 @@ impl Asker {
             Fallback::Flag(_) => 0,
         };
         self.ask(message, fallback, || {
+            let mut config = Self::default_config();
             let mut prompt = inquire::Select::new(message, options).with_starting_cursor(start);
             if let Some(page_size) = page_size {
                 prompt = prompt.with_page_size(page_size);
             }
             if let Some(esc) = esc {
-                prompt = prompt.with_render_config(
-                    inquire::ui::RenderConfig::default_colored()
-                        .with_canceled_prompt_indicator(inquire::ui::Styled::new(esc)),
-                );
+                config = config.with_canceled_prompt_indicator(inquire::ui::Styled::new(esc));
             }
             if let Some(help) = help {
                 prompt = prompt.with_help_message(help);
             }
+            prompt = prompt.with_render_config(config);
             prompt.prompt()
         })
     }
@@ -228,6 +211,7 @@ impl Asker {
             Fallback::Flag(_) => Vec::new(),
         };
         self.ask(message, fallback, || {
+            let config = Self::default_config();
             let mut prompt = inquire::MultiSelect::new(message, options);
             if !preselect.is_empty() {
                 prompt = prompt.with_default(&preselect);
@@ -235,6 +219,7 @@ impl Asker {
             if let Some(help) = help {
                 prompt = prompt.with_help_message(help);
             }
+            prompt = prompt.with_render_config(config);
             prompt.prompt()
         })
     }
@@ -259,10 +244,12 @@ impl Asker {
             };
         }
         self.ask(message, fallback, || {
+            let config = Self::default_config();
             let mut prompt = inquire::Confirm::new(message).with_default(default);
             if let Some(help) = help {
                 prompt = prompt.with_help_message(help);
             }
+            prompt = prompt.with_render_config(config);
             prompt.prompt()
         })
     }
@@ -285,6 +272,114 @@ impl Asker {
                 instead,
             }),
         }
+    }
+}
+
+/// What an answer must satisfy to be accepted. `Rc` rather than `Box` because inquire
+/// clones validators, and a plain closure is `Clone` but a boxed one is not.
+type Validator = std::rc::Rc<dyn Fn(&str) -> Result<(), String>>;
+
+/// A line of text under construction, started by [`Asker::text`].
+///
+/// Each method names one optional part of the question, so a call says what it means
+/// instead of relying on the position of a run of `None`s. [`ask`](Self::ask) opens the
+/// prompt, or answers from the fallback when nobody is there.
+pub struct TextPrompt<'a> {
+    asker: &'a Asker,
+    message: &'a str,
+    help: Option<String>,
+    default: Option<String>,
+    placeholder: Option<String>,
+    fallback: Fallback<String>,
+    accepts: Option<Validator>,
+    esc: Option<&'static str>,
+}
+
+impl<'a> TextPrompt<'a> {
+    /// The explanation under the question.
+    pub fn help(mut self, help: impl Into<String>) -> Self {
+        self.help = Some(help.into());
+        self
+    }
+
+    /// The answer Enter takes, shown preselected in the prompt.
+    ///
+    /// This is display only: what a run without a terminal answers comes from
+    /// [`fallback`](Self::fallback), because the two can disagree (the first series
+    /// name shows `default` but answers empty).
+    pub fn default(mut self, default: impl Into<String>) -> Self {
+        self.default = Some(default.into());
+        self
+    }
+
+    /// Grey text shown while the line is empty, an example rather than an answer.
+    pub fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
+        self.placeholder = Some(placeholder.into());
+        self
+    }
+
+    /// What a run with nobody at the prompt answers. A text question otherwise answers
+    /// the empty line Enter would give.
+    pub fn fallback(mut self, fallback: Fallback<String>) -> Self {
+        self.fallback = fallback;
+        self
+    }
+
+    /// What Esc answers here, when it is a decision rather than a cancellation (the
+    /// wizard's value prompt goes back), so the line left on screen says so.
+    pub fn esc(mut self, esc: &'static str) -> Self {
+        self.esc = Some(esc);
+        self
+    }
+
+    /// Refuse an answer that is not well-formed, at the site that knows what one looks
+    /// like: a position, a name, a number.
+    pub fn validate(
+        mut self,
+        accepts: impl Fn(&str) -> std::result::Result<(), String> + 'static,
+    ) -> Self {
+        self.accepts = Some(std::rc::Rc::new(accepts));
+        self
+    }
+
+    /// Ask the question, or take the fallback when nobody is there to answer it.
+    pub fn ask(self) -> Result<String, PromptError> {
+        let Self {
+            asker,
+            message,
+            help,
+            default,
+            placeholder,
+            fallback,
+            accepts,
+            esc,
+        } = self;
+        asker.ask(message, fallback, || {
+            let mut config = Asker::default_config();
+            let mut prompt = inquire::Text::new(message);
+            if let Some(placeholder) = placeholder.as_deref() {
+                prompt = prompt.with_placeholder(placeholder);
+            }
+            if let Some(default) = default.as_deref() {
+                prompt = prompt.with_default(default);
+            }
+            if let Some(esc) = esc {
+                config = config.with_canceled_prompt_indicator(inquire::ui::Styled::new(esc));
+            }
+            if let Some(help) = help.as_deref() {
+                prompt = prompt.with_help_message(help);
+            }
+            if let Some(validator) = accepts {
+                prompt = prompt.with_validator(move |input: &str| {
+                    Ok(match validator(input) {
+                        Ok(()) => inquire::validator::Validation::Valid,
+                        Err(message) => inquire::validator::Validation::Invalid(message.into()),
+                    })
+                })
+            }
+            prompt = prompt.with_render_config(config);
+            prompt.prompt()
+        })
     }
 }
 
@@ -326,13 +421,9 @@ mod tests {
     #[test]
     fn a_question_only_a_flag_can_answer_names_the_flag() {
         let err = silent()
-            .text(
-                "Which patches to enable",
-                None,
-                None,
-                Fallback::Flag(skot_args("enable", "<patch>")),
-                None,
-            )
+            .text("Which patches to enable?")
+            .fallback(Fallback::Flag(skot_args("enable", "<patch>")))
+            .ask()
             .unwrap_err();
         let shown = err.to_string();
         assert!(
@@ -370,13 +461,9 @@ mod tests {
     fn yes_does_not_invent_an_answer_it_cannot_know() {
         let yes = Asker::new(false, true, false);
         let err = yes
-            .text(
-                "Which patches to enable",
-                None,
-                None,
-                Fallback::Flag(skot_args("enable", "<patch>")),
-                None,
-            )
+            .text("Which patches to enable?")
+            .fallback(Fallback::Flag(skot_args("enable", "<patch>")))
+            .ask()
             .unwrap_err();
         assert!(
             err.to_string().contains(&skot_args("enable", "<patch>")),
@@ -388,13 +475,9 @@ mod tests {
     fn json_is_a_run_nobody_can_ask_even_on_a_terminal() {
         let json = Asker::new(true, false, true);
         let answer = json
-            .text(
-                "Default ref",
-                None,
-                None,
-                Fallback::Default("main".to_owned()),
-                None,
-            )
+            .text("Default ref?")
+            .fallback(Fallback::Default("main".to_owned()))
+            .ask()
             .unwrap();
         assert_eq!(answer, "main");
     }

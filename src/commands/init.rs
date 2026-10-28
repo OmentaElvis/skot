@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use log::{info, warn};
 
-use crate::cli::InitArgs;
+use crate::cli::{ASCII_LOGO, InitArgs};
 use crate::commands::{Ctx, Exit};
 use crate::config::SandboxPolicy;
 use crate::hints::Hints;
@@ -76,6 +76,28 @@ fn parse_hook(spec: &str) -> Result<(String, String)> {
 fn non_empty(answer: String) -> Option<String> {
     let trimmed = answer.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// What the upstream URL question accepts: a non-blank location git can parse, with a
+/// local path required to name an existing repository. A remote is checked for grammar
+/// only: whether it answers is the first command's business, not a prompt's.
+fn valid_upstream(value: &str) -> std::result::Result<(), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("an upstream repository URL or local path".to_owned());
+    }
+    let parsed = gix_url::parse(value).map_err(|_| "a valid git URL or local path".to_owned())?;
+    let local = !value.contains("://") && parsed.scheme == gix_url::Scheme::File;
+    if local {
+        let path = std::path::Path::new(value);
+        if !path.exists() {
+            return Err("a local path that exists, or a URL".to_owned());
+        }
+        if !crate::git::is_repo(path) {
+            return Err("a path inside a git repository, or a URL".to_owned());
+        }
+    }
+    Ok(())
 }
 
 /// What the wizard says about a stage when asking for its hook.
@@ -316,6 +338,10 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
     // terminal all mean the same silent run, which takes each default.
     let asker = ctx.asker();
 
+    if asker.is_interactive() {
+        eprintln!("{}\n", ASCII_LOGO);
+    }
+
     // The first series: a flag or a question decide its name, and the layout points at
     // it from here on, so every file init writes lands in that series' directory. A
     // name that is not a single path component is refused now, before anything is made.
@@ -323,16 +349,15 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
         Some(name) => name.clone(),
         None => {
             let answer = asker
-                .text(
-                    "First series name",
-                    Some(
-                        "Where your patches live: a directory under patches/. \
-                         Leave empty for the default series.",
-                    ),
-                    Some(DEFAULT_SERIES),
-                    Fallback::Default(String::new()),
-                    None,
+                .text("First series name?")
+                .help(
+                    "Where your patches live: a directory under patches/. \
+                     Leave empty for the default series.",
                 )
+                .default(DEFAULT_SERIES)
+                .placeholder(DEFAULT_SERIES)
+                .fallback(Fallback::Default(String::new()))
+                .ask()
                 .context("asking for the first series name")?;
             non_empty(answer).unwrap_or_else(|| DEFAULT_SERIES.to_owned())
         }
@@ -357,30 +382,28 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
     let url = match &args.url {
         Some(url) => non_empty(url.clone()),
         None => non_empty(
-            asker.text(
-                "Upstream repository URL",
-                Some(
+            asker
+                .text("Upstream repository URL?")
+                .help(
                     "The repository your patches apply to: an https URL, an ssh remote, or a local path.",
-                ),
-                Some("https://github.com/you/project"),
-                Fallback::Flag("--url <URL>".to_owned()),
-                None,
-            )
-            .context("asking for the upstream repository URL")?,
+                )
+                .placeholder("https://github.com/you/project")
+                .fallback(Fallback::Flag("--url <URL>".to_owned()))
+                .validate(valid_upstream)
+                .ask()
+                .context("asking for the upstream repository URL")?,
         ),
     };
 
     let default_ref = match &args.default_ref {
         Some(ref_name) => Some(ref_name.clone()),
         None => non_empty(
-            asker.text(
-                "Default ref",
-                Some("Branch or tag commands use when you pass none. Leave empty to set it later."),
-                None,
-                Fallback::Default(String::new()),
-                None,
-            )
-            .context("asking for the default ref")?,
+            asker
+                .text("Default ref?")
+                .help("Branch or tag commands use when you pass none. Leave empty to set it later.")
+                .fallback(Fallback::Default(String::new()))
+                .ask()
+                .context("asking for the default ref")?,
         ),
     };
 
@@ -388,7 +411,7 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
         Some(choice) => Some(choice.policy()),
         None => {
             let chosen = asker.select(
-                "Sandbox policy",
+                "Sandbox policy?",
                 None,
                 vec![
                     "persistent: kept between runs; a ref change resets it (right locally)",
@@ -486,13 +509,15 @@ pub fn run(ctx: &Ctx, args: &InitArgs) -> Result<Exit> {
                 break; // `done`
             };
             let label = format!("Configure `{key}`");
-            let answer = asker.text(
-                &label,
-                Some(stage_help(*point)),
-                stage_example(*point),
-                Fallback::Default(String::new()),
-                Some("<back>"),
-            );
+            let mut question = asker
+                .text(&label)
+                .help(stage_help(*point))
+                .fallback(Fallback::Default(String::new()))
+                .esc("<back>");
+            if let Some(example) = stage_example(*point) {
+                question = question.placeholder(example);
+            }
+            let answer = question.ask();
             let answer = match answer {
                 Ok(answer) => answer,
                 // Esc goes back to the menu, the value as it stands.
@@ -617,6 +642,51 @@ mod tests {
 
     fn read(layout: &Layout) -> String {
         std::fs::read_to_string(layout.config_file()).unwrap()
+    }
+
+    #[test]
+    fn the_url_question_refuses_a_blank_answer() {
+        let err = valid_upstream("   ").unwrap_err();
+        assert!(err.contains("URL or local path"), "{err}");
+    }
+
+    #[test]
+    fn the_url_question_accepts_a_remote_without_a_network_round_trip() {
+        valid_upstream("https://github.com/example/project").unwrap();
+        valid_upstream("git@github.com:example/project").unwrap();
+        valid_upstream("ssh://git@example.com/project").unwrap();
+    }
+
+    #[test]
+    fn the_url_question_refuses_a_malformed_remote() {
+        assert!(
+            valid_upstream("https://").is_err(),
+            "a URL with no host is not a repository"
+        );
+    }
+
+    #[test]
+    fn the_url_question_accepts_an_existing_local_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        git2::Repository::init(tmp.path()).unwrap();
+        valid_upstream(tmp.path().to_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_url_question_refuses_a_local_path_that_names_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing");
+        let err = valid_upstream(missing.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("that exists"), "{err}");
+    }
+
+    #[test]
+    fn the_url_question_refuses_a_directory_that_is_not_a_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plain = tmp.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let err = valid_upstream(plain.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("git repository"), "{err}");
     }
 
     #[test]
