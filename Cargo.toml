@@ -6,7 +6,7 @@ description = "Manage a patch series against an upstream git repository and buil
 license = "MIT"
 repository = "https://github.com/OmentaElvis/skot"
 readme = "README.md"
-categories = ["command-line-utilities", "development-tools", "git"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "skot"
