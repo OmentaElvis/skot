@@ -1,0 +1,6 @@
+# Cross.toml — configuration for the `cross` cross-compiler tool.
+# https://github.com/cross-rs/cross
+
+[build.env]
+# Forward these into every cross Docker container.
+passthrough = ["CARGO_TERM_COLOR"]

@@ -899,11 +899,12 @@ index 3333333..4444444 100644
         // A second branch the sandbox was never applied to.
         {
             let repo = git2::Repository::open(f.layout.mirror_dir()).unwrap();
+            let who = git2::Signature::now("t", "t@e").unwrap();
             let sha = repo
                 .commit(
                     Some("refs/heads/other"),
-                    &repo.signature().unwrap(),
-                    &repo.signature().unwrap(),
+                    &who,
+                    &who,
                     "other",
                     &repo.head().unwrap().peel_to_tree().unwrap(),
                     &[],

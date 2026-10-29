@@ -72,3 +72,18 @@ tempfile = "3"
 [profile.release]
 strip = true
 lto = "thin"
+
+[package.metadata.deb]
+maintainer = "Elvis Omenta"
+copyright = "2026, Elvis Omenta"
+license-file = ["LICENSE", "4"]
+extended-description = """\
+Manage a patch series against an upstream git repository \
+and easily produce build outputs."""
+depends = "$auto"
+section = "utility"
+priority = "optional"
+assets = [
+  ["target/release/skot", "usr/bin/", "755"],
+  ["README.md", "usr/share/doc/skot/README", "644"],
+]
