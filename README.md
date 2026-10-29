@@ -22,6 +22,7 @@ Every developer has been there: you need one small tweak or critical bugfix in a
 <br clear="right" />
 
 ---
+<img width="1280" height="720" alt="Image" src="https://github.com/user-attachments/assets/7e1cf635-6c56-4689-95b1-33fad30ed10b" />
 
 <!-- START doctoc generated TOC please keep comment here to allow auto update -->
 <!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
