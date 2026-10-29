@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.0](https://github.com/OmentaElvis/skot/compare/v1.0.0...v1.1.0) (2026-10-29)
+
+### Features
+
+* **ci:** wire up docker and gh actions ([5c3ee11](https://github.com/OmentaElvis/skot/commit/5c3ee1167a4311179734f7d0be707183f94e1a5a))
+
 ## 1.0.0 (2026-10-29)
 
 ### Features
