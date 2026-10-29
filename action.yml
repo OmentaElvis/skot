@@ -1,0 +1,42 @@
+name: "Setup skot"
+description: "Install skot - manage a patch series against an upstream git repository"
+author: "Elvis Omenta"
+
+branding:
+  icon: "layers"
+  color: "blue"
+
+inputs:
+  version:
+    description: >
+      Version of skot to install (e.g. "1.2.3", "v1.2.3", or "latest").
+      Defaults to the latest release.
+    required: false
+    default: "latest"
+  token:
+    description: >
+      GitHub token used to query the GitHub API and download release assets.
+      Defaults to the automatic GITHUB_TOKEN. Override if you hit rate limits
+      or need access to a private fork.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  version:
+    description: "The resolved version that was installed (without leading 'v')"
+    value: ${{ steps.setup.outputs.version }}
+  skot-path:
+    description: "Absolute path to the installed skot binary"
+    value: ${{ steps.setup.outputs.skot-path }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install skot
+      id: setup
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        GH_TOKEN: ${{ inputs.token }}
+        GH_REPO: OmentaElvis/skot
+      run: ${{ github.action_path }}/.github/scripts/setup-skot.sh

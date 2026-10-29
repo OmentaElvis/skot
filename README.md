@@ -51,6 +51,12 @@ Every developer has been there: you need one small tweak or critical bugfix in a
   - [Autonomous next-step guidance ("next" hints)](#autonomous-next-step-guidance-next-hints)
   - [Machine-readable, stable JSON output (`--json`)](#machine-readable-stable-json-output---json)
   - [Reliable CI matrix testing](#reliable-ci-matrix-testing)
+  - [CI Recipes](#ci-recipes)
+    - [GitHub Action](#github-action)
+    - [Recipe: Build on tag push (manual release trigger)](#recipe-build-on-tag-push-manual-release-trigger)
+    - [Docker](#docker)
+      - [Multi-stage Dockerfile (Intermediate builder)](#multi-stage-dockerfile-intermediate-builder)
+      - [Bonus: Running skot directly via Docker](#bonus-running-skot-directly-via-docker)
 - [Rebasing Across Upstream Releases](#rebasing-across-upstream-releases)
   - [Why patches become invalid (History churn and anchor drift)](#why-patches-become-invalid-history-churn-and-anchor-drift)
     - [Example: A patch before rebase (anchored to v1.0.0)](#example-a-patch-before-rebase-anchored-to-v100)
@@ -424,6 +430,126 @@ skot check --series all
 ```
 
 Standard Unix exit codes (0 for success, non-zero for conflict or build failure) ensure that CI pipelines fail fast when upstream moves or patches collide.
+
+### CI Recipes
+
+#### GitHub Action
+
+skot is available as a GitHub Action. Add it to any workflow to install the `skot` binary:
+
+```yaml
+- uses: OmentaElvis/skot@v1
+  with:
+    version: latest   # optional - a specific version like "1.2.3" also works
+- run: skot --version
+```
+
+| Input | Default | Description |
+|-------|---------|-------------|
+| `version` | `latest` | Version to install (`latest`, `1.2.3`, or `v1.2.3`) |
+| `token` | `${{ github.token }}` | GitHub token for downloading release assets |
+
+| Output | Description |
+|--------|-------------|
+| `version` | Resolved version that was installed (without leading `v`) |
+| `skot-path` | Absolute path to the installed binary |
+
+#### Recipe: Build on tag push (manual release trigger)
+
+Push a version tag like `v1.2.3` and let CI build your patched project against that upstream ref:
+
+```yaml
+name: Patched build
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: OmentaElvis/skot@v1
+
+      # Verify patches apply cleanly - fails fast before building
+      - name: Check patches against ${{ github.ref_name }}
+        run: skot check "${{ github.ref_name }}"
+
+      - name: Build against ${{ github.ref_name }}
+        run: skot build "${{ github.ref_name }}"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-build-${{ github.ref_name }}
+          path: .skot/sandbox/
+```
+
+This gives you full control: tag a new version when you are ready, and CI produces the patched build.
+
+#### Docker
+
+skot is available as an official multi-arch Docker image (`linux/amd64`, `linux/arm64`) on GitHub Container Registry: `ghcr.io/omentaelvis/skot:latest`.
+
+##### Multi-stage Dockerfile (Intermediate builder)
+
+Just like you use `cargo` or `node` images as build stages to compile applications, you can use `skot` as an intermediate builder in a multi-stage `Dockerfile`. skot clones the upstream, validates and applies your patch series, and executes your configured build hooks to produce the final artifacts:
+
+```dockerfile
+# Stage 1: Build the patched project using skot
+FROM ghcr.io/omentaelvis/skot:latest AS builder
+WORKDIR /workspace
+
+# Copy skot configuration, patch series, and blobs
+COPY skot.toml ./
+COPY patches/ ./patches/
+COPY blobs/ ./blobs/
+
+# Verify patches and build the patched project (e.g. against a specific upstream ref or default-ref)
+RUN skot check && skot build
+
+# Stage 2: Minimal runtime image containing only the built artifacts
+FROM debian:bookworm-slim
+WORKDIR /app
+
+# Copy the build output from skot's sandbox workspace
+COPY --from=builder /workspace/.skot/sandbox/default/target/release/my-app /usr/local/bin/my-app
+
+ENTRYPOINT ["my-app"]
+```
+
+##### Bonus: Running skot directly via Docker
+
+You can also use the container image directly for local development or within CI runner container jobs without installing `skot` on the host:
+
+```bash
+# Pull the latest image
+docker pull ghcr.io/omentaelvis/skot:latest
+
+# Run skot commands mounted against your local project folder
+docker run --rm -v "$(pwd):/project" -w /project \
+  ghcr.io/omentaelvis/skot:latest check --series all
+
+# Build against a specific upstream release ref
+docker run --rm -v "$(pwd):/project" -w /project \
+  ghcr.io/omentaelvis/skot:latest build v1.2.3
+```
+
+In GitHub Actions container jobs:
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/omentaelvis/skot:latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: skot check --series all
+      - run: skot build
+```
 
 ---
 ## Rebasing Across Upstream Releases

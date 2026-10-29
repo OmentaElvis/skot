@@ -1,0 +1,19 @@
+# Build artifacts
+target/
+node_modules/
+
+# Dev / CI files not needed in the image
+drafts/
+.git/
+.github/
+.gitignore
+.releaserc.json
+package.json
+pnpm-lock.yaml
+CHANGELOG.md
+README.md
+LICENSE
+
+# Docker itself
+Dockerfile
+.dockerignore
