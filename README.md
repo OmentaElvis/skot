@@ -15,9 +15,14 @@
 
 <img src="assets/skot.svg" alt="skot logo" align="right" width="160">
 
-Every developer has been there: you need one small tweak or critical bugfix in an open-source tool, so you fork the repository. Three months later, upstream is hundreds of commits ahead, your branch is hopelessly stale, and a simple rebase turns into an afternoon of merge conflict shenanigans.
 
-**skot** changes that dynamic. Instead of maintaining an unwieldy, drifting fork, skot lets you keep your modifications as an explicit, ordered series of plain patch files on top of clean upstream code. Each patch stays small, reviewable, and isolated. When upstream moves, your patches replay cleanly, and you can add, drop, reorder, or toggle any change in seconds.
+**Your changes shouldn't need their own fork.**
+
+Sometimes you need a fix or a feature that isn't in upstream. Maybe your pull request has been waiting for years, was closed as “not planned,” or the change is simply something you want to maintain yourself. Whatever the reason, you shouldn't have to keep an entire fork alive just to carry a few commits forward.
+
+**skot** lets you collect changes from your own work, commits, pull requests, merge requests, or existing patch files and maintain them as an ordered series of patches on top of upstream. When a new upstream version arrives, rebuild with your patches applied. Add, remove, reorder, or temporarily disable changes without dragging an increasingly stale fork along with them.
+
+Keep the changes you need. Stay close to upstream. Let skot handle the patch series.
 
 <br clear="right" />
 
