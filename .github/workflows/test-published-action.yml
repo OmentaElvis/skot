@@ -1,0 +1,37 @@
+name: Test published skot Action
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install exact release
+        id: skot
+        uses: OmentaElvis/skot@v1
+        with:
+          version: v1.1.0
+
+      - name: Verify installation
+        shell: bash
+        env:
+          VERSION: ${{ steps.skot.outputs.version }}
+          SKOT_PATH: ${{ steps.skot.outputs.skot-path }}
+        run: |
+          set -euo pipefail
+
+          echo "Installed version: $VERSION"
+          echo "Binary path: $SKOT_PATH"
+
+          test "$VERSION" = "1.1.0"
+          test -x "$SKOT_PATH"
+
+          "$SKOT_PATH" --version
+          skot --version
+          skot --help
+
