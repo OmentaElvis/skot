@@ -740,6 +740,16 @@ pub struct ImportArgs {
     /// series. How you put back a feature upstream deleted.
     #[arg(long, short = 'r')]
     pub reverse: bool,
+
+    /// Write the exported patch directly to this file instead of the series directory.
+    /// The patch is not added to the series.
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Emit the generated patch text to stdout, with progress and diagnostics on stderr.
+    /// The patch is not added to the series.
+    #[arg(long, conflicts_with_all = ["output", "json"])]
+    pub stdout: bool,
 }
 
 #[derive(Debug, Clone, Args)]

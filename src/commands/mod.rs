@@ -109,6 +109,46 @@ impl Ctx {
             yes: cli.yes,
         })
     }
+
+    /// Resolve a layout for an import that may run outside a project.
+    ///
+    /// Inside a project this resolves exactly as [`Ctx::discover`]. Outside one, a
+    /// standalone layout rooted in the platform cache directory holds the mirror and
+    /// any `--repo` URL stores, so sourcing a patch needs neither `skot.toml` nor a
+    /// series directory.
+    pub fn discover_or_standalone(cli: &Cli) -> Result<Self> {
+        let start = match &cli.dir {
+            Some(dir) => crate::layout::absolute(dir),
+            None => std::env::current_dir()?,
+        };
+        let project = if start.join(crate::layout::CONFIG_FILE).is_file() {
+            Some(Layout::new(start))
+        } else {
+            Layout::discover(&start).ok()
+        };
+        let layout = match project {
+            Some(layout) => series_for(cli, layout)?,
+            None => Layout::standalone()
+                .with_refresh(cli.refresh)
+                .with_offline(cli.offline),
+        };
+        Ok(Self {
+            layout,
+            cli: cli.clone(),
+            yes: cli.yes,
+        })
+    }
+}
+
+/// Whether this run is an import that writes its patch somewhere other than a series.
+///
+/// Such a run is allowed outside a project: `-o` and `--stdout` mean the patch itself
+/// is the output, so a disposable mirror in the platform cache is all the state it needs.
+pub fn is_standalone_import(cli: &Cli) -> bool {
+    matches!(
+        &cli.command,
+        Command::Patch(PatchCommand::Import(args)) if args.stdout || args.output.is_some()
+    )
 }
 
 /// The series this invocation works on, and the sandbox scope it describes.

@@ -213,13 +213,41 @@ pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<Exit> {
     debug!(target: "import", "  {} -> {}", done.from, done.to);
     debug!(target: "import", "  {}", done.summary);
     if done.series_line.is_none() {
-        info!(target: "import", "Not added to the series (--no-register).");
+        if args.stdout {
+            info!(target: "import", "Wrote the patch to stdout.");
+        } else if let Some(path) = &args.output {
+            info!(target: "import", "Wrote the patch to {}.", path.display());
+        } else {
+            info!(target: "import", "Not added to the series (--no-register).");
+        }
     }
-    Hints::new("next")
-        .entry(skot("check"), "verify the series applies")
-        .entry(skot("build"), "the whole run: fetch, apply, build")
-        .print();
+    // A patch that went to a file or a pipe is not in a series, so there is nothing
+    // for `check` or `build` to read: no next step belongs to this run.
+    if done.series_line.is_some() {
+        Hints::new("next")
+            .entry(skot("check"), "verify the series applies")
+            .entry(skot("build"), "the whole run: fetch, apply, build")
+            .print();
+    }
     Ok(Exit::Success)
+}
+
+/// The config and series an import works against.
+///
+/// A project has both. A standalone import outside one has neither `skot.toml` nor a
+/// series file, and a default config with an empty series is all it needs: the patch is
+/// written to `-o` or stdout, never registered.
+fn project_or_default(layout: &Layout) -> Result<(crate::config::Config, crate::series::Series)> {
+    if layout.config_file().is_file() {
+        return layout.project();
+    }
+    let series_file = layout.series_file();
+    let series = if series_file.is_file() {
+        crate::series::Series::load(&series_file)?
+    } else {
+        crate::series::Series::parse(&series_file, "")
+    };
+    Ok((crate::config::Config::default(), series))
 }
 
 /// The plain work behind [`run`]: no clap, no stdout, no verdict.
@@ -231,7 +259,21 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         return import_file(layout, args, &file_path);
     }
 
-    let (config, mut series) = layout.project()?;
+    // Outside a project there is no `skot.toml` to name an upstream, so the source has
+    // to be named on the command line. Said before any fetch, so a missing `--repo`
+    // costs no network.
+    if !layout.config_file().is_file() && args.repo.is_none() {
+        bail!(
+            "standalone import requires --repo <URL|PATH> to specify the target repository.\n\
+             hint: run: {}",
+            skot_args(
+                "import",
+                "--pr 42 --repo https://github.com/org/repo --stdout"
+            )
+        );
+    }
+
+    let (config, mut series) = project_or_default(layout)?;
 
     // Opening the mirror is local, and the URL its `origin` records decides which forge
     // a `--pr` number is read against, so the request is built after it. With no mirror
@@ -579,6 +621,7 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         Some(name) => super::new::slug(name)?,
         None => filename_slug(&derived),
     };
+    let patch_name = series::default_patch_name(&slug);
 
     // A name the user gave is the subject the same way it is for `new`: read back from the
     // filename, so `skot patch list` and the patch header say the same words.
@@ -600,8 +643,15 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     if commits == 1 {
         header.body = tip_body.clone();
     }
-    let bare = diff::tree_to_tree_patch(repo, &old, &new, &header, &layout.blobs_dir())
-        .context("rendering the import")?;
+    // A patch going to a file or a pipe is read by other tools, which cannot resolve
+    // skot's blob store: binary content is inlined in git's own format instead.
+    let self_contained = args.stdout || args.output.is_some();
+    let bare = if self_contained {
+        diff::tree_to_tree_patch_standard(repo, &old, &new, &header)
+    } else {
+        diff::tree_to_tree_patch(repo, &old, &new, &header, &layout.blobs_dir())
+    }
+    .context("rendering the import")?;
     let change = change_id(&bare)?;
     header
         .extra
@@ -609,9 +659,33 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     if let Some(url) = &source_url {
         header.extra.push(format!("X-Skot-Source: {url}"));
     }
-    let text = diff::tree_to_tree_patch(repo, &old, &new, &header, &layout.blobs_dir())
-        .context("rendering the import")?;
+    let text = if self_contained {
+        diff::tree_to_tree_patch_standard(repo, &old, &new, &header)
+    } else {
+        diff::tree_to_tree_patch(repo, &old, &new, &header, &layout.blobs_dir())
+    }
+    .context("rendering the import")?;
     let summary = diff::summarise(&text);
+
+    // An export is answered here, before the series is consulted: the caller asked for
+    // the patch itself, so there is no line to add and no duplicate to report.
+    if let Some(path) = export(args, &text)? {
+        return Ok(Imported {
+            patch: patch_name,
+            path,
+            series_line: None,
+            from: ends.from,
+            from_sha: ends.from_sha,
+            to: ends.to,
+            to_sha: ends.to_sha,
+            reverse: args.reverse,
+            commits,
+            summary,
+            outcome: Outcome::Created,
+            registered_now: false,
+            previous_commits: None,
+        });
+    }
 
     // Does any existing patch already answer to this import? One pass over the directory:
     // an identical diff under any name at all, and a patch recorded for this same request.
@@ -736,7 +810,6 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     // `--at` says otherwise). Chosen here rather than earlier because a run that turns
     // out to be a no-op never names a file.
     let index = series::position_at(&series, args.at.as_deref())?;
-    let patch_name = series::default_patch_name(&slug);
     let path = layout.patches_dir().join(&patch_name);
     if path.exists() {
         bail!(
@@ -779,6 +852,27 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
     })
 }
 
+/// Write a rendered patch wherever `-o` or `--stdout` asked, if either did.
+///
+/// Returns the destination that was written, with `-` standing for stdout, or `None`
+/// when the patch belongs in the series as usual.
+fn export(args: &ImportArgs, text: &str) -> Result<Option<PathBuf>> {
+    if args.stdout {
+        use std::io::Write as _;
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        out.write_all(text.as_bytes())
+            .context("writing the patch to stdout")?;
+        out.flush().context("flushing the patch to stdout")?;
+        return Ok(Some(PathBuf::from("-")));
+    }
+    let Some(path) = &args.output else {
+        return Ok(None);
+    };
+    std::fs::write(path, text).context(format!("writing {}", path.display()))?;
+    Ok(Some(path.clone()))
+}
+
 /// Resolve whether the import request names an existing patch file on disk.
 fn resolve_file_target(args: &ImportArgs) -> Result<Option<PathBuf>> {
     if let Some(file) = &args.file {
@@ -812,7 +906,7 @@ fn import_file(layout: &Layout, args: &ImportArgs, file_path: &Path) -> Result<I
         bail!("`--from` cannot be used when importing a patch file.");
     }
 
-    let (_config, mut series) = layout.project()?;
+    let (_config, mut series) = project_or_default(layout)?;
 
     let text =
         std::fs::read_to_string(file_path).context(format!("reading {}", file_path.display()))?;
@@ -843,9 +937,29 @@ fn import_file(layout: &Layout, args: &ImportArgs, file_path: &Path) -> Result<I
         series::default_patch_name(clean_slug)
     };
 
-    let path = layout.patches_dir().join(&patch_name);
     let summary = diff::summarise(&text);
 
+    // A patch handed to `-o` or stdout is a copy, not an installation: the series keeps
+    // what it has and nothing here needs a lock.
+    if let Some(path) = export(args, &text)? {
+        return Ok(Imported {
+            patch: patch_name,
+            path,
+            series_line: None,
+            from: file_path.display().to_string(),
+            from_sha: String::new(),
+            to: file_path.display().to_string(),
+            to_sha: String::new(),
+            reverse: false,
+            commits: 1,
+            summary,
+            outcome: Outcome::Created,
+            registered_now: false,
+            previous_commits: None,
+        });
+    }
+
+    let path = layout.patches_dir().join(&patch_name);
     if path.exists() {
         let existing =
             std::fs::read_to_string(&path).context(format!("reading {}", path.display()))?;
@@ -1788,6 +1902,8 @@ mod tests {
             name: None,
             no_register: false,
             reverse: false,
+            output: None,
+            stdout: false,
         }
     }
 
@@ -4092,6 +4208,136 @@ diff --git a/f.txt b/f.txt
         .to_string();
 
         assert!(err.contains("`--reverse` is not supported"), "got: {err}");
+    }
+
+    #[test]
+    fn importing_to_a_file_leaves_the_series_alone() {
+        let (tmp, layout, _main) = fixture();
+        let out = tmp.path().join("exported.patch");
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                output: Some(out.clone()),
+                ..args(Some("feat"))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.outcome, Outcome::Created);
+        assert_eq!(done.series_line, None);
+        assert_eq!(done.path, out);
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(text.contains("+second"), "the change:\n{text}");
+        assert!(
+            !layout.series_file().exists(),
+            "an export must not register a line"
+        );
+        assert!(
+            !layout.patches_dir().join(&done.patch).exists(),
+            "an export must not install the patch in the series"
+        );
+    }
+
+    #[test]
+    fn exporting_a_binary_change_is_self_contained() {
+        // The export is for another tool, so it cannot name skot's store: the binary
+        // bytes travel inside the patch in git's own format.
+        let (tmp, layout, main) = fixture();
+        {
+            let repo = git2::Repository::open_bare(layout.mirror_dir()).unwrap();
+            let parent = repo
+                .find_commit(git2::Oid::from_str(&main).unwrap())
+                .unwrap();
+            let parent_tree = parent.tree().unwrap();
+            let mut builder = repo.treebuilder(Some(&parent_tree)).unwrap();
+            builder
+                .insert(
+                    "logo.bin",
+                    repo.blob(b"\x00\x01binary\x00").unwrap(),
+                    0o100644,
+                )
+                .unwrap();
+            let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+            let who = git2::Signature::now("t", "t@e").unwrap();
+            repo.commit(
+                Some("refs/heads/bin"),
+                &who,
+                &who,
+                "add a binary",
+                &tree,
+                &[&parent],
+            )
+            .unwrap();
+        }
+        let out = tmp.path().join("binary.patch");
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                output: Some(out.clone()),
+                ..args(Some("main..bin"))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.path, out);
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(
+            text.contains("GIT binary patch"),
+            "the bytes are inlined:\n{text}"
+        );
+        assert!(
+            !text.contains("X-Skot-Blob"),
+            "the export names no skot store:\n{text}"
+        );
+        assert!(
+            !layout.blobs_dir().exists(),
+            "an export writes no project blob store"
+        );
+    }
+
+    #[test]
+    fn a_standalone_import_requires_a_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = Layout::new(tmp.path().join("cache"));
+
+        let err = import(&layout, &args(Some("main..feat")))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("standalone import requires --repo"),
+            "got: {err}"
+        );
+        assert!(err.contains("--stdout"), "the hint names an export: {err}");
+    }
+
+    #[test]
+    fn a_standalone_import_reads_a_repo_and_writes_the_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = fork(tmp.path());
+        let layout = Layout::new(tmp.path().join("cache"));
+        let out = tmp.path().join("out.patch");
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                repo: Some(source.to_str().unwrap().to_owned()),
+                output: Some(out.clone()),
+                ..args(Some("main..feat"))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.path, out);
+        assert_eq!(done.series_line, None);
+        let text = std::fs::read_to_string(&done.path).unwrap();
+        assert!(text.contains("+forked"), "the source's change:\n{text}");
+        assert!(
+            !layout.config_file().exists(),
+            "a standalone import writes no project config"
+        );
     }
 }
 

@@ -185,6 +185,20 @@ skot patch import --pr 88 --repo https://gitlab.com/contributor/project
 > **Zero shared history needed with `--repo`:**
 > The `--pr` flag tells skot what change to extract. When `--repo` is omitted, skot operates against your project's primary upstream mirror. When you pass `--repo`, skot fetches from that target repository regardless of whether it shares any commit history with your current project. You can borrow configs, workflows, or helpers from anywhere across the open-source ecosystem.
 
+### Sourcing a patch for another toolchain
+
+Sometimes the patch is not for skot at all. A packaging pipeline or patch store may want the clean diff from a pull request or commit range without a skot project in the picture:
+
+```bash
+# Write the normalized patch to a file, no skot.toml required
+skot patch import --pr 142 --repo https://github.com/org/project -o fix-142.patch
+
+# Or pipe it straight into another tool
+skot patch import --pr 142 --repo https://github.com/org/project --stdout | quilt import
+```
+
+`--stdout` puts only the patch on stdout; progress and diagnostics stay on stderr. Both flags leave the current series alone, and when run outside a project they keep the fetched mirror under the platform cache directory (`$XDG_CACHE_HOME/skot/standalone`, `~/Library/Caches/skot/standalone`, or `%LOCALAPPDATA%\skot\standalone`) instead of creating `.skot/` in your working directory.
+
 ### Need that bugfix in production yesterday?
 
 You submitted a fix to upstream, but the official release cycle is weeks away. Import your branch or commit range today and ship immediately:
@@ -757,7 +771,7 @@ Global flags available on any command: `--series`, `--refresh`, `--offline`, `--
 | `patch new <name> [--base <ref>] [--at <patch/N>]` | Create an empty patch at `--at` (end by default), register it, and open a work area on it. Only the new line is added; every other patch keeps its name and place. |
 | `patch edit <patch> [--base <ref>] [--discard]` | Open a work area on an existing patch: a worktree under `.skot/work/<series>/` holding the patches below plus the patch's own content. Refuses if the work area has unsaved changes; use `--discard` to throw them away. |
 | `patch save [patch] [--force]` | Save the work area's changes into the patch file, keeping its author and date, and retire the work area. Refuses when patches below changed since opening; `--force` exports against the recorded base anyway. |
-| `patch import <range> [--pr <n>] [--repo <url>] [-r]` | Turn a commit range, a `--repo` fork/clone, or a `--pr` pull request into a new patch at the end (or `--at`). `-r` reverses the diff (undoing what the range did). |
+| `patch import <range> [--pr <n>] [--repo <url>] [-r] [-o <file> \| --stdout]` | Turn a commit range, a `--repo` fork/clone, or a `--pr` pull request into a new patch at the end (or `--at`). `-r` reverses the diff (undoing what the range did). `-o` writes the patch to a file and `--stdout` pipes it out; neither touches the series, and either works outside a project when `--repo` names the source. |
 | `patch enable [patch...] [--all]` | Put patches back in the applying set by removing the `#!` marker. Several patches per run; `--all` takes every disabled one; otherwise an interactive picker. |
 | `patch disable [patch...] [--all]` | Skip patches from now on: mark their series lines with `#!`. Several per run; `--all` takes every enabled one the sandbox is not holding; otherwise an interactive picker. Refuses while any are applied; `pop` first. |
 | `patch apply [ref]` | Reset the sandbox to a ref and replay the enabled set into it. No prompts; choose the set with `enable`/`disable`. |

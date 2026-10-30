@@ -327,8 +327,39 @@ pub fn tree_to_tree_patch(
     header: &Header,
     blobs: &Path,
 ) -> Result<String> {
+    tree_to_tree_patch_with(repo, old, new, header, Some(blobs))
+}
+
+/// Diff two trees as a self-contained patch another tool can read.
+///
+/// Text changes render as usual. Binary changes are inlined as git's own
+/// `GIT binary patch` sections (libgit2's `show_binary`), not as skot's stored
+/// references, so `git apply`, `patch`, `quilt` and similar readers can consume the
+/// result without the project's blob store.
+pub fn tree_to_tree_patch_standard(
+    repo: &git2::Repository,
+    old: &git2::Tree<'_>,
+    new: &git2::Tree<'_>,
+    header: &Header,
+) -> Result<String> {
+    tree_to_tree_patch_with(repo, old, new, header, None)
+}
+
+/// The one renderer behind both exports: `Some(blobs)` stores binary content and names
+/// it in the header, `None` inlines it in the body.
+fn tree_to_tree_patch_with(
+    repo: &git2::Repository,
+    old: &git2::Tree<'_>,
+    new: &git2::Tree<'_>,
+    header: &Header,
+    blobs: Option<&Path>,
+) -> Result<String> {
+    let mut options = git2::DiffOptions::new();
+    if blobs.is_none() {
+        options.show_binary(true);
+    }
     let diff = repo
-        .diff_tree_to_tree(Some(old), Some(new), None)
+        .diff_tree_to_tree(Some(old), Some(new), Some(&mut options))
         .context("diffing two trees")?;
 
     // No change between the trees is an empty patch, and an empty patch is the 0-byte file
@@ -340,6 +371,15 @@ pub fn tree_to_tree_patch(
     }
 
     let mut header = header.clone();
+    // A self-contained export has no store to point at, so a carried reference would
+    // name bytes no other tool can resolve.
+    if blobs.is_none() {
+        header.extra.retain(|line| {
+            !line
+                .strip_prefix(REF_HEADER)
+                .is_some_and(|rest| rest.starts_with(": "))
+        });
+    }
     let mut body = String::new();
     render_body(&diff, &mut body)?;
     let stats = render_stats(&diff)?.map(|lines| lines.join("\n"));
@@ -347,22 +387,24 @@ pub fn tree_to_tree_patch(
     // Last for the same reason as in `tree_to_patch`: a `git_diff_foreach` pass
     // before `render_stats` can make libgit2's `git_diff_get_stats` dereference a
     // NULL patch and crash. Upstream bug; this order is the workaround.
-    let deltas = binary_deltas(&diff)?;
-    reference_binaries(
-        &deltas,
-        blobs,
-        |delta: &BinaryDelta| {
-            let entry = new
-                .get_path(Path::new(&delta.path))
-                .context(format!("reading {} from the tree", delta.path))?;
-            let blob = repo
-                .find_blob(entry.id())
-                .context(format!("reading the blob for {}", delta.path))?;
-            Ok(blob.content().to_vec())
-        },
-        &mut body,
-        &mut header,
-    )?;
+    if let Some(blobs) = blobs {
+        let deltas = binary_deltas(&diff)?;
+        reference_binaries(
+            &deltas,
+            blobs,
+            |delta: &BinaryDelta| {
+                let entry = new
+                    .get_path(Path::new(&delta.path))
+                    .context(format!("reading {} from the tree", delta.path))?;
+                let blob = repo
+                    .find_blob(entry.id())
+                    .context(format!("reading the blob for {}", delta.path))?;
+                Ok(blob.content().to_vec())
+            },
+            &mut body,
+            &mut header,
+        )?;
+    }
 
     Ok(format!("{}{body}", header.render(stats.as_deref())))
 }
@@ -1087,6 +1129,12 @@ diff --git a/a.txt b/a.txt
             tree_to_tree_patch(&self.repo, old, new, &header, &self.blobs).unwrap()
         }
 
+        /// Export `old` to `new` the self-contained way `import -o/--stdout` does.
+        fn export_between_standard(&self, old: &git2::Tree<'_>, new: &git2::Tree<'_>) -> String {
+            let header = Header::signed("t", &git2::Signature::now("a", "a@b").unwrap());
+            tree_to_tree_patch_standard(&self.repo, old, new, &header).unwrap()
+        }
+
         /// Apply an exported patch onto the base tree and return the resulting index.
         ///
         /// The index rather than a tree, because `apply_to_tree` builds it in memory — there is no
@@ -1360,6 +1408,38 @@ diff --git a/a.txt b/a.txt
             !patch.contains("GIT binary patch"),
             "still a reference, not an inlined payload:\n{patch}"
         );
+    }
+
+    #[test]
+    fn a_standard_export_inlines_binary_bytes_and_names_no_store() {
+        // An import sent to `-o` or stdout is consumed by tools that know nothing about
+        // skot's blob store. The bytes have to be in the patch itself, in git's own
+        // binary format, or the patch cannot travel.
+        let s = Sandbox::new();
+        let bytes = sample_binary();
+        let old = s.base_tree();
+        let new = s.derived(&[("logo.png", Some(&bytes))]);
+
+        let patch = s.export_between_standard(&old, &new);
+
+        assert!(
+            patch.contains("GIT binary patch"),
+            "the bytes are inlined:\n{patch}"
+        );
+        assert!(
+            !patch.contains("X-Skot-Blob"),
+            "a self-contained export names no store:\n{patch}"
+        );
+        assert!(
+            !s.blobs.exists(),
+            "a self-contained export writes no blob store"
+        );
+        git2::Diff::from_buffer(patch.as_bytes()).expect("the export is a readable patch");
+
+        let index = s.replay(&patch);
+        let entry = index.get_path(Path::new("logo.png"), 0).expect("the file");
+        let blob = s.repo.find_blob(entry.id).unwrap();
+        assert_eq!(blob.content(), bytes.as_slice());
     }
 
     #[test]

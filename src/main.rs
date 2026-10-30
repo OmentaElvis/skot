@@ -127,6 +127,13 @@ fn run(cli: &Cli) -> Result<Exit> {
         return commands::run(ctx);
     }
 
+    // An import that redirects its patch to `-o` or `--stdout` also works outside a
+    // project: the patch is the output, so there is nothing that needs a series.
+    if commands::is_standalone_import(cli) {
+        let ctx = commands::Ctx::discover_or_standalone(cli)?;
+        return commands::run(ctx);
+    }
+
     let ctx = commands::Ctx::discover(cli)?;
     commands::run(ctx)
 }
