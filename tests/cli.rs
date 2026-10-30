@@ -1038,6 +1038,90 @@ fn output_import_writes_the_file_without_registering_it() {
     );
 }
 
+/// `track` is a first-class entry point: in a directory with no project it scaffolds one
+/// instead of sending the user through an init wizard for an upstream URL it will not use.
+#[test]
+fn track_creates_the_project_when_there_is_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("fresh");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = tmp.path().join("upstream-src");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("f.txt"), "base\n").unwrap();
+
+    let out = skot(&root, &["track", &source.display().to_string(), "v1.0.0"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+
+    let layout = Layout::new(&root).with_per_series_sandbox(true);
+    assert!(layout.config_file().is_file());
+    assert!(layout.series_file().is_file());
+    assert!(layout.base_file().is_file());
+    let config = std::fs::read_to_string(layout.config_file()).unwrap();
+    assert!(
+        !config.lines().any(|line| line.starts_with("url = ")),
+        "the scaffolded config must not invent an upstream URL:\n{config}"
+    );
+    let base = std::fs::read_to_string(layout.base_file()).unwrap();
+    assert!(base.starts_with("v1.0.0 "), "got: {base}");
+
+    let check = skot(&root, &["check"]);
+    assert_eq!(check.status.code(), Some(0), "stderr: {}", stderr(&check));
+}
+
+/// A plain directory becomes the series base, and a fresh checkout with no `.skot/`
+/// rebuilds the same base by re-running `track`.
+#[test]
+fn track_records_a_plain_directory_and_rebuilds_it_after_a_clone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    let layout = Layout::new(&root).with_per_series_sandbox(true);
+    // No upstream URL at all: the tracked snapshot is the whole upstream.
+    std::fs::write(layout.config_file(), "").unwrap();
+    std::fs::create_dir_all(layout.patches_dir()).unwrap();
+    write_series(&layout, "a.patch", patch_one());
+
+    let source = tmp.path().join("upstream-src");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("f.txt"), "base\n").unwrap();
+    std::fs::write(source.join(".gitignore"), ".DS_Store\n").unwrap();
+    std::fs::write(source.join(".DS_Store"), "junk").unwrap();
+
+    let out = skot(&root, &["track", &source.display().to_string(), "v1.0.0"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let base = std::fs::read_to_string(layout.base_file()).unwrap();
+    let recorded: Vec<&str> = base.split_whitespace().collect();
+    assert_eq!(recorded[0], "v1.0.0");
+    assert_eq!(recorded.len(), 2, "the base records the commit too: {base}");
+
+    let check = skot(&root, &["check"]);
+    assert_eq!(check.status.code(), Some(0), "stderr: {}", stderr(&check));
+
+    // The mirror's HEAD has to be usable: `apply` creates its worktree before replaying,
+    // and an unborn HEAD makes that worktree fail.
+    let apply = skot(&root, &["patch", "apply"]);
+    assert_eq!(apply.status.code(), Some(0), "stderr: {}", stderr(&apply));
+    assert_eq!(sandbox_text(&layout), "first\n");
+
+    // A clone has the committed patches and config but no `.skot/`. Re-tracking the
+    // same unpacked archive has to land on the same commit, so check passes again.
+    std::fs::remove_dir_all(layout.state_dir()).unwrap();
+    let again = skot(&root, &["track", &source.display().to_string(), "v1.0.0"]);
+    assert_eq!(again.status.code(), Some(0), "stderr: {}", stderr(&again));
+    assert_eq!(
+        std::fs::read_to_string(layout.base_file()).unwrap(),
+        base,
+        "the same files produce the same recorded base"
+    );
+    let check = skot(&root, &["check"]);
+    assert_eq!(
+        check.status.code(),
+        Some(0),
+        "fresh clone check: {}",
+        stderr(&check)
+    );
+}
+
 /// Outside a project, an import that asks for neither `-o` nor `--stdout` still needs a
 /// project: the existing refusal points at `init`.
 #[test]

@@ -276,6 +276,13 @@ impl Layout {
         text.split_whitespace().next().map(str::to_owned)
     }
 
+    /// The commit [`Layout::base_ref`] pointed at when it was recorded, if the file
+    /// carries one.
+    pub fn base_sha(&self) -> Option<String> {
+        let text = std::fs::read_to_string(self.base_file()).ok()?;
+        text.split_whitespace().nth(1).map(str::to_owned)
+    }
+
     /// Record what this series sits on: the ref, and the commit it pointed at when it
     /// was recorded (when known).
     ///

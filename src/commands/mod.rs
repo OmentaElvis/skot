@@ -31,6 +31,7 @@ mod status;
 pub(crate) mod sync;
 #[cfg(test)]
 pub(crate) mod testsupport;
+mod track;
 
 use anyhow::{Result, bail};
 use log::info;
@@ -131,6 +132,40 @@ impl Ctx {
             None => Layout::standalone()
                 .with_refresh(cli.refresh)
                 .with_offline(cli.offline),
+        };
+        Ok(Self {
+            layout,
+            cli: cli.clone(),
+            yes: cli.yes,
+        })
+    }
+
+    /// Resolve a layout for `track`, which may be the command that creates the project.
+    ///
+    /// Inside a project this resolves exactly as [`Ctx::discover`]. Outside one it names the
+    /// directory `track` will scaffold into, using `--series` when given and the default
+    /// series otherwise. The command itself decides when to scaffold, after the source
+    /// directory and ref have been validated.
+    pub fn discover_for_track(cli: &Cli) -> Result<Self> {
+        let start = match &cli.dir {
+            Some(dir) => crate::layout::absolute(dir),
+            None => std::env::current_dir()?,
+        };
+        let project = if start.join(crate::layout::CONFIG_FILE).is_file() {
+            Some(Layout::new(&start))
+        } else {
+            Layout::discover(&start).ok()
+        };
+        let layout = match project {
+            Some(layout) => series_for(cli, layout)?,
+            None => {
+                let name = cli.series.as_deref().unwrap_or(DEFAULT_SERIES);
+                Layout::new(start)
+                    .with_per_series_sandbox(crate::config::Sandbox::default().per_series)
+                    .with_series(name)?
+                    .with_refresh(cli.refresh)
+                    .with_offline(cli.offline)
+            }
         };
         Ok(Self {
             layout,
@@ -269,6 +304,7 @@ pub enum Exit {
 pub fn run(ctx: Ctx) -> Result<Exit> {
     match &ctx.cli.command {
         Command::Init(args) => init::run(&ctx, args),
+        Command::Track(args) => track::run(&ctx, args),
         Command::Build(args) => build::run(&ctx, args),
         Command::Status(args) => status::run(&ctx, args),
         Command::Patch(patch) => match patch {

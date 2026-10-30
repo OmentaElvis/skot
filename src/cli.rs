@@ -144,6 +144,14 @@ pub enum Command {
     /// Scaffold skot.toml, series and patches/, asking for what is missing.
     Init(InitArgs),
 
+    /// Record an unversioned directory as a ref in the mirror.
+    ///
+    /// This is the bridge for upstreams shipped as a ZIP or tarball: point the series
+    /// base at the unpacked folder instead of inventing a Git repository for it. Run
+    /// outside a project, it scaffolds `skot.toml` and the series first; there is no
+    /// upstream URL to supply, because the folder is the upstream.
+    Track(TrackArgs),
+
     /// Build: sandbox, apply, then your hooks.
     Build(BuildArgs),
 
@@ -385,7 +393,7 @@ const LITERAL: Style = Style::new().bold();
 
 /// The root help's groups: heading, then the commands under it in display order.
 const ROOT_GROUPS: &[(&str, &[&str])] = &[
-    ("Start here", &["init", "build", "status"]),
+    ("Start here", &["init", "track", "build", "status"]),
     ("Patches", &["patch"]),
     ("Series", &["series"]),
     ("Upstream", &["check", "rebase", "sync"]),
@@ -633,6 +641,24 @@ pub struct InitArgs {
 
     /// Overwrite an existing skot.toml.
     #[arg(long)]
+    pub force: bool,
+}
+
+/// `skot track <DIR> [REF]`.
+#[derive(Debug, Clone, Args)]
+pub struct TrackArgs {
+    // Named `source` rather than `dir` because `--dir` is the global project flag: two
+    // arguments with one id would hand the project path to the source position.
+    /// Directory holding the unversioned upstream source files.
+    #[arg(value_name = "DIR")]
+    pub source: PathBuf,
+
+    /// Ref name to associate with this snapshot: a tag, or a branch when written in full.
+    #[arg(value_name = "REF", default_value = "upstream")]
+    pub ref_name: String,
+
+    /// Replace the recorded ref and base even though the series is anchored elsewhere.
+    #[arg(long, short = 'f')]
     pub force: bool,
 }
 

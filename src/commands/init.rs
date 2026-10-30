@@ -180,6 +180,22 @@ fn keep_candidates(root: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
+/// Scaffold a project whose upstream is a tracked directory rather than a Git URL.
+///
+/// `skot track` calls this when it is run outside a project, so recording an unpacked
+/// folder is one command instead of an init wizard with a URL that would never be used.
+/// Nothing is asked: the tracked folder is the base, policy and hooks can be edited in
+/// `skot.toml` afterwards.
+pub(crate) fn scaffold_for_track(layout: &Layout) -> Result<()> {
+    let plan = Plan {
+        policy: Some(SandboxPolicy::Persistent),
+        ..Plan::default()
+    };
+    scaffold(layout, &plan)?;
+    State::load(layout)?.set_active_series(layout, layout.series())?;
+    Ok(())
+}
+
 /// Scaffold the layout with what it is given; it never invents a value.
 ///
 /// A value it is not given is commented out, not left as a plausible example: an

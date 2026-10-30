@@ -82,6 +82,26 @@ impl Mirror {
         .map(|_| ())
     }
 
+    /// Open the mirror, creating an empty bare repository when it is not there yet.
+    ///
+    /// This is the offline counterpart of [`Mirror::open_or_clone`]: a tracked directory
+    /// supplies the objects itself, so there is no upstream to fetch and no `origin` to
+    /// record.
+    pub fn open_or_init(layout: &Layout) -> Result<Self> {
+        if layout.mirror_dir().join("HEAD").is_file() {
+            return Self::open(layout);
+        }
+        let path = layout.mirror_dir();
+        std::fs::create_dir_all(&path).context(format!("creating {}", path.display()))?;
+        let repo = git2::Repository::init_bare(&path)
+            .context(format!("creating the mirror at {}", path.display()))?;
+        Ok(Self {
+            repo,
+            path,
+            offline: layout.offline(),
+        })
+    }
+
     /// Open the mirror, creating it from `url` if it is not there yet.
     pub fn open_or_clone(layout: &Layout, url: &str, ref_name: Option<&str>) -> Result<Self> {
         if layout.mirror_dir().join("HEAD").is_file() {
