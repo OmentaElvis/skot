@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.0](https://github.com/OmentaElvis/skot/compare/v1.1.0...v1.2.0) (2026-10-30)
+
+### Features
+
+* add track subcommand for gitless sources ([1ed7b47](https://github.com/OmentaElvis/skot/commit/1ed7b47e994c7fe7aec17a8c9623669ef664c02a))
+* allow importing of .patch .diff files ([7bf6ffb](https://github.com/OmentaElvis/skot/commit/7bf6ffb90879842e8c6573ceba84b6e9f34343aa))
+* **import:** export patches to files and stdout ([6a6e8fb](https://github.com/OmentaElvis/skot/commit/6a6e8fb4da6068e5bece09b71f019350f25ece84))
+
 ## [1.1.0](https://github.com/OmentaElvis/skot/compare/v1.0.0...v1.1.0) (2026-10-29)
 
 ### Features
