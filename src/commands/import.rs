@@ -171,12 +171,23 @@ pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<Exit> {
     }
 
     match done.outcome {
-        Outcome::Created => info!(
-            target: "import",
-            "imported {} into {}",
-            super::push::count(done.commits, "commit", "commits"),
-            done.patch
-        ),
+        Outcome::Created => {
+            if done.from_sha.is_empty() {
+                info!(
+                    target: "import",
+                    "imported {} into {}",
+                    done.from,
+                    done.patch
+                )
+            } else {
+                info!(
+                    target: "import",
+                    "imported {} into {}",
+                    super::push::count(done.commits, "commit", "commits"),
+                    done.patch
+                )
+            }
+        }
         Outcome::Updated => match done.previous_commits {
             Some(before) => info!(
                 target: "import",
@@ -216,6 +227,10 @@ pub fn run(ctx: &Ctx, args: &ImportArgs) -> Result<Exit> {
 /// Everything that can be rejected is rejected before the first fetch: a mistyped range
 /// should cost no network.
 fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
+    if let Some(file_path) = resolve_file_target(args)? {
+        return import_file(layout, args, &file_path);
+    }
+
     let (config, mut series) = layout.project()?;
 
     // Opening the mirror is local, and the URL its `origin` records decides which forge
@@ -757,6 +772,137 @@ fn import(layout: &Layout, args: &ImportArgs) -> Result<Imported> {
         to_sha: ends.to_sha,
         reverse: args.reverse,
         commits,
+        summary,
+        outcome: Outcome::Created,
+        registered_now: false,
+        previous_commits: None,
+    })
+}
+
+/// Resolve whether the import request names an existing patch file on disk.
+fn resolve_file_target(args: &ImportArgs) -> Result<Option<PathBuf>> {
+    if let Some(file) = &args.file {
+        if !file.exists() {
+            bail!("patch file '{}' does not exist.", file.display());
+        }
+        return Ok(Some(file.clone()));
+    }
+    if let Some(range) = &args.range {
+        let path = Path::new(range);
+        if path.is_file() {
+            if range.ends_with(".patch") || range.ends_with(".diff") || !range.contains("..") {
+                return Ok(Some(path.to_path_buf()));
+            }
+        } else if (range.ends_with(".patch") || range.ends_with(".diff")) && !range.contains("..") {
+            bail!("patch file '{}' does not exist.", range);
+        }
+    }
+    Ok(None)
+}
+
+/// Import a patch directly from a file on disk into the active series.
+fn import_file(layout: &Layout, args: &ImportArgs, file_path: &Path) -> Result<Imported> {
+    if args.reverse {
+        bail!("`--reverse` is not supported when importing a patch file.");
+    }
+    if args.repo.is_some() {
+        bail!("`--repo` cannot be used when importing a patch file.");
+    }
+    if args.from.is_some() {
+        bail!("`--from` cannot be used when importing a patch file.");
+    }
+
+    let (_config, mut series) = layout.project()?;
+
+    let text =
+        std::fs::read_to_string(file_path).context(format!("reading {}", file_path.display()))?;
+
+    git2::Diff::from_buffer(text.as_bytes()).context(format!(
+        "'{}' is not a valid patch skot can read; refusing to install it.",
+        file_path.display()
+    ))?;
+
+    let header = diff::Header::parse(&text);
+    let tip_subject = header.as_ref().and_then(|h| h.subject.as_deref());
+
+    let patch_name = if let Some(name) = &args.name {
+        let slug = super::new::slug(name)?;
+        let clean_slug = slug.strip_suffix(".patch").unwrap_or(&slug);
+        series::default_patch_name(clean_slug)
+    } else if let Some(subj) = tip_subject.filter(|s| !s.trim().is_empty()) {
+        let slug = filename_slug(subj.trim());
+        let clean_slug = slug.strip_suffix(".patch").unwrap_or(&slug);
+        series::default_patch_name(clean_slug)
+    } else {
+        let stem = file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("imported");
+        let slug = filename_slug(stem);
+        let clean_slug = slug.strip_suffix(".patch").unwrap_or(&slug);
+        series::default_patch_name(clean_slug)
+    };
+
+    let path = layout.patches_dir().join(&patch_name);
+    let summary = diff::summarise(&text);
+
+    if path.exists() {
+        let existing =
+            std::fs::read_to_string(&path).context(format!("reading {}", path.display()))?;
+        if existing == text {
+            let (series_line, registered_now) =
+                register_existing(layout, &mut series, &patch_name, args.no_register)?;
+            return Ok(Imported {
+                patch: patch_name,
+                path,
+                series_line,
+                from: file_path.display().to_string(),
+                from_sha: String::new(),
+                to: file_path.display().to_string(),
+                to_sha: String::new(),
+                reverse: false,
+                commits: 1,
+                summary,
+                outcome: Outcome::Unchanged,
+                registered_now,
+                previous_commits: None,
+            });
+        }
+
+        bail!(
+            "{} already exists.\n\
+             Choose another name with `--name`, or remove it if it is stale.",
+            path.display()
+        );
+    }
+
+    let lock = layout.lock()?;
+    let index = series::position_at(&series, args.at.as_deref())?;
+    std::fs::create_dir_all(layout.patches_dir()).context("creating the patch directory")?;
+
+    let series_line = if args.no_register {
+        std::fs::write(&path, &text).context(format!("writing {}", path.display()))?;
+        None
+    } else {
+        let line = series.insert(&patch_name, index)?;
+        series.save(layout)?;
+        std::fs::write(&path, &text).context(format!("writing {}", path.display()))?;
+        Some(line)
+    };
+
+    crate::blobs::sweep(layout).context("sweeping binary content no patch references")?;
+    drop(lock);
+
+    Ok(Imported {
+        patch: patch_name,
+        path,
+        series_line,
+        from: file_path.display().to_string(),
+        from_sha: String::new(),
+        to: file_path.display().to_string(),
+        to_sha: String::new(),
+        reverse: false,
+        commits: 1,
         summary,
         outcome: Outcome::Created,
         registered_now: false,
@@ -1635,6 +1781,7 @@ mod tests {
         ImportArgs {
             at: None,
             range: range.map(str::to_owned),
+            file: None,
             from: None,
             pr: None,
             repo: None,
@@ -3711,6 +3858,240 @@ mod tests {
         assert!(msg.contains("forge.unknown.example"), "got: {msg}");
         assert!(msg.contains("[pr-refs]"), "got: {msg}");
         assert!(msg.contains("refs/pull/{n}/head"), "got: {msg}");
+    }
+
+    #[test]
+    fn importing_a_patch_file_directly_registers_it() {
+        let (_tmp, layout, _main) = fixture();
+        let patch_dir = tempfile::tempdir().unwrap();
+        let patch_path = patch_dir.path().join("my-fix.patch");
+        let patch_content = "\
+From: Alice <alice@example.invalid>
+Date: Mon, 1 Jan 2026 00:00:00 +0000
+Subject: [PATCH] Fix important bug
+
+---
+diff --git a/f.txt b/f.txt
+--- a/f.txt
++++ b/f.txt
+@@ -1 +1 @@
+-base
++patched
+";
+        std::fs::write(&patch_path, patch_content).unwrap();
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                range: Some(patch_path.to_str().unwrap().to_owned()),
+                ..args(None)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.patch, "fix-important-bug.patch");
+        assert_eq!(done.outcome, Outcome::Created);
+        assert_eq!(done.series_line, Some(1));
+        assert!(layout.patches_dir().join(&done.patch).is_file());
+
+        let series = std::fs::read_to_string(layout.series_file()).unwrap();
+        assert_eq!(series.trim(), "fix-important-bug.patch");
+    }
+
+    #[test]
+    fn importing_a_patch_file_with_file_flag() {
+        let (_tmp, layout, _main) = fixture();
+        let patch_dir = tempfile::tempdir().unwrap();
+        let patch_path = patch_dir.path().join("custom.diff");
+        let patch_content = "\
+diff --git a/f.txt b/f.txt
+--- a/f.txt
++++ b/f.txt
+@@ -1 +1 @@
+-base
++custom
+";
+        std::fs::write(&patch_path, patch_content).unwrap();
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                file: Some(patch_path),
+                ..args(None)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.patch, "custom.patch");
+        assert_eq!(done.outcome, Outcome::Created);
+        assert_eq!(done.series_line, Some(1));
+    }
+
+    #[test]
+    fn importing_a_patch_file_with_custom_name() {
+        let (_tmp, layout, _main) = fixture();
+        let patch_dir = tempfile::tempdir().unwrap();
+        let patch_path = patch_dir.path().join("orig.patch");
+        let patch_content = "\
+diff --git a/f.txt b/f.txt
+--- a/f.txt
++++ b/f.txt
+@@ -1 +1 @@
+-base
++custom
+";
+        std::fs::write(&patch_path, patch_content).unwrap();
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                file: Some(patch_path),
+                name: Some("special-fix".to_owned()),
+                ..args(None)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.patch, "special-fix.patch");
+        assert_eq!(done.outcome, Outcome::Created);
+    }
+
+    #[test]
+    fn importing_a_patch_file_with_no_register() {
+        let (_tmp, layout, _main) = fixture();
+        let patch_dir = tempfile::tempdir().unwrap();
+        let patch_path = patch_dir.path().join("unregistered.patch");
+        let patch_content = "\
+diff --git a/f.txt b/f.txt
+--- a/f.txt
++++ b/f.txt
+@@ -1 +1 @@
+-base
++unregistered
+";
+        std::fs::write(&patch_path, patch_content).unwrap();
+
+        let done = import(
+            &layout,
+            &ImportArgs {
+                file: Some(patch_path),
+                no_register: true,
+                ..args(None)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(done.patch, "unregistered.patch");
+        assert!(done.series_line.is_none());
+        assert!(layout.patches_dir().join("unregistered.patch").is_file());
+        assert!(
+            !layout.series_file().exists(),
+            "the series must be untouched"
+        );
+    }
+
+    #[test]
+    fn reimporting_identical_patch_file_is_unchanged() {
+        let (_tmp, layout, _main) = fixture();
+        let patch_dir = tempfile::tempdir().unwrap();
+        let patch_path = patch_dir.path().join("same.patch");
+        let patch_content = "\
+diff --git a/f.txt b/f.txt
+--- a/f.txt
++++ b/f.txt
+@@ -1 +1 @@
+-base
++same
+";
+        std::fs::write(&patch_path, patch_content).unwrap();
+
+        let first = import(
+            &layout,
+            &ImportArgs {
+                file: Some(patch_path.clone()),
+                ..args(None)
+            },
+        )
+        .unwrap();
+        assert_eq!(first.outcome, Outcome::Created);
+
+        let second = import(
+            &layout,
+            &ImportArgs {
+                file: Some(patch_path),
+                ..args(None)
+            },
+        )
+        .unwrap();
+        assert_eq!(second.outcome, Outcome::Unchanged);
+    }
+
+    #[test]
+    fn importing_nonexistent_patch_file_fails() {
+        let (_tmp, layout, _main) = fixture();
+        let err = import(
+            &layout,
+            &ImportArgs {
+                range: Some("does-not-exist.patch".to_owned()),
+                ..args(None)
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn importing_invalid_patch_file_fails() {
+        let (_tmp, layout, _main) = fixture();
+        let patch_dir = tempfile::tempdir().unwrap();
+        let patch_path = patch_dir.path().join("broken.patch");
+        std::fs::write(
+            &patch_path,
+            "this is definitely not a patch\njust random text",
+        )
+        .unwrap();
+
+        let err = import(
+            &layout,
+            &ImportArgs {
+                file: Some(patch_path),
+                ..args(None)
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("not a valid patch"), "got: {err}");
+    }
+
+    #[test]
+    fn importing_patch_file_with_reverse_is_refused() {
+        let (_tmp, layout, _main) = fixture();
+        let patch_dir = tempfile::tempdir().unwrap();
+        let patch_path = patch_dir.path().join("test.patch");
+        let patch_content = "\
+--- a/f.txt
++++ b/f.txt
+@@ -1 +1 @@
+-base
++test
+";
+        std::fs::write(&patch_path, patch_content).unwrap();
+
+        let err = import(
+            &layout,
+            &ImportArgs {
+                file: Some(patch_path),
+                reverse: true,
+                ..args(None)
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("`--reverse` is not supported"), "got: {err}");
     }
 }
 
