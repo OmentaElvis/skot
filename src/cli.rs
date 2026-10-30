@@ -144,6 +144,14 @@ pub enum Command {
     /// Scaffold skot.toml, series and patches/, asking for what is missing.
     Init(InitArgs),
 
+    /// Record an unversioned directory as a ref in the mirror.
+    ///
+    /// This is the bridge for upstreams shipped as a ZIP or tarball: point the series
+    /// base at the unpacked folder instead of inventing a Git repository for it. Run
+    /// outside a project, it scaffolds `skot.toml` and the series first; there is no
+    /// upstream URL to supply, because the folder is the upstream.
+    Track(TrackArgs),
+
     /// Build: sandbox, apply, then your hooks.
     Build(BuildArgs),
 
@@ -385,7 +393,7 @@ const LITERAL: Style = Style::new().bold();
 
 /// The root help's groups: heading, then the commands under it in display order.
 const ROOT_GROUPS: &[(&str, &[&str])] = &[
-    ("Start here", &["init", "build", "status"]),
+    ("Start here", &["init", "track", "build", "status"]),
     ("Patches", &["patch"]),
     ("Series", &["series"]),
     ("Upstream", &["check", "rebase", "sync"]),
@@ -636,6 +644,24 @@ pub struct InitArgs {
     pub force: bool,
 }
 
+/// `skot track <DIR> [REF]`.
+#[derive(Debug, Clone, Args)]
+pub struct TrackArgs {
+    // Named `source` rather than `dir` because `--dir` is the global project flag: two
+    // arguments with one id would hand the project path to the source position.
+    /// Directory holding the unversioned upstream source files.
+    #[arg(value_name = "DIR")]
+    pub source: PathBuf,
+
+    /// Ref name to associate with this snapshot: a tag, or a branch when written in full.
+    #[arg(value_name = "REF", default_value = "upstream")]
+    pub ref_name: String,
+
+    /// Replace the recorded ref and base even though the series is anchored elsewhere.
+    #[arg(long, short = 'f')]
+    pub force: bool,
+}
+
 /// The sandbox policy as spelled on the command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum SandboxPolicyChoice {
@@ -694,9 +720,14 @@ pub struct PatchArg {
 
 #[derive(Debug, Clone, Args)]
 pub struct ImportArgs {
-    /// What to import: `FROM..TO`, `FROM...TO` (from their merge base), or just `TO`.
-    #[arg(value_name = "RANGE", required_unless_present = "pr")]
+    /// What to import: `FROM..TO`, `FROM...TO` (from their merge base), `TO`,
+    /// or a path to an existing .patch file.
+    #[arg(value_name = "RANGE", required_unless_present_any = ["pr", "file"])]
     pub range: Option<String>,
+
+    /// Import directly from an existing patch file on disk.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["range", "pr"])]
+    pub file: Option<PathBuf>,
 
     /// Base of the patch. Defaults to the merge base with `upstream.default-ref`, or to
     /// `TO^` when `--repo` reads a tree and the range names no base.
@@ -706,7 +737,7 @@ pub struct ImportArgs {
     /// Import a pull request: a number, which is read against the forge's own ref
     /// namespace from the domain of the repository being asked, or the full ref name
     /// as written (for a forge skot does not know).
-    #[arg(long, value_name = "N|REF", conflicts_with = "range")]
+    #[arg(long, value_name = "N|REF", conflicts_with_all = ["range", "file"])]
     pub pr: Option<String>,
 
     /// Read the range from this repository. A local tree is read where it lies and the
@@ -735,6 +766,16 @@ pub struct ImportArgs {
     /// series. How you put back a feature upstream deleted.
     #[arg(long, short = 'r')]
     pub reverse: bool,
+
+    /// Write the exported patch directly to this file instead of the series directory.
+    /// The patch is not added to the series.
+    #[arg(short = 'o', long = "output", value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Emit the generated patch text to stdout, with progress and diagnostics on stderr.
+    /// The patch is not added to the series.
+    #[arg(long, conflicts_with_all = ["output", "json"])]
+    pub stdout: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -1106,6 +1147,21 @@ mod tests {
             err.contains("RANGE"),
             "the other side should be named: {err}"
         );
+    }
+
+    #[test]
+    fn import_takes_a_file_flag() {
+        let cli =
+            Cli::try_parse_from(["skot", "patch", "import", "--file", "my-fix.patch"]).unwrap();
+        let Command::Patch(PatchCommand::Import(args)) = cli.command else {
+            panic!("expected import");
+        };
+        assert_eq!(
+            args.file.as_deref(),
+            Some(std::path::Path::new("my-fix.patch"))
+        );
+        assert!(args.range.is_none());
+        assert!(args.pr.is_none());
     }
 
     #[test]

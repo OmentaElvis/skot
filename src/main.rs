@@ -127,6 +127,21 @@ fn run(cli: &Cli) -> Result<Exit> {
         return commands::run(ctx);
     }
 
+    // `track` is allowed to be the command that creates the project: a folder of source
+    // files is a complete upstream on its own, so a wizard asking for a URL would be
+    // asking for something no later command reads.
+    if matches!(cli.command, Command::Track(_)) {
+        let ctx = commands::Ctx::discover_for_track(cli)?;
+        return commands::run(ctx);
+    }
+
+    // An import that redirects its patch to `-o` or `--stdout` also works outside a
+    // project: the patch is the output, so there is nothing that needs a series.
+    if commands::is_standalone_import(cli) {
+        let ctx = commands::Ctx::discover_or_standalone(cli)?;
+        return commands::run(ctx);
+    }
+
     let ctx = commands::Ctx::discover(cli)?;
     commands::run(ctx)
 }

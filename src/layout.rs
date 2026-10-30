@@ -74,6 +74,26 @@ impl Layout {
         }
     }
 
+    /// The platform cache directory skot keeps standalone state in.
+    ///
+    /// `dirs` resolves `$XDG_CACHE_HOME` on Linux and the BSDs, `~/Library/Caches` on
+    /// macOS, and `%LOCALAPPDATA%` on Windows. A platform that cannot name one falls back
+    /// to the temporary directory, which is at least writable and disposable.
+    pub fn cache_root() -> PathBuf {
+        dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("skot")
+    }
+
+    /// A layout for a standalone import, outside any project.
+    ///
+    /// The mirror and the `--repo` URL stores live under the cache directory rather than
+    /// a project's `.skot/`, so sourcing a patch does not need a workspace or leave one
+    /// behind in the directory the command was run from.
+    pub fn standalone() -> Self {
+        Self::new(Self::cache_root().join("standalone"))
+    }
+
     /// Walk up from `start` looking for `skot.toml`.
     pub fn discover(start: &Path) -> Result<Self> {
         let start = absolute(start);
@@ -254,6 +274,13 @@ impl Layout {
         // The first word: `rebase` records the ref and the commit it moved from, and
         // only the ref answers "what is this series based on".
         text.split_whitespace().next().map(str::to_owned)
+    }
+
+    /// The commit [`Layout::base_ref`] pointed at when it was recorded, if the file
+    /// carries one.
+    pub fn base_sha(&self) -> Option<String> {
+        let text = std::fs::read_to_string(self.base_file()).ok()?;
+        text.split_whitespace().nth(1).map(str::to_owned)
     }
 
     /// Record what this series sits on: the ref, and the commit it pointed at when it

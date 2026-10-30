@@ -11,6 +11,7 @@ pub mod binary;
 pub mod diff;
 pub mod mirror;
 pub mod sandbox;
+pub mod track;
 
 use std::path::Path;
 

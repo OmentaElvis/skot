@@ -43,12 +43,12 @@ Keep the changes you need. Stay close to upstream. Let skot handle the patch ser
   - [What a skot tree looks like](#what-a-skot-tree-looks-like)
 - [📦 Recipes: Real-World Survival Guides](#-recipes-real-world-survival-guides)
   - [Rescuing abandoned or rejected PRs ("Where PRs go to die")](#rescuing-abandoned-or-rejected-prs-where-prs-go-to-die)
+  - [Sourcing a patch for another toolchain](#sourcing-a-patch-for-another-toolchain)
   - [Need that bugfix in production yesterday?](#need-that-bugfix-in-production-yesterday)
   - [Gotta catch 'em all: Stacking multiple community PRs](#gotta-catch-em-all-stacking-multiple-community-prs)
   - [Bringing back a removed feature or legacy workflow](#bringing-back-a-removed-feature-or-legacy-workflow)
-  - [Bonus Recipe: No real upstream Git repository? Working with ZIP files and custom hooks](#bonus-recipe-no-real-upstream-git-repository-working-with-zip-files-and-custom-hooks)
+  - [Bonus Recipe: No real upstream Git repository? Working with ZIP files](#bonus-recipe-no-real-upstream-git-repository-working-with-zip-files)
     - [The raw preparation flow](#the-raw-preparation-flow)
-    - [Taming the prep with custom hooks](#taming-the-prep-with-custom-hooks)
 - [The Authoring Loop](#the-authoring-loop)
 - [Pull requests from any forge](#pull-requests-from-any-forge)
 - [CI, Automation, and Autonomous Agents](#ci-automation-and-autonomous-agents)
@@ -70,6 +70,7 @@ Keep the changes you need. Stay close to upstream. Let skot handle the patch ser
   - [Branching to a new series with `--into`](#branching-to-a-new-series-with---into)
   - [Atomic safety and undo](#atomic-safety-and-undo)
 - [The Series Format](#the-series-format)
+- [Binary Files](#binary-files)
 - [Multiple Series](#multiple-series)
 - [Cumulative Verification (`check`)](#cumulative-verification-check)
 - [The Mirror and the Sandbox](#the-mirror-and-the-sandbox)
@@ -190,6 +191,20 @@ skot patch import --pr 88 --repo https://gitlab.com/contributor/project
 > **Zero shared history needed with `--repo`:**
 > The `--pr` flag tells skot what change to extract. When `--repo` is omitted, skot operates against your project's primary upstream mirror. When you pass `--repo`, skot fetches from that target repository regardless of whether it shares any commit history with your current project. You can borrow configs, workflows, or helpers from anywhere across the open-source ecosystem.
 
+### Sourcing a patch for another toolchain
+
+Sometimes the patch is not for skot at all. A packaging pipeline or patch store may want the clean diff from a pull request or commit range without a skot project in the picture:
+
+```bash
+# Write the normalized patch to a file, no skot.toml required
+skot patch import --pr 142 --repo https://github.com/org/project -o fix-142.patch
+
+# Or pipe it straight into another tool
+skot patch import --pr 142 --repo https://github.com/org/project --stdout | quilt import
+```
+
+`--stdout` puts only the patch on stdout; progress and diagnostics stay on stderr. Both flags leave the current series alone, and when run outside a project they keep the fetched mirror under the platform cache directory (`$XDG_CACHE_HOME/skot/standalone`, `~/Library/Caches/skot/standalone`, or `%LOCALAPPDATA%\skot\standalone`) instead of creating `.skot/` in your working directory.
+
 ### Need that bugfix in production yesterday?
 
 You submitted a fix to upstream, but the official release cycle is weeks away. Import your branch or commit range today and ship immediately:
@@ -234,7 +249,7 @@ skot check
 skot build
 ```
 
-### Bonus Recipe: No real upstream Git repository? Working with ZIP files and custom hooks
+### Bonus Recipe: No real upstream Git repository? Working with ZIP files
 
 Sometimes the software you need to patch has no public Git repository at all. Perhaps you run commercial deployments distributed as raw ZIP/tarball downloads, or you are modding a game or tool where releases are delivered as archive files.
 
@@ -247,12 +262,10 @@ Here is what the raw preparation looks like without automation:
 ```bash
 # 1. Unpack the original release into a local folder
 unzip upstream-v1.0.zip -d ./upstream-src
-cd ./upstream-src
-git init && git add . && git commit -m "upstream v1.0.0"
-cd ..
 
-# 2. Initialize skot pointing to the unpacked folder
-skot init --url ./upstream-src --default-ref master
+# 2. Record the unpacked folder as the series base. Outside a project, `track`
+#    scaffolds skot.toml and patches/<series>/ itself.
+skot track ./upstream-src upstream
 
 # 3. Add your custom fixes, performance tweaks, or mods
 skot patch new optimize-caching
@@ -265,33 +278,9 @@ skot patch save
 skot build
 ```
 
-#### Taming the prep with custom hooks
+`skot track` reads the files straight into the mirror as a deterministic commit, and the series base points at that snapshot.
 
-Nobody wants to manually run unzip, `git init`, and `git commit` every single time an upstream archive drops. You can cleanly extract that prep into a custom `skot` hook in `skot.toml`, working just like the `scripts` section in `package.json`:
-
-```toml
-# skot.toml
-[upstream]
-url = "./upstream-src"
-default-ref = "master"
-
-# Custom hook: works just like the "scripts" section in package.json!
-[[hook]]
-name = "unpack-upstream"
-cmd = "unzip -qo upstream-v*.zip -d ./upstream-src && cd ./upstream-src && git init && git add . && git commit -m 'upstream release'"
-```
-
-With that hook in place, handling a new upstream release drops down to two clean commands:
-
-```bash
-# 1. Drop the new zip in the folder and let your hook handle prep:
-skot run unpack-upstream
-
-# 2. Build the new release with your patch series replayed automatically!
-# Because `skot build` runs the full chain (sync -> check -> apply -> build hooks),
-# you go straight from prep to a finished build:
-skot build
-```
+What the snapshot contains is decided by the folder's own `.gitignore` files, read with git's semantics. Only `.git` and `.skot` are left out, because they are repository and tool state rather than source.
 
 If you ever want to dry-run or verify compatibility before compiling, `skot check` is always available to cumulative-test your series without triggering a build. No manual diffing, no lost tweaks.
 
@@ -735,7 +724,7 @@ Because a linked worktree depends on the mirror, skot never garbage-collects or 
 
 skot organizes operations into three command namespaces:
 
-- **[Project commands](#project-commands):** run directly (`skot build`, `skot check`, `skot sync`, `skot status`, `skot clean`, `skot hooks`, `skot run`)
+- **[Project commands](#project-commands):** run directly (`skot init`, `skot track`, `skot build`, `skot check`, `skot sync`, `skot status`, `skot clean`, `skot hooks`, `skot run`)
 - **[Patch commands](#patch-commands):** under `skot patch` (`new`, `edit`, `save`, `import`, `enable`, `disable`, `apply`, `unapply`, `push`, `pop`, `list`, `show`, `move`, `drop`, `copy`)
 - **[Series commands](#series-commands):** under `skot series` (`list`, `create`, `switch`, `copy`, `undo`, `rename`, `drop`)
 
@@ -746,6 +735,7 @@ Global flags available on any command: `--series`, `--refresh`, `--offline`, `--
 | Command | Description |
 |---------|-------------|
 | `init` | Scaffold `skot.toml` and `patches/<series>/`. Prompts for missing values including the first series name (default `default`). |
+| `track <dir> [ref] [--force]` | Read an unversioned directory into the mirror as a deterministic synthetic commit, point `ref` at it (a tag unless written as a full ref), and record it as the series base. Outside a project it scaffolds `skot.toml` and the series first, with no upstream URL to supply. The directory's `.gitignore` files decide what is included. Re-running on the same files is idempotent; `--force` moves a base that was anchored elsewhere. |
 | `build [ref]` | The one-command run: sync, apply, then run your hooks (`pre-build`, `build`, `post-build`). |
 | `status` | Show paths, disk usage, current ref, and whether a run was interrupted. |
 | `check [ref] [--applied]` | Verify the series applies to a ref. `--applied` checks only the enabled set (what `build` lands). `--series all` checks every series against its own base. No build, no network. |
@@ -762,7 +752,7 @@ Global flags available on any command: `--series`, `--refresh`, `--offline`, `--
 | `patch new <name> [--base <ref>] [--at <patch/N>]` | Create an empty patch at `--at` (end by default), register it, and open a work area on it. Only the new line is added; every other patch keeps its name and place. |
 | `patch edit <patch> [--base <ref>] [--discard]` | Open a work area on an existing patch: a worktree under `.skot/work/<series>/` holding the patches below plus the patch's own content. Refuses if the work area has unsaved changes; use `--discard` to throw them away. |
 | `patch save [patch] [--force]` | Save the work area's changes into the patch file, keeping its author and date, and retire the work area. Refuses when patches below changed since opening; `--force` exports against the recorded base anyway. |
-| `patch import <range> [--pr <n>] [--repo <url>] [-r]` | Turn a commit range, a `--repo` fork/clone, or a `--pr` pull request into a new patch at the end (or `--at`). `-r` reverses the diff (undoing what the range did). |
+| `patch import <range> [--pr <n>] [--repo <url>] [-r] [-o <file> \| --stdout]` | Turn a commit range, a `--repo` fork/clone, or a `--pr` pull request into a new patch at the end (or `--at`). `-r` reverses the diff (undoing what the range did). `-o` writes the patch to a file and `--stdout` pipes it out; neither touches the series, and either works outside a project when `--repo` names the source. |
 | `patch enable [patch...] [--all]` | Put patches back in the applying set by removing the `#!` marker. Several patches per run; `--all` takes every disabled one; otherwise an interactive picker. |
 | `patch disable [patch...] [--all]` | Skip patches from now on: mark their series lines with `#!`. Several per run; `--all` takes every enabled one the sandbox is not holding; otherwise an interactive picker. Refuses while any are applied; `pop` first. |
 | `patch apply [ref]` | Reset the sandbox to a ref and replay the enabled set into it. No prompts; choose the set with `enable`/`disable`. |

@@ -25,6 +25,23 @@ fn skot(dir: &Path, args: &[&str]) -> Output {
         .expect("running skot")
 }
 
+/// Run the binary with the platform cache redirected into `cache`.
+///
+/// A standalone import keeps its mirror in the user's cache directory, which a test must
+/// not touch. Every variable `dirs` consults is pointed at the test's own directory.
+fn skot_cached(dir: &Path, cache: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_skot"))
+        .arg("--dir")
+        .arg(dir)
+        .args(args)
+        .env("XDG_CACHE_HOME", cache)
+        .env("LOCALAPPDATA", cache)
+        .env("HOME", cache)
+        .env("USERPROFILE", cache)
+        .output()
+        .expect("running skot")
+}
+
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -52,6 +69,44 @@ fn bare_with_one_commit(path: &Path) {
     // ref that resolves to nothing, and every command that asks for `main` fails to find it.
     repo.reference("refs/heads/main", commit, true, "init")
         .unwrap();
+}
+
+/// A bare repository whose `main` has a base commit and one change on top.
+fn bare_with_one_change(path: &Path) {
+    let repo = git2::Repository::init_bare(path).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    let base = {
+        let mut b = repo.treebuilder(None).unwrap();
+        b.insert("f.txt", repo.blob(b"base\n").unwrap(), 0o100644)
+            .unwrap();
+        b.write().unwrap()
+    };
+    let base_commit = repo
+        .commit(
+            Some("refs/heads/main"),
+            &sig,
+            &sig,
+            "base",
+            &repo.find_tree(base).unwrap(),
+            &[],
+        )
+        .unwrap();
+    let changed = {
+        let mut b = repo.treebuilder(None).unwrap();
+        b.insert("f.txt", repo.blob(b"first\n").unwrap(), 0o100644)
+            .unwrap();
+        b.write().unwrap()
+    };
+    let parent = repo.find_commit(base_commit).unwrap();
+    repo.commit(
+        Some("refs/heads/main"),
+        &sig,
+        &sig,
+        "change",
+        &repo.find_tree(changed).unwrap(),
+        &[&parent],
+    )
+    .unwrap();
 }
 
 /// A project with a mirror holding one commit, a sandbox, and no patches.
@@ -892,4 +947,195 @@ fn a_silent_init_reports_what_it_defaulted() {
         "{log}"
     );
     assert!(log.contains("keep defaulted to vendor"), "{log}");
+}
+
+/// A standalone import emits the patch and nothing else on stdout, from a directory that
+/// has no project in it, and leaves no `.skot/` behind there.
+#[test]
+fn standalone_import_stdout_is_only_the_patch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source.git");
+    bare_with_one_change(&source);
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let cache = tmp.path().join("cache");
+
+    let out = skot_cached(
+        &work,
+        &cache,
+        &[
+            "patch",
+            "import",
+            "main",
+            "--repo",
+            &source.display().to_string(),
+            "--stdout",
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains("Subject:"),
+        "the mail header is the patch:\n{text}"
+    );
+    assert!(
+        text.contains("+first"),
+        "the change is in the patch:\n{text}"
+    );
+    assert!(
+        !text.contains("imported"),
+        "diagnostics belong on stderr:\n{text}"
+    );
+    assert!(
+        !work.join(".skot").exists(),
+        "a standalone import leaves no state in the working directory"
+    );
+}
+
+/// `-o` writes the patch to the named file and does not add a line to the series.
+#[test]
+fn output_import_writes_the_file_without_registering_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let layout = bare_project(tmp.path());
+    let source = tmp.path().join("source.patch");
+    std::fs::write(
+        &source,
+        "From: Alice <alice@example.invalid>\n\
+         Subject: [PATCH] Export me\n\n\
+         ---\n\
+         diff --git a/f.txt b/f.txt\n\
+         --- a/f.txt\n\
+         +++ b/f.txt\n\
+         @@ -1 +1 @@\n\
+         -base\n\
+         +exported\n",
+    )
+    .unwrap();
+    let exported = tmp.path().join("exported.patch");
+
+    let out = skot(
+        tmp.path(),
+        &[
+            "patch",
+            "import",
+            &source.display().to_string(),
+            "--output",
+            &exported.display().to_string(),
+        ],
+    );
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let text = std::fs::read_to_string(&exported).unwrap();
+    assert!(text.contains("+exported"), "the patch on disk:\n{text}");
+    assert!(
+        !layout.series_file().exists(),
+        "an export is not a series entry"
+    );
+    assert!(
+        !layout.patches_dir().join("export-me.patch").exists(),
+        "the patch is not installed beside the series"
+    );
+}
+
+/// `track` is a first-class entry point: in a directory with no project it scaffolds one
+/// instead of sending the user through an init wizard for an upstream URL it will not use.
+#[test]
+fn track_creates_the_project_when_there_is_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("fresh");
+    std::fs::create_dir_all(&root).unwrap();
+    let source = tmp.path().join("upstream-src");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("f.txt"), "base\n").unwrap();
+
+    let out = skot(&root, &["track", &source.display().to_string(), "v1.0.0"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+
+    let layout = Layout::new(&root).with_per_series_sandbox(true);
+    assert!(layout.config_file().is_file());
+    assert!(layout.series_file().is_file());
+    assert!(layout.base_file().is_file());
+    let config = std::fs::read_to_string(layout.config_file()).unwrap();
+    assert!(
+        !config.lines().any(|line| line.starts_with("url = ")),
+        "the scaffolded config must not invent an upstream URL:\n{config}"
+    );
+    let base = std::fs::read_to_string(layout.base_file()).unwrap();
+    assert!(base.starts_with("v1.0.0 "), "got: {base}");
+
+    let check = skot(&root, &["check"]);
+    assert_eq!(check.status.code(), Some(0), "stderr: {}", stderr(&check));
+}
+
+/// A plain directory becomes the series base, and a fresh checkout with no `.skot/`
+/// rebuilds the same base by re-running `track`.
+#[test]
+fn track_records_a_plain_directory_and_rebuilds_it_after_a_clone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+    let layout = Layout::new(&root).with_per_series_sandbox(true);
+    // No upstream URL at all: the tracked snapshot is the whole upstream.
+    std::fs::write(layout.config_file(), "").unwrap();
+    std::fs::create_dir_all(layout.patches_dir()).unwrap();
+    write_series(&layout, "a.patch", patch_one());
+
+    let source = tmp.path().join("upstream-src");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("f.txt"), "base\n").unwrap();
+    std::fs::write(source.join(".gitignore"), ".DS_Store\n").unwrap();
+    std::fs::write(source.join(".DS_Store"), "junk").unwrap();
+
+    let out = skot(&root, &["track", &source.display().to_string(), "v1.0.0"]);
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let base = std::fs::read_to_string(layout.base_file()).unwrap();
+    let recorded: Vec<&str> = base.split_whitespace().collect();
+    assert_eq!(recorded[0], "v1.0.0");
+    assert_eq!(recorded.len(), 2, "the base records the commit too: {base}");
+
+    let check = skot(&root, &["check"]);
+    assert_eq!(check.status.code(), Some(0), "stderr: {}", stderr(&check));
+
+    // The mirror's HEAD has to be usable: `apply` creates its worktree before replaying,
+    // and an unborn HEAD makes that worktree fail.
+    let apply = skot(&root, &["patch", "apply"]);
+    assert_eq!(apply.status.code(), Some(0), "stderr: {}", stderr(&apply));
+    assert_eq!(sandbox_text(&layout), "first\n");
+
+    // A clone has the committed patches and config but no `.skot/`. Re-tracking the
+    // same unpacked archive has to land on the same commit, so check passes again.
+    std::fs::remove_dir_all(layout.state_dir()).unwrap();
+    let again = skot(&root, &["track", &source.display().to_string(), "v1.0.0"]);
+    assert_eq!(again.status.code(), Some(0), "stderr: {}", stderr(&again));
+    assert_eq!(
+        std::fs::read_to_string(layout.base_file()).unwrap(),
+        base,
+        "the same files produce the same recorded base"
+    );
+    let check = skot(&root, &["check"]);
+    assert_eq!(
+        check.status.code(),
+        Some(0),
+        "fresh clone check: {}",
+        stderr(&check)
+    );
+}
+
+/// Outside a project, an import that asks for neither `-o` nor `--stdout` still needs a
+/// project: the existing refusal points at `init`.
+#[test]
+fn standalone_import_without_an_export_still_needs_a_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    let out = skot(&work, &["patch", "import", "main"]);
+
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("no skot.toml found"),
+        "stderr: {}",
+        stderr(&out)
+    );
 }
